@@ -39,3 +39,7 @@ target/
 
 # nix
 result
+
+# Vibe Coding
+CLAUDE.md
+AGENTS.md
