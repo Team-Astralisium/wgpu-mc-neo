@@ -1,37 +1,31 @@
 package dev.birb.wgpu.backend
 
-import com.mojang.blaze3d.buffers.GpuBuffer
-import com.mojang.blaze3d.pipeline.CompiledRenderPipeline
-import com.mojang.blaze3d.pipeline.RenderPipeline
-import com.mojang.blaze3d.shaders.ShaderType
-import com.mojang.blaze3d.systems.CommandEncoder
-import com.mojang.blaze3d.systems.GpuDevice
-import com.mojang.blaze3d.textures.GpuTexture
-import com.mojang.blaze3d.textures.TextureFormat
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
 import net.minecraft.resources.ResourceLocation
 import org.lwjgl.glfw.*
 import java.nio.ByteBuffer
 import java.util.function.BiFunction
-import java.util.function.Supplier
 
-class WgpuBackend(window: Long, shaderSourceGetter: BiFunction<ResourceLocation, ShaderType, String>) : GpuDevice {
+class WgpuBackend(
+    window: Long,
+    @Suppress("UNUSED_PARAMETER") shaderSourceGetter: BiFunction<ResourceLocation, Any, String>? = null
+) : AutoCloseable {
 
-    private val minUniformOffsetAlignment: Int
-    private val maxTextureSize: Int
-    private val defaultShaderSourceGetter: BiFunction<ResourceLocation, ShaderType, String> = shaderSourceGetter
+    val minUniformOffsetAlignment: Int
+    val maxTextureSize: Int
 
     init {
         val mcWindow = Minecraft.getInstance().window
         val w = mcWindow.width
         val h = mcWindow.height
+        val windowHandle = mcWindow.window
 
         val nativeWindow = when (GLFW.glfwGetPlatform()) {
-            GLFW.GLFW_PLATFORM_X11 -> GLFWNativeX11.glfwGetX11Window(window)
-            GLFW.GLFW_PLATFORM_WIN32 -> GLFWNativeWin32.glfwGetWin32Window(window)
-            GLFW.GLFW_PLATFORM_COCOA -> GLFWNativeCocoa.glfwGetCocoaWindow(window)
-            GLFW.GLFW_PLATFORM_WAYLAND -> GLFWNativeWayland.glfwGetWaylandWindow(window)
+            GLFW.GLFW_PLATFORM_X11 -> GLFWNativeX11.glfwGetX11Window(windowHandle)
+            GLFW.GLFW_PLATFORM_WIN32 -> GLFWNativeWin32.glfwGetWin32Window(windowHandle)
+            GLFW.GLFW_PLATFORM_COCOA -> GLFWNativeCocoa.glfwGetCocoaWindow(windowHandle)
+            GLFW.GLFW_PLATFORM_WAYLAND -> GLFWNativeWayland.glfwGetWaylandWindow(windowHandle)
             else -> throw IllegalStateException("Unexpected value: ${GLFW.glfwGetPlatform()}")
         }
 
@@ -41,66 +35,46 @@ class WgpuBackend(window: Long, shaderSourceGetter: BiFunction<ResourceLocation,
         this.maxTextureSize = WgpuNative.getMaxTextureSize()
     }
 
-    override fun createCommandEncoder(): CommandEncoder = WgpuCommandEncoder()
+    fun createCommandEncoder(): WgpuCommandEncoder = WgpuCommandEncoder()
 
-    override fun createTexture(
-        labelGetter: Supplier<String>?,
-        usage: Int,
-        textureFormat: TextureFormat,
-        height: Int,
-        mipLevels: Int,
-        j: Int
-    ): GpuTexture {
-        return this.createTexture(labelGetter!!.get(), usage, textureFormat, j, height, mipLevels)
-    }
-
-    override fun createTexture(
+    fun createTexture(
         label: String?,
         usage: Int,
-        textureFormat: TextureFormat,
+        textureFormat: WgpuTextureFormat,
         width: Int,
         height: Int,
         mipLevels: Int
-    ): GpuTexture {
+    ): WgpuTexture {
         return WgpuTexture(usage, label, textureFormat, width, height, mipLevels)
     }
 
-    override fun createBuffer(labelGetter: Supplier<String>?, usage: Int, size: Int): GpuBuffer {
-        val label = labelGetter!!.get()
-        return WgpuBuffer(label ?: "<mc buffer>", usage, size)
+    fun createBuffer(label: String, usage: Int, size: Int): WgpuBuffer {
+        return WgpuBuffer(label, usage, size)
     }
 
-    override fun createBuffer(labelGetter: Supplier<String>?, usage: Int, data: ByteBuffer): GpuBuffer {
-        val label = labelGetter!!.get()
+    fun createBuffer(label: String, usage: Int, data: ByteBuffer): WgpuBuffer {
         return WgpuBuffer(label, usage, data)
     }
 
-    override fun getImplementationInformation(): String = "wgpu"
+    fun implementationInformation(): String = "wgpu"
 
-    override fun getLastDebugMessages(): List<String> = emptyList()
+    fun lastDebugMessages(): List<String> = emptyList()
 
-    override fun isDebuggingEnabled(): Boolean = false
+    fun isDebuggingEnabled(): Boolean = false
 
-    override fun getVendor(): String = "wgpu"
+    fun vendor(): String = "wgpu"
 
-    override fun getBackendName(): String = "wgpu"
+    fun backendName(): String = "wgpu"
 
-    override fun getVersion(): String = "22"
+    fun version(): String = "21.1-compat"
 
-    override fun getRenderer(): String = "wgpu-mc"
+    fun renderer(): String = "wgpu-mc"
 
-    override fun getMaxTextureSize(): Int = maxTextureSize
+    fun uniformOffsetAlignment(): Int = minUniformOffsetAlignment
 
-    override fun getUniformOffsetAlignment(): Int = minUniformOffsetAlignment
+    fun precompilePipeline(): WgpuCompiledRenderPipeline = WgpuCompiledRenderPipeline()
 
-    override fun precompilePipeline(
-        pipeline: RenderPipeline,
-        sourceRetriever: BiFunction<ResourceLocation, ShaderType, String>?
-    ): CompiledRenderPipeline = WgpuCompiledRenderPipeline()
-
-    override fun clearPipelineCache() {}
-
-    override fun getEnabledExtensions(): List<String> = emptyList()
+    fun clearPipelineCache() {}
 
     override fun close() {}
 }

@@ -3,8 +3,14 @@ package dev.birb.wgpu.render
 import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.entity.EntityState
 import dev.birb.wgpu.palette.RustBlockStateAccessor
+import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
 import net.minecraft.core.BlockPos
+import org.lwjgl.glfw.GLFW
+import org.lwjgl.glfw.GLFWNativeCocoa
+import org.lwjgl.glfw.GLFWNativeWayland
+import org.lwjgl.glfw.GLFWNativeWin32
+import org.lwjgl.glfw.GLFWNativeX11
 
 object Wgpu {
 	@JvmField
@@ -15,6 +21,9 @@ object Wgpu {
 
 	@Volatile
 	private var mayInitialize: Boolean = false
+
+	@Volatile
+	private var nativeBackendProbed: Boolean = false
 
 	private var timesTexSubImageCalled: Int = 0
 
@@ -36,6 +45,40 @@ object Wgpu {
 	@JvmStatic
 	fun setMayInitialize(mayInitialize: Boolean) {
 		this.mayInitialize = mayInitialize
+	}
+
+	@JvmStatic
+	fun probeNativeBackendOnce() {
+		if (nativeBackendProbed || !mayInitialize) {
+			return
+		}
+		nativeBackendProbed = true
+
+		try {
+			val mcWindow = Minecraft.getInstance().window ?: return
+			val windowHandle = mcWindow.window
+			if (windowHandle == 0L) {
+				return
+			}
+
+			val nativeWindow = when (GLFW.glfwGetPlatform()) {
+				GLFW.GLFW_PLATFORM_X11 -> GLFWNativeX11.glfwGetX11Window(windowHandle)
+				GLFW.GLFW_PLATFORM_WIN32 -> GLFWNativeWin32.glfwGetWin32Window(windowHandle)
+				GLFW.GLFW_PLATFORM_COCOA -> GLFWNativeCocoa.glfwGetCocoaWindow(windowHandle)
+				GLFW.GLFW_PLATFORM_WAYLAND -> GLFWNativeWayland.glfwGetWaylandWindow(windowHandle)
+				else -> 0L
+			}
+
+			if (nativeWindow == 0L) {
+				WgpuMcMod.LOGGER.warn("Skipped native backend probe: unknown GLFW platform {}", GLFW.glfwGetPlatform())
+				return
+			}
+
+			WgpuNative.createDevice(windowHandle, nativeWindow, mcWindow.width, mcWindow.height)
+			WgpuMcMod.LOGGER.info("Native backend probe result: {}", WgpuNative.getBackend())
+		} catch (throwable: Throwable) {
+			WgpuMcMod.LOGGER.warn("Native backend probe failed", throwable)
+		}
 	}
 
 	@JvmStatic

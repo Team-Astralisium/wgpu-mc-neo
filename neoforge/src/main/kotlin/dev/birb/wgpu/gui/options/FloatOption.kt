@@ -48,7 +48,17 @@ class FloatOption(
         }
 
         override fun build(): Option<Double> {
-            return FloatOption(name!!, tooltip!!, requiresRestart, getter!!, setter!!, min, max, step, formatter)
+            return FloatOption(
+                requireName(),
+                resolveTooltip(),
+                requiresRestart,
+                requireGetter(),
+                requireSetter(),
+                min,
+                max,
+                step,
+                formatter
+            )
         }
     }
 

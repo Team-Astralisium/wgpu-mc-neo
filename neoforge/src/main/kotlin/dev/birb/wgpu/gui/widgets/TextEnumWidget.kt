@@ -38,7 +38,7 @@ class TextEnumWidget(x: Int, y: Int, width: Int, private val option: TextEnumOpt
         renderer.rect(x, y, x + width, y + height, if (isMouseOver(mouseX, mouseY)) Widget.BG_HOVERED else Widget.BG)
 
         // Name
-        renderer.text(option.getName(), x + 6, centerTextY(renderer), Widget.WHITE)
+        renderer.text(option.displayName(), x + 6, centerTextY(renderer), Widget.WHITE)
 
         // Value
         if (animation < 1.0) {

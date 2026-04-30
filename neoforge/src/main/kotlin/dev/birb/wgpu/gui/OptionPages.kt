@@ -3,6 +3,7 @@ package dev.birb.wgpu.gui
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.reflect.TypeToken
+import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.gui.options.BoolOption
 import dev.birb.wgpu.gui.options.EnumOption
 import dev.birb.wgpu.gui.options.FloatOption
@@ -223,7 +224,9 @@ class OptionPages : Iterable<OptionPages.Page> {
             if (name.string == "Electrum") {
                 val options = groups.flatten()
                 val json = GSON.toJson(options, SETTINGS_TYPE_TOKEN.type)
-                WgpuNative.sendSettings(json)
+                if (!WgpuNative.sendSettings(json)) {
+                    WgpuMcMod.LOGGER.error("Failed to save Electrum renderer settings")
+                }
                 return
             }
 

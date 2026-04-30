@@ -26,7 +26,7 @@ class BoolWidget(x: Int, y: Int, width: Int, private val option: BoolOption) :
         animation = Mth.clamp(animation + delta * 6.0 * (if (option.get()) 1.0 else -1.0), 0.0, 1.0)
 
         renderer.rect(x, y, x + width, y + height, if (isMouseOver(mouseX, mouseY)) Widget.BG_HOVERED else Widget.BG)
-        renderer.text(option.getName(), x + 6, centerTextY(renderer), Widget.WHITE)
+        renderer.text(option.displayName(), x + 6, centerTextY(renderer), Widget.WHITE)
 
         val color = Utils.blendColors(Widget.ACCENT, Widget.WHITE, animation)
         val s = renderer.textHeight() + 2

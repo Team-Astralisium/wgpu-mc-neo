@@ -1,41 +1,47 @@
 package dev.birb.wgpu.backend
 
-import com.mojang.blaze3d.buffers.GpuBuffer
 import dev.birb.wgpu.rust.WgpuNative
 import org.lwjgl.system.MemoryUtil
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
-class WgpuBuffer(label: String, usage: Int, size: Int) : GpuBuffer(usage, size) {
+class WgpuBuffer(label: String, val usage: Int, val size: Int) : AutoCloseable {
 
-    private val buffer: Long
-    private val mapShadow: Long
+    private val buffer: Long = WgpuNative.createBuffer(label, usage, size)
     val map: ByteBuffer = MemoryUtil.memCalloc(size)
     private val alive = AtomicBoolean(true)
 
     constructor(label: String, usage: Int, data: ByteBuffer) : this(label, usage, data.capacity()) {
-        MemoryUtil.memCopy(data, map)
-    }
-
-    init {
-        this.buffer = WgpuNative.createBuffer(label, usage and (GpuBuffer.USAGE_MAP_WRITE or GpuBuffer.USAGE_MAP_READ).inv(), size)
+        val src = data.duplicate()
+        src.clear()
+        val dst = map.duplicate()
+        dst.clear()
+        dst.put(src)
+        dst.flip()
     }
 
     fun getWgpuBuffer(): Long = buffer
 
-    override fun isClosed(): Boolean = !alive.getAcquire()
+    fun isClosed(): Boolean = !alive.get()
+
+    fun mappedView(offset: Int = 0, length: Int = size - offset): WgpuMappedView {
+        require(offset >= 0 && length >= 0 && offset + length <= size) { "Invalid mapped range: offset=$offset length=$length size=$size" }
+        val duplicate = map.duplicate()
+        duplicate.position(offset)
+        duplicate.limit(offset + length)
+        return WgpuMappedView(duplicate.slice())
+    }
 
     override fun close() {
-        val wasAlive = alive.compareAndExchange(true, false)
-        if (wasAlive) {
+        if (alive.compareAndSet(true, false)) {
             WgpuNative.dropBuffer(buffer)
-        } else {
-            throw IllegalStateException("wgpu buffer was already dropped")
+            MemoryUtil.memFree(map)
         }
     }
 
-    class WgpuMappedView(private val buffer: ByteBuffer) : GpuBuffer.MappedView {
-        override fun data(): ByteBuffer = buffer
+    class WgpuMappedView(private val buffer: ByteBuffer) : AutoCloseable {
+        fun data(): ByteBuffer = buffer
+
         override fun close() {}
     }
 }

@@ -20,7 +20,7 @@ class BoolOption(
 
     class Builder : Option.Builder<Builder, Boolean>() {
         override fun build(): Option<Boolean> {
-            return BoolOption(name!!, tooltip!!, requiresRestart, getter!!, setter!!)
+            return BoolOption(requireName(), resolveTooltip(), requiresRestart, requireGetter(), requireSetter())
         }
     }
 }

@@ -16,6 +16,15 @@ abstract class Widget(x: Int, y: Int, var width: Int, var height: Int) {
         return mouseX >= x && mouseX <= x + width && mouseY >= y && mouseY <= y + height
     }
 
+    fun isMouseOver(mouseX: Int, mouseY: Int): Boolean {
+        return isMouseOver(mouseX.toDouble(), mouseY.toDouble())
+    }
+
+    fun setPosition(x: Int, y: Int) {
+        this.x = x
+        this.y = y
+    }
+
     open fun mouseClicked(mouseX: Double, mouseY: Double, button: Int): Boolean = false
 
     open fun mouseReleased(mouseX: Double, mouseY: Double, button: Int): Boolean = false

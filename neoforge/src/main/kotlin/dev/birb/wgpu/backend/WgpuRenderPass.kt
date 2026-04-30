@@ -1,141 +1,100 @@
 package dev.birb.wgpu.backend
 
-import com.mojang.blaze3d.buffers.GpuBuffer
-import com.mojang.blaze3d.buffers.GpuBufferSlice
-import com.mojang.blaze3d.pipeline.RenderPipeline
-import com.mojang.blaze3d.systems.RenderPass
-import com.mojang.blaze3d.textures.GpuTexture
-import com.mojang.blaze3d.vertex.VertexFormat
 import dev.birb.wgpu.rust.WgpuNative
-import net.minecraft.client.renderer.RenderType
 import org.lwjgl.system.MemoryUtil
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
-import java.util.function.Supplier
 
-class WgpuRenderPass(val target: WgpuTexture?, val depth: WgpuTexture?) : RenderPass {
+enum class WgpuIndexType(val nativeId: Int) {
+    SHORT(0),
+    INT(1)
+}
+
+class WgpuRenderPass(val target: WgpuTexture?, val depth: WgpuTexture?) : AutoCloseable {
 
     val commands: ByteBuffer = MemoryUtil.memCalloc(16000)
     var commandCount: Int = 0
 
     companion object {
-        private val COMMAND_SIZE = WgpuNative.getRenderPassCommandSize().toInt()
+        private val COMMAND_SIZE = WgpuNative.getRenderPassCommandSize().toInt().coerceAtLeast(32)
     }
 
-    override fun pushDebugGroup(supplier: Supplier<String>) {}
-
-    override fun popDebugGroup() {}
-
-    override fun setPipeline(pipeline: RenderPipeline) {
-        var pipelineId = 0
-
+    private fun writeCommandHeader(opcode: Long): Int {
         val p = commands.position()
-
-        commands.putLong(4)
-        commands.position(p + COMMAND_SIZE)
-
-        if (pipeline == RenderType.guiTextured()) pipelineId = 1
-
-        commands.putInt(pipelineId)
+        commands.putLong(opcode)
+        return p
     }
 
-    override fun bindSampler(name: String, texture: GpuTexture?) {
-        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
-        val nameStr = MemoryUtil.memCalloc(nameBytes.size)
-        nameStr.put(nameBytes)
-
-        val p = commands.position()
-
-        commands.putLong(5)
-        commands.putLong((texture as? WgpuTexture)?.texture ?: 0L)
-        commands.putLong(MemoryUtil.memAddress0(nameStr))
-        commands.putInt(nameBytes.size)
-
-        commands.position(p + COMMAND_SIZE)
-    }
-
-    override fun setUniform(name: String, buffer: GpuBuffer) {
-        setUniform(name, buffer.slice())
-    }
-
-    override fun setUniform(name: String, slice: GpuBufferSlice) {
-        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
-        val nameStr = MemoryUtil.memCalloc(nameBytes.size)
-        nameStr.put(nameBytes)
-
-        val p = commands.position()
-
-        commands.putLong(6)
-        commands.putLong((slice.buffer() as WgpuBuffer).getWgpuBuffer())
-        commands.putLong(MemoryUtil.memAddress0(nameStr))
-        commands.putInt(nameBytes.size)
-        commands.putInt(slice.offset())
-        commands.putInt(slice.length() + slice.offset())
-
-        commands.position(p + COMMAND_SIZE)
-    }
-
-    override fun enableScissor(x: Int, y: Int, width: Int, height: Int) {}
-
-    override fun disableScissor() {}
-
-    override fun setVertexBuffer(index: Int, buffer: GpuBuffer) {
-        val p = commands.position()
-
-        commands.putLong(3)
-        commands.putLong((buffer as WgpuBuffer).getWgpuBuffer())
-        commands.putInt(index)
-
-        commands.position(p + COMMAND_SIZE)
-        commandCount++
-    }
-
-    override fun setIndexBuffer(indexBuffer: GpuBuffer, indexType: VertexFormat.IndexType) {
-        val i = when (indexType) {
-            VertexFormat.IndexType.SHORT -> 0
-            VertexFormat.IndexType.INT -> 1
+    private fun finalizeCommand(start: Int, countAsDraw: Boolean = false) {
+        commands.position((start + COMMAND_SIZE).coerceAtMost(commands.capacity()))
+        if (countAsDraw) {
+            commandCount++
         }
-
-        val p = commands.position()
-
-        commands.putLong(2)
-        commands.putLong((indexBuffer as WgpuBuffer).getWgpuBuffer())
-        commands.putInt(i)
-
-        commands.position(p + COMMAND_SIZE)
-        commandCount++
     }
 
-    override fun drawIndexed(offset: Int, count: Int, primcount: Int, i: Int) {
-        val p = commands.position()
+    fun setPipeline(pipelineId: Int) {
+        val p = writeCommandHeader(4)
+        commands.putInt(pipelineId)
+        finalizeCommand(p)
+    }
 
-        commands.putLong(1)
+    fun bindSampler(name: String, texture: WgpuTexture?) {
+        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
+        val nameStr = MemoryUtil.memCalloc(nameBytes.size)
+        nameStr.put(nameBytes)
+
+        val p = writeCommandHeader(5)
+        commands.putLong(texture?.texture ?: 0L)
+        commands.putLong(MemoryUtil.memAddress0(nameStr))
+        commands.putInt(nameBytes.size)
+        finalizeCommand(p)
+    }
+
+    fun setUniform(name: String, buffer: WgpuBuffer, offset: Int = 0, length: Int = buffer.size - offset) {
+        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
+        val nameStr = MemoryUtil.memCalloc(nameBytes.size)
+        nameStr.put(nameBytes)
+
+        val p = writeCommandHeader(6)
+        commands.putLong(buffer.getWgpuBuffer())
+        commands.putLong(MemoryUtil.memAddress0(nameStr))
+        commands.putInt(nameBytes.size)
+        commands.putInt(offset)
+        commands.putInt(offset + length)
+        finalizeCommand(p)
+    }
+
+    fun setVertexBuffer(index: Int, buffer: WgpuBuffer) {
+        val p = writeCommandHeader(3)
+        commands.putLong(buffer.getWgpuBuffer())
+        commands.putInt(index)
+        finalizeCommand(p, countAsDraw = true)
+    }
+
+    fun setIndexBuffer(indexBuffer: WgpuBuffer, indexType: WgpuIndexType) {
+        val p = writeCommandHeader(2)
+        commands.putLong(indexBuffer.getWgpuBuffer())
+        commands.putInt(indexType.nativeId)
+        finalizeCommand(p, countAsDraw = true)
+    }
+
+    fun drawIndexed(offset: Int, count: Int, primcount: Int, i: Int) {
+        val p = writeCommandHeader(1)
         commands.putInt(offset)
         commands.putInt(count)
         commands.putInt(primcount)
         commands.putInt(i)
-
-        commands.position(p + COMMAND_SIZE)
-        commandCount++
+        finalizeCommand(p, countAsDraw = true)
     }
 
-    override fun drawMultipleIndexed(
-        objects: Collection<RenderObject>,
-        buffer: GpuBuffer?,
-        indexType: VertexFormat.IndexType?,
-        validationSkippedUniforms: Collection<String>
-    ) {}
-
-    override fun draw(offset: Int, count: Int) {
-        val p = commands.position()
-
-        commands.putLong(0)
+    fun draw(offset: Int, count: Int) {
+        val p = writeCommandHeader(0)
         commands.putInt(offset)
         commands.putInt(count)
-
-        commands.position(p + COMMAND_SIZE)
-        commandCount++
+        finalizeCommand(p, countAsDraw = true)
     }
 
-    override fun close() {}
+    override fun close() {
+        MemoryUtil.memFree(commands)
+    }
 }

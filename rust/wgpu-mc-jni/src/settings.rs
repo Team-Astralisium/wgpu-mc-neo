@@ -20,8 +20,10 @@ static RENDERER_CONFIG_JSON: OnceCell<PathBuf> = OnceCell::new();
 /// TODO: handle the case of "json doesn't have every field",
 /// because that's what happens when adding a new setting
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct Settings {
+    pub backend: EnumSetting,
     pub vsync: BoolSetting,
     pub test_enum: EnumSetting,
     pub test_float: FloatSetting,
@@ -30,6 +32,7 @@ pub struct Settings {
 
 #[derive(Serialize)]
 pub struct SettingsInfo {
+    backend: EnumSettingInfo<BackendSetting>,
     vsync: SettingInfo,
     test_enum: EnumSettingInfo<TestEnumSetting>,
     test_float: SettingInfo,
@@ -38,6 +41,10 @@ pub struct SettingsInfo {
 
 lazy_static! {
     pub static ref SETTINGS_INFO: SettingsInfo = SettingsInfo {
+        backend: EnumSettingInfo::new(
+            "Preferred wgpu backend. Changes apply after restart. Auto uses a platform default fallback chain.",
+            true,
+        ),
         vsync: SettingInfo {
             desc: "Whether or not to sync the framerate to the display's framerate.\
             May reduce screen tearing, on the cost of added latency.",
@@ -65,7 +72,9 @@ impl Settings {
             serde_json::from_str(&contents).unwrap_or_default()
         } else {
             let default = Settings::default();
-            default.write();
+            if !default.write() {
+                log::warn!("Failed to persist default renderer settings to disk");
+            }
             default
         };
         log::info!("Loaded settings: {setting:?}");
@@ -75,7 +84,7 @@ impl Settings {
     fn config_path_get_or_init<'a>() -> &'a PathBuf {
         RENDERER_CONFIG_JSON.get_or_init(|| {
             let mut path = RUN_DIRECTORY.get().unwrap().clone();
-            let path_from_dot_minecraft = Path::new("config/fabric/wgpu-mc-renderer.json");
+            let path_from_dot_minecraft = Path::new("config/wgpu-mc-renderer.json");
             path.push(path_from_dot_minecraft);
             path
         })
@@ -83,18 +92,55 @@ impl Settings {
 
     pub fn write(&self) -> bool {
         let config_path = Self::config_path_get_or_init();
+        if let Some(parent) = config_path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                log::error!("Couldn't create config directory at {parent:?}: {error}");
+                return false;
+            }
+        }
 
-        let str = serde_json::to_string_pretty(self).unwrap();
-        std::fs::write(config_path, str).unwrap_or_else(|_| {
-            panic!("Couldn't write wgpu-mc-renderer.json (config) to {config_path:?}")
-        });
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("Couldn't serialize wgpu renderer settings: {error}");
+                return false;
+            }
+        };
+
+        if let Err(error) = std::fs::write(config_path, json) {
+            log::error!("Couldn't write wgpu-mc-renderer.json (config) to {config_path:?}: {error}");
+            return false;
+        }
         true
+    }
+
+    pub fn backend_selection(&self) -> BackendSetting {
+        self.backend.get_variant::<BackendSetting>()
+    }
+
+    pub fn backend_candidates(&self) -> Vec<&'static str> {
+        match self.backend_selection() {
+            BackendSetting::Auto => {
+                if cfg!(target_os = "windows") {
+                    vec!["dx12", "vulkan", "gl"]
+                } else if cfg!(target_os = "macos") {
+                    vec!["metal", "vulkan", "gl"]
+                } else {
+                    vec!["vulkan", "gl"]
+                }
+            }
+            BackendSetting::Dx12 => vec!["dx12"],
+            BackendSetting::Vulkan => vec!["vulkan"],
+            BackendSetting::Metal => vec!["metal"],
+            BackendSetting::OpenGl => vec!["gl"],
+        }
     }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            backend: EnumSetting::from_variant(BackendSetting::Auto),
             vsync: BoolSetting { value: true },
             test_enum: EnumSetting::from_variant(TestEnumSetting::Off),
             test_float: FloatSetting {
@@ -217,4 +263,13 @@ enum TestEnumSetting {
     Two,
     Three,
     Off,
+}
+
+#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Copy, Clone, Debug)]
+pub enum BackendSetting {
+    Auto,
+    Dx12,
+    Vulkan,
+    Metal,
+    OpenGl,
 }

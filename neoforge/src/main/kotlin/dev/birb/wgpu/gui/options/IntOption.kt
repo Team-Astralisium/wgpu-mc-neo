@@ -48,7 +48,17 @@ class IntOption(
         }
 
         override fun build(): Option<Int> {
-            return IntOption(name!!, tooltip!!, requiresRestart, getter!!, setter!!, min, max, step, formatter)
+            return IntOption(
+                requireName(),
+                resolveTooltip(),
+                requiresRestart,
+                requireGetter(),
+                requireSetter(),
+                min,
+                max,
+                step,
+                formatter
+            )
         }
     }
 

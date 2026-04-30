@@ -37,7 +37,7 @@ abstract class Option<T>(
 
     abstract fun createWidget(x: Int, y: Int, width: Int): Widget
 
-    fun getName(): Component {
+    fun displayName(): Component {
         return if (isChanged()) {
             name.copy().append(" *").withStyle(ChatFormatting.ITALIC)
         } else {
@@ -52,6 +52,22 @@ abstract class Option<T>(
         protected var requiresRestart: Boolean = false
         protected var getter: Supplier<T>? = null
         protected var setter: Consumer<T>? = null
+
+        protected fun requireName(): Component {
+            return requireNotNull(name) { "Option name must be set before build()" }
+        }
+
+        protected fun resolveTooltip(): Component {
+            return tooltip ?: Component.empty()
+        }
+
+        protected fun requireGetter(): Supplier<T> {
+            return requireNotNull(getter) { "Option getter must be set before build()" }
+        }
+
+        protected fun requireSetter(): Consumer<T> {
+            return requireNotNull(setter) { "Option setter must be set before build()" }
+        }
 
         fun setName(name: Component): B {
             this.name = name
@@ -190,6 +206,7 @@ abstract class Option<T>(
                     root.addProperty("step", option.step)
                 }
                 is TextEnumOption -> {
+                    root.addProperty("type", "enum")
                     root.addProperty("selected", option.get())
                 }
                 is FloatOption -> {

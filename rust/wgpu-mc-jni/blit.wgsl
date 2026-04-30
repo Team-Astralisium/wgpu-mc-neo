@@ -22,8 +22,6 @@ struct VertexResult {
     @location(0) uv: vec2<f32>
 };
 
-var<push_constant> section_pos: vec3i;
-
 @vertex
 fn vert(
     @builtin(vertex_index) vi: u32

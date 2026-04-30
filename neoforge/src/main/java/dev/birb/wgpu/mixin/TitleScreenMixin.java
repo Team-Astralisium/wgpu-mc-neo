@@ -1,6 +1,7 @@
 package dev.birb.wgpu.mixin;
 
 import dev.birb.wgpu.WgpuMcMod;
+import dev.birb.wgpu.entity.EntityModelUpload;
 import dev.birb.wgpu.render.Wgpu;
 import dev.birb.wgpu.rust.WgpuNative;
 import net.minecraft.client.Minecraft;
@@ -19,6 +20,8 @@ public class TitleScreenMixin {
 
     @Inject(method = "render", at = @At("HEAD"))
     private void render(GuiGraphics context, int mouseX, int mouseY, float delta, CallbackInfo ci) {
+        Wgpu.probeNativeBackendOnce();
+
         if (!wgpu_mc$updatedTitle && Wgpu.isInitialized()) {
             Thread bakeBlocks = new Thread(WgpuNative::cacheBlockStates);
             bakeBlocks.setContextClassLoader(Thread.currentThread().getContextClassLoader());
@@ -27,8 +30,13 @@ public class TitleScreenMixin {
             Minecraft.getInstance().updateTitle();
             wgpu_mc$updatedTitle = true;
 
-            WgpuMcMod.MAY_INJECT_PART_IDS = true;
-            WgpuMcMod.ENTITIES_UPLOADED = true;
+            try {
+                EntityModelUpload.uploadEntityModels();
+                WgpuMcMod.MAY_INJECT_PART_IDS = true;
+                WgpuMcMod.ENTITIES_UPLOADED = true;
+            } catch (Throwable throwable) {
+                WgpuMcMod.LOGGER.error("Failed to upload entity model definitions", throwable);
+            }
         }
     }
 }

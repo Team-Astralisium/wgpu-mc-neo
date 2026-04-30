@@ -1,5 +1,5 @@
 use crate::glfw::LWJGLGLFWWindow;
-use crate::{MinecraftResourceManagerAdapter, RENDERER};
+use crate::{MinecraftResourceManagerAdapter, BACKEND_STATUS, RENDERER, SETTINGS};
 use futures::executor::block_on;
 use jni::objects::{JByteBuffer, JClass, JString};
 use jni::sys::{jint, jlong};
@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::num::{NonZeroIsize, NonZeroU64};
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use wgpu_mc::texture::TextureAndView;
 use wgpu_mc::wgpu::util::{BufferInitDescriptor, DeviceExt};
@@ -29,106 +30,158 @@ struct BuiltinPipelines {
 
 static BUILTIN_PIPELINES: OnceCell<BuiltinPipelines> = OnceCell::new();
 
-#[repr(C)]
-struct McRenderPass<'a> {
-    target: &'a TextureAndView,
-    depth_target: Option<&'a TextureAndView>,
-    commands: *mut RenderPassCommand<'a>,
-    commands_len: u32,
+fn backend_name(backends: wgpu::Backends) -> &'static str {
+    if backends == wgpu::Backends::DX12 {
+        "DX12"
+    } else if backends == wgpu::Backends::VULKAN {
+        "Vulkan"
+    } else if backends == wgpu::Backends::METAL {
+        "Metal"
+    } else if backends == wgpu::Backends::GL {
+        "OpenGL"
+    } else if backends == wgpu::Backends::PRIMARY {
+        "Primary"
+    } else {
+        "Unknown"
+    }
 }
 
-#[repr(u32)]
-#[derive(Debug)]
-enum IndexType {
-    I16 = 0,
-    I32 = 1,
+fn parse_backend_token(token: &str) -> Option<wgpu::Backends> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
+        "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        "metal" => Some(wgpu::Backends::METAL),
+        "gl" | "opengl" | "gles" => Some(wgpu::Backends::GL),
+        "primary" => Some(wgpu::Backends::PRIMARY),
+        _ => None,
+    }
 }
 
-#[repr(u64)]
-#[derive(Debug)]
-enum RenderPassCommand<'a> {
-    Draw {
-        offset: u32,
-        count: u32,
-    } = 0,
-    DrawIndexed {
-        offset: u32,
-        count: u32,
-        primcount: u32,
-        i: i32,
-    } = 1,
-    SetIndexBuffer {
-        index_buffer: &'a wgpu::Buffer,
-        index_type: IndexType,
-    } = 2,
-    SetVertexBuffer {
-        vertex_buffer: &'a wgpu::Buffer,
-        index: u32,
-    } = 3,
-    SetPipeline(u32) = 4,
-    BindTexture {
-        texture: &'a TextureAndView,
-        name: *mut u8,
-        name_len: u32,
-    } = 5,
-    BindBuffer {
-        buffer: &'a wgpu::Buffer,
-        name: *mut u8,
-        name_len: u32,
-        start: u32,
-        end: u32,
-    } = 6,
+fn default_backend_candidates() -> Vec<wgpu::Backends> {
+    if cfg!(target_os = "windows") {
+        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    } else if cfg!(target_os = "macos") {
+        vec![wgpu::Backends::METAL, wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    }
 }
 
-#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn getRenderPassCommandSize(env: JNIEnv, _class: JClass) -> jlong {
-    size_of::<RenderPassCommand>() as jlong
+fn backend_candidates() -> Vec<wgpu::Backends> {
+    if let Ok(raw) = std::env::var("WGPU_MC_BACKENDS") {
+        let mut parsed = Vec::new();
+        for token in raw.split(',') {
+            if let Some(backend) = parse_backend_token(token) {
+                if !parsed.iter().any(|item| *item == backend) {
+                    parsed.push(backend);
+                }
+            }
+        }
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    if let Some(settings) = SETTINGS.read().as_ref() {
+        let mut parsed = Vec::new();
+        for token in settings.backend_candidates() {
+            if let Some(backend) = parse_backend_token(token) {
+                if !parsed.iter().any(|item| *item == backend) {
+                    parsed.push(backend);
+                }
+            }
+        }
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    default_backend_candidates()
 }
 
-#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn createDevice(
-    env: JNIEnv,
-    _class: JClass,
-    window: jlong,
+fn requested_features() -> wgpu::Features {
+    wgpu::Features::DEPTH_CLIP_CONTROL
+        | wgpu::Features::PUSH_CONSTANTS
+        | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+        | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+        | wgpu::Features::MULTI_DRAW_INDIRECT
+}
+
+fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn create_renderer_for_backend(
+    jvm: jni::JavaVM,
     native_window: jlong,
-    width: jint,
-    height: jint,
-) {
-    let width = width as u32;
-    let height = height as u32;
-
+    width: u32,
+    height: u32,
+    backends: wgpu::Backends,
+) -> Result<(WmRenderer, BuiltinPipelines, String), String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
+        backends,
         ..Default::default()
     });
 
     let handle = unsafe { LWJGLGLFWWindow::new(native_window as _) };
-
-    let surface = instance.create_surface(Arc::new(handle)).unwrap();
+    let surface = instance
+        .create_surface(Arc::new(handle))
+        .map_err(|e| format!("create_surface failed: {e:?}"))?;
 
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: Some(&surface),
     }))
-    .unwrap();
+    .ok_or_else(|| "request_adapter returned None".to_string())?;
 
+    let adapter_info = adapter.get_info();
     const VSYNC: bool = false;
 
     let surface_caps = surface.get_capabilities(&adapter);
+    let format = surface_caps
+        .formats
+        .iter()
+        .copied()
+        .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
+        .or_else(|| surface_caps.formats.first().copied())
+        .ok_or_else(|| "surface has no supported formats".to_string())?;
+
+    let alpha_mode = surface_caps
+        .alpha_modes
+        .first()
+        .copied()
+        .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+
+    let present_mode = if VSYNC && surface_caps.present_modes.contains(&wgpu::PresentMode::AutoVsync)
+    {
+        wgpu::PresentMode::AutoVsync
+    } else if surface_caps
+        .present_modes
+        .contains(&wgpu::PresentMode::AutoNoVsync)
+    {
+        wgpu::PresentMode::AutoNoVsync
+    } else {
+        *surface_caps
+            .present_modes
+            .first()
+            .ok_or_else(|| "surface has no supported present modes".to_string())?
+    };
+
     let surface_config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: wgpu::TextureFormat::Bgra8Unorm,
+        format,
         width,
         height,
-        present_mode: if VSYNC {
-            wgpu::PresentMode::AutoVsync
-        } else {
-            wgpu::PresentMode::AutoNoVsync
-        },
-
+        present_mode,
         desired_maximum_frame_latency: 2,
-        alpha_mode: surface_caps.alpha_modes[0],
+        alpha_mode,
         view_formats: vec![],
     };
 
@@ -138,23 +191,20 @@ pub fn createDevice(
         ..Default::default()
     };
 
+    let supported_features = adapter.features();
+    let requested = requested_features();
+    let features = requested & supported_features;
+
     let (device, queue) = block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::default()
-                | wgpu::Features::DEPTH_CLIP_CONTROL
-                | wgpu::Features::PUSH_CONSTANTS
-                // | wgpu::Features::BUFFER_BINDING_ARRAY
-                | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
-                | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
-                // | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY
-                | wgpu::Features::MULTI_DRAW_INDIRECT,
+            required_features: features,
             required_limits,
             memory_hints: wgpu::MemoryHints::Performance,
         },
-        None, // Trace path
+        None,
     ))
-    .unwrap();
+    .map_err(|e| format!("request_device failed: {e:?}"))?;
 
     surface.configure(&device, &surface_config);
 
@@ -167,12 +217,8 @@ pub fn createDevice(
         adapter,
     };
 
-    let resource_provider = Arc::new(MinecraftResourceManagerAdapter {
-        jvm: env.get_java_vm().unwrap(),
-    });
-
+    let resource_provider = Arc::new(MinecraftResourceManagerAdapter { jvm });
     let wm = WmRenderer::new(display, resource_provider);
-
     wm.init();
 
     let blit_shader = wm
@@ -279,12 +325,137 @@ pub fn createDevice(
                 cache: None,
             });
 
-    drop(BUILTIN_PIPELINES.set(BuiltinPipelines {
-        blit: blit_pipeline,
-        gui_textured: gui_textured_pipeline,
-    }));
+    let adapter_backend = adapter_info.backend.to_str();
+    let adapter_name = adapter_info.name;
+    let backend_description = format!("wgpu ({adapter_backend}; adapter: {adapter_name})");
 
-    drop(RENDERER.set(wm));
+    Ok((
+        wm,
+        BuiltinPipelines {
+            blit: blit_pipeline,
+            gui_textured: gui_textured_pipeline,
+        },
+        backend_description,
+    ))
+}
+
+#[repr(C)]
+struct McRenderPass<'a> {
+    target: &'a TextureAndView,
+    depth_target: Option<&'a TextureAndView>,
+    commands: *mut RenderPassCommand<'a>,
+    commands_len: u32,
+}
+
+#[repr(u32)]
+#[derive(Debug)]
+enum IndexType {
+    I16 = 0,
+    I32 = 1,
+}
+
+#[repr(u64)]
+#[derive(Debug)]
+enum RenderPassCommand<'a> {
+    Draw {
+        offset: u32,
+        count: u32,
+    } = 0,
+    DrawIndexed {
+        offset: u32,
+        count: u32,
+        primcount: u32,
+        i: i32,
+    } = 1,
+    SetIndexBuffer {
+        index_buffer: &'a wgpu::Buffer,
+        index_type: IndexType,
+    } = 2,
+    SetVertexBuffer {
+        vertex_buffer: &'a wgpu::Buffer,
+        index: u32,
+    } = 3,
+    SetPipeline(u32) = 4,
+    BindTexture {
+        texture: &'a TextureAndView,
+        name: *mut u8,
+        name_len: u32,
+    } = 5,
+    BindBuffer {
+        buffer: &'a wgpu::Buffer,
+        name: *mut u8,
+        name_len: u32,
+        start: u32,
+        end: u32,
+    } = 6,
+}
+
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn getRenderPassCommandSize(env: JNIEnv, _class: JClass) -> jlong {
+    size_of::<RenderPassCommand>() as jlong
+}
+
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn createDevice(
+    env: JNIEnv,
+    _class: JClass,
+    _window: jlong,
+    native_window: jlong,
+    width: jint,
+    height: jint,
+) {
+    if let Some(renderer) = RENDERER.get() {
+        *BACKEND_STATUS.write() = renderer.get_backend_description();
+        return;
+    }
+
+    let width = width as u32;
+    let height = height as u32;
+    let mut errors = Vec::new();
+
+    for backend in backend_candidates() {
+        let jvm = match env.get_java_vm() {
+            Ok(vm) => vm,
+            Err(e) => {
+                errors.push(format!("{}: get_java_vm failed ({e})", backend_name(backend)));
+                continue;
+            }
+        };
+
+        let attempt = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            create_renderer_for_backend(jvm, native_window, width, height, backend)
+        }));
+
+        match attempt {
+            Ok(Ok((wm, pipelines, description))) => {
+                let _ = BUILTIN_PIPELINES.set(pipelines);
+                if RENDERER.set(wm).is_ok() {
+                    *BACKEND_STATUS.write() = description.clone();
+                    log::info!("Initialized native renderer with {}", backend_name(backend));
+                } else if let Some(renderer) = RENDERER.get() {
+                    *BACKEND_STATUS.write() = renderer.get_backend_description();
+                }
+                return;
+            }
+            Ok(Err(error)) => {
+                errors.push(format!("{}: {}", backend_name(backend), error));
+            }
+            Err(payload) => {
+                errors.push(format!(
+                    "{}: panic during init ({})",
+                    backend_name(backend),
+                    panic_to_string(payload)
+                ));
+            }
+        }
+    }
+
+    let status = format!(
+        "wgpu native renderer init failed ({})",
+        errors.join(" | ")
+    );
+    log::error!("{status}");
+    *BACKEND_STATUS.write() = status;
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]

@@ -65,11 +65,11 @@ class IntWidget(x: Int, y: Int, width: Int, private val option: IntOption) :
         val halfWidth = width / 2
 
         // Name
-        if (hovered && renderer.textWidth(option.getName()) > width / 3) {
-            val trimmed = FormattedText.composite(renderer.trimText(option.getName(), width / 3), Component.literal("..."))
+        if (hovered && renderer.textWidth(option.displayName()) > width / 3) {
+            val trimmed = FormattedText.composite(renderer.trimText(option.displayName(), width / 3), Component.literal("..."))
             renderer.text(Language.getInstance().getVisualOrder(trimmed), x + 6, centerTextY(renderer), Widget.WHITE)
         } else {
-            renderer.text(option.getName(), x + 6, centerTextY(renderer), Widget.WHITE)
+            renderer.text(option.displayName(), x + 6, centerTextY(renderer), Widget.WHITE)
         }
 
         // Value

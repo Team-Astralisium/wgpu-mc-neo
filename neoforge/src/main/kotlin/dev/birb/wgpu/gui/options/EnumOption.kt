@@ -50,7 +50,15 @@ class EnumOption<T : Enum<T>>(
         }
 
         override fun build(): Option<T> {
-            return EnumOption(name!!, enumClass, tooltip!!, requiresRestart, getter!!, setter!!, formatter)
+            return EnumOption(
+                requireName(),
+                enumClass,
+                resolveTooltip(),
+                requiresRestart,
+                requireGetter(),
+                requireSetter(),
+                formatter
+            )
         }
     }
 }

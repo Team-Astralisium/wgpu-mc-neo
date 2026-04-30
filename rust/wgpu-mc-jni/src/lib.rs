@@ -91,6 +91,9 @@ static MC_STATE: Lazy<ArcSwap<MinecraftRenderState>> = Lazy::new(|| {
     }))
 });
 
+pub static BACKEND_STATUS: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new("wgpu native renderer not initialized".to_string()));
+
 static CLEAR_COLOR: Lazy<ArcSwap<[f32; 3]>> = Lazy::new(|| ArcSwap::new(Arc::new([0.0; 3])));
 
 static AIR: Lazy<BlockstateKey> = Lazy::new(|| BlockstateKey {
@@ -286,12 +289,21 @@ pub fn getSettings(env: JNIEnv, _class: JClass) -> jstring {
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn sendSettings(mut env: JNIEnv, _class: JClass, settings: JString) -> bool {
     let json: String = env.get_string(&settings).unwrap().into();
-    if let Ok(settings) = serde_json::from_str(json.as_str()) {
-        let mut guard = SETTINGS.write();
-        *guard = Some(settings);
-        true
-    } else {
-        false
+    match serde_json::from_str::<Settings>(json.as_str()) {
+        Ok(settings) => {
+            let persisted = settings.write();
+            if !persisted {
+                log::error!("Failed to persist renderer settings after Java update");
+            }
+
+            let mut guard = SETTINGS.write();
+            *guard = Some(settings);
+            persisted
+        }
+        Err(error) => {
+            log::error!("Failed to parse renderer settings from Java: {error}");
+            false
+        }
     }
 }
 
@@ -307,8 +319,11 @@ pub fn sendRunDirectory(mut env: JNIEnv, _class: JClass, dir: JString) {
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn getBackend(env: JNIEnv, _class: JClass) -> jstring {
-    let renderer = RENDERER.get().unwrap();
-    let backend = renderer.get_backend_description();
+    let backend = if let Some(renderer) = RENDERER.get() {
+        renderer.get_backend_description()
+    } else {
+        BACKEND_STATUS.read().clone()
+    };
 
     env.new_string(backend).unwrap().into_raw()
 }

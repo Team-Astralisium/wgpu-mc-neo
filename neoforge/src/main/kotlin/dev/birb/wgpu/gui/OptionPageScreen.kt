@@ -34,7 +34,7 @@ class OptionPageScreen(private val parent: Screen) : Screen(Component.literal("O
     private var previousWidth = 0
     private var previousHeight = 0
 
-    fun setCurrentPage(page: OptionPages.Page) {
+    fun switchPage(page: OptionPages.Page) {
         if (currentPage == page) return
 
         currentPage = page
@@ -141,8 +141,7 @@ class OptionPageScreen(private val parent: Screen) : Screen(Component.literal("O
         val optionWidget = getHoveredOptionWidget(mouseX, mouseY)
         if (optionWidget is IOptionWidget) {
             hoveredOption = optionWidget.getOption()
-            tooltipWidget.x = optionWidget.x
-            tooltipWidget.y = optionWidget.y + optionWidget.height
+            tooltipWidget.setPosition(optionWidget.x, optionWidget.y + optionWidget.height)
             tooltipWidget.width = optionWidget.width
         } else {
             hoveredOption = null

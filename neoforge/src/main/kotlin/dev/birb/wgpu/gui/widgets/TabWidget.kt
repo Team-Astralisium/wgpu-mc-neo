@@ -22,7 +22,7 @@ class TabWidget(
 
     override fun mouseClicked(mouseX: Double, mouseY: Double, button: Int): Boolean {
         if (isMouseOver(mouseX, mouseY) && Minecraft.getInstance().screen is OptionPageScreen) {
-            (Minecraft.getInstance().screen as OptionPageScreen).setCurrentPage(page)
+            (Minecraft.getInstance().screen as OptionPageScreen).switchPage(page)
             playClickSound()
             return true
         }
