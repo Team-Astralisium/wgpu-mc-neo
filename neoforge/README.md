@@ -1,13 +1,13 @@
-# wgpu-mc NeoForge (Initial Port)
+# wgpu-mc NeoForge - Neolectrum
 
-This module is the first-stage NeoForge port of the Fabric `wgpu_mc` mod.
+This module is the first-stage NeoForge port of the Fabric Electrum mod.
 
 ## Current Baseline
 
-- Loader: NeoForge `21.1.228`
-- Minecraft: `1.21.1`
-- Java: `21`
-- Native bridge: reuses `rust/wgpu-mc-jni` through `rustImport`
+- Loader: NeoForge 21.1.228
+- Minecraft: 1.21.1
+- Java: 21 and above
+- Native bridge: reuses rust/wgpu-mc-jni through rustImport
 
 ## Port Scope in This Stage
 
@@ -28,7 +28,7 @@ This module is the first-stage NeoForge port of the Fabric `wgpu_mc` mod.
 
 ## Known Gaps 
 
-- Fabric target is `25w17a` (1.21.6 snapshot lineage), NeoForge target is `1.21.1` stable.
+- Fabric target is 25w17a, NeoForge target is 1.21.1 stable.
 - Deobfuscations that Fabric mixins are not yet remapped from Yarn names to Mojmap names.
 - Parts of the access Widener rules are not yet translated to NeoForge access transformers.
 - Rendering pipeline hooks still include scaffold-level mixins that need deeper NeoForge-side integration.
