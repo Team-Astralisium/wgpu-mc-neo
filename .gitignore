@@ -43,3 +43,5 @@ result
 # Vibe Coding
 CLAUDE.md
 AGENTS.md
+.claude/settings.local.json
+/neoforge/runs

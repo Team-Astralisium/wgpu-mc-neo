@@ -33,7 +33,9 @@ pub struct Matrices {
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn reloadShaders(_env: JNIEnv, _class: JClass) {
-    load_shaders(RENDERER.get().unwrap());
+    if let Some(renderer) = RENDERER.get() {
+        load_shaders(renderer);
+    }
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
@@ -108,7 +110,9 @@ pub fn setEntityInstanceBuffer(
     let now = Instant::now();
     let instance_count = instance_count as u32;
 
-    let wm = RENDERER.get().unwrap();
+    if RENDERER.get().is_none() {
+        return 0;
+    }
 
     //TODO this is slow, let's use an integer id somewhere
     let entity_name: String = env.get_string(&entity_name).unwrap().into();
