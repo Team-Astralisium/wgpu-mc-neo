@@ -266,7 +266,19 @@ pub fn getSettingsStructure(env: JNIEnv, _class: JClass) -> jstring {
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn getSettings(env: JNIEnv, _class: JClass) -> jstring {
-    let json = serde_json::to_string(&SETTINGS.read().as_ref().unwrap()).unwrap();
+    let json = {
+        let guard = SETTINGS.read();
+        if let Some(settings) = guard.as_ref() {
+            serde_json::to_string(settings).unwrap()
+        } else {
+            drop(guard);
+            let mut write = SETTINGS.write();
+            if write.is_none() {
+                *write = Some(Settings::default());
+            }
+            serde_json::to_string(write.as_ref().unwrap()).unwrap()
+        }
+    };
     env.new_string(json).unwrap().into_raw()
 }
 

@@ -1,0 +1,93 @@
+package dev.birb.wgpu.render
+
+import dev.birb.wgpu.WgpuMcMod
+import dev.birb.wgpu.entity.EntityState
+import dev.birb.wgpu.palette.RustBlockStateAccessor
+import net.minecraft.client.Minecraft
+import net.minecraft.core.BlockPos
+
+object Wgpu {
+	@JvmField
+	val keyStates: HashMap<Int, Int> = HashMap()
+
+	@Volatile
+	private var initialized: Boolean = false
+
+	@Volatile
+	private var mayInitialize: Boolean = false
+
+	private var timesTexSubImageCalled: Int = 0
+
+	@JvmStatic
+	fun isInitialized(): Boolean {
+		return initialized
+	}
+
+	@JvmStatic
+	fun setInitialized(initialized: Boolean) {
+		this.initialized = initialized
+	}
+
+	@JvmStatic
+	fun isMayInitialize(): Boolean {
+		return mayInitialize
+	}
+
+	@JvmStatic
+	fun setMayInitialize(mayInitialize: Boolean) {
+		this.mayInitialize = mayInitialize
+	}
+
+	@JvmStatic
+	fun getTimesTexSubImageCalled(): Int {
+		return timesTexSubImageCalled
+	}
+
+	@JvmStatic
+	fun linkRenderDoc() {
+		try {
+			System.loadLibrary("renderdoc")
+		} catch (e: UnsatisfiedLinkError) {
+			WgpuMcMod.LOGGER.warn("Error while loading RenderDoc", e)
+		}
+	}
+
+	@JvmStatic
+	fun rustPanic(message: String) {
+		WgpuMcMod.LOGGER.error(message)
+		throw IllegalStateException(message)
+	}
+
+	@JvmStatic
+	fun rustDebug(message: String) {
+		WgpuMcMod.LOGGER.info("[Engine] {}", message)
+	}
+
+	@JvmStatic
+	fun helperSetBlockStateIndex(state: Any?, blockstateKey: Int) {
+		if (state is RustBlockStateAccessor) {
+			state.`wgpu_mc$setRustBlockStateIndex`(blockstateKey)
+		}
+	}
+
+	@JvmStatic
+	fun helperSetPartIndex(entity: String, part: String, index: Int) {
+		EntityState.matrixIndices.computeIfAbsent(entity) { HashMap() }[part] = index
+	}
+
+	@JvmStatic
+	fun helperGetBlockColor(x: Int, y: Int, z: Int, tintIndex: Int): Int {
+		val client = Minecraft.getInstance()
+		if (client == null || client.level == null) {
+			return 0xFFFFFFFF.toInt()
+		}
+		val level = client.level ?: return 0xFFFFFFFF.toInt()
+
+		val pos = BlockPos(x, y, z)
+		val color = client.blockColors.getColor(level.getBlockState(pos), level, pos, tintIndex)
+		val r = color shr 16 and 255
+		val g = color shr 8 and 255
+		val b = color and 255
+		return r or (g shl 8) or (b shl 16)
+	}
+}
