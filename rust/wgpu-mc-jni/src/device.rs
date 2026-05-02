@@ -99,6 +99,58 @@ fn backend_candidates() -> Vec<wgpu::Backends> {
     default_backend_candidates()
 }
 
+fn preferred_vsync() -> bool {
+    SETTINGS
+        .read()
+        .as_ref()
+        .map(|settings| settings.vsync.value)
+        .unwrap_or(true)
+}
+
+fn choose_present_mode(
+    vsync: bool,
+    surface_caps: &wgpu::SurfaceCapabilities,
+) -> Result<wgpu::PresentMode, String> {
+    if vsync && surface_caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
+        Ok(wgpu::PresentMode::AutoVsync)
+    } else if !vsync && surface_caps.present_modes.contains(&wgpu::PresentMode::AutoNoVsync) {
+        Ok(wgpu::PresentMode::AutoNoVsync)
+    } else {
+        surface_caps
+            .present_modes
+            .first()
+            .copied()
+            .ok_or_else(|| "surface has no supported present modes".to_string())
+    }
+}
+
+pub fn apply_vsync_setting_to_surface() -> bool {
+    let Some(renderer) = RENDERER.get() else {
+        return false;
+    };
+
+    let vsync = preferred_vsync();
+    let surface_caps = renderer.gpu.surface.get_capabilities(&renderer.gpu.adapter);
+    let present_mode = match choose_present_mode(vsync, &surface_caps) {
+        Ok(mode) => mode,
+        Err(error) => {
+            log::error!("Failed to choose present mode for vsync={vsync}: {error}");
+            return false;
+        }
+    };
+
+    let mut config = renderer.gpu.config.write();
+    if config.present_mode == present_mode {
+        return true;
+    }
+    config.present_mode = present_mode;
+    renderer
+        .gpu
+        .surface
+        .configure(&renderer.gpu.device, &config);
+    true
+}
+
 fn requested_features() -> wgpu::Features {
     wgpu::Features::DEPTH_CLIP_CONTROL
         | wgpu::Features::PUSH_CONSTANTS
@@ -142,8 +194,6 @@ fn create_renderer_for_backend(
     .ok_or_else(|| "request_adapter returned None".to_string())?;
 
     let adapter_info = adapter.get_info();
-    const VSYNC: bool = false;
-
     let surface_caps = surface.get_capabilities(&adapter);
     let format = surface_caps
         .formats
@@ -159,20 +209,7 @@ fn create_renderer_for_backend(
         .copied()
         .unwrap_or(wgpu::CompositeAlphaMode::Auto);
 
-    let present_mode = if VSYNC && surface_caps.present_modes.contains(&wgpu::PresentMode::AutoVsync)
-    {
-        wgpu::PresentMode::AutoVsync
-    } else if surface_caps
-        .present_modes
-        .contains(&wgpu::PresentMode::AutoNoVsync)
-    {
-        wgpu::PresentMode::AutoNoVsync
-    } else {
-        *surface_caps
-            .present_modes
-            .first()
-            .ok_or_else(|| "surface has no supported present modes".to_string())?
-    };
+    let present_mode = choose_present_mode(preferred_vsync(), &surface_caps)?;
 
     let surface_config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

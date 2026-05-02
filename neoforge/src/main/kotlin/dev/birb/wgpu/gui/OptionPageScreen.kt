@@ -89,12 +89,15 @@ class OptionPageScreen(private val parent: Screen) : Screen(Component.literal("O
         add(CustomButtonWidget(
             alignX(x - buttonWidth),
             y,
-            { Component.literal(if (pages.isChanged()) "Apply and close" else "Close") },
+            { Component.literal(if (pages.isChanged()) "Apply" else "Close") },
             buttonWidth,
             { true },
             {
-                pages.apply()
-                onClose()
+                if (pages.isChanged()) {
+                    pages.apply()
+                } else {
+                    onClose()
+                }
             }
         ))
 

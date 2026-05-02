@@ -25,18 +25,12 @@ static RENDERER_CONFIG_JSON: OnceCell<PathBuf> = OnceCell::new();
 pub struct Settings {
     pub backend: EnumSetting,
     pub vsync: BoolSetting,
-    pub test_enum: EnumSetting,
-    pub test_float: FloatSetting,
-    pub test_int: IntSetting,
 }
 
 #[derive(Serialize)]
 pub struct SettingsInfo {
     backend: EnumSettingInfo<BackendSetting>,
     vsync: SettingInfo,
-    test_enum: EnumSettingInfo<TestEnumSetting>,
-    test_float: SettingInfo,
-    test_int: SettingInfo,
 }
 
 lazy_static! {
@@ -49,15 +43,6 @@ lazy_static! {
             desc: "Whether or not to sync the framerate to the display's framerate.\
             May reduce screen tearing, on the cost of added latency.",
             needs_restart: true,
-        },
-        test_enum: EnumSettingInfo::new("", true,),
-        test_float: SettingInfo {
-            desc: "test float - ignore this",
-            needs_restart: false,
-        },
-        test_int: SettingInfo {
-            desc: "test int - ignore this",
-            needs_restart: false,
         },
     };
     pub static ref SETTINGS_INFO_JSON: String = serde_json::to_string(&*SETTINGS_INFO).unwrap();
@@ -142,19 +127,6 @@ impl Default for Settings {
         Settings {
             backend: EnumSetting::from_variant(BackendSetting::Auto),
             vsync: BoolSetting { value: true },
-            test_enum: EnumSetting::from_variant(TestEnumSetting::Off),
-            test_float: FloatSetting {
-                min: 70.0,
-                max: 120.0,
-                step: 2.5,
-                value: 90.0,
-            },
-            test_int: IntSetting {
-                min: 0,
-                max: 100,
-                step: 1,
-                value: 0,
-            },
         }
     }
 }
@@ -255,14 +227,6 @@ impl EnumSetting {
     pub fn get_variant<T: IntoEnumIterator>(&self) -> T {
         T::iter().nth(self.selected).unwrap()
     }
-}
-
-#[derive(EnumIter, IntoStaticStr, Eq, PartialEq)]
-enum TestEnumSetting {
-    One,
-    Two,
-    Three,
-    Off,
 }
 
 #[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Copy, Clone, Debug)]

@@ -4,7 +4,7 @@
   "package": "dev.birb.wgpu.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "DebugHudMixin",
+    "DebugHUDMixin",
     "TitleScreenMixin",
     "core.MainTestRenderdocMixin",
     "core.MinecraftClientCoreMixin",

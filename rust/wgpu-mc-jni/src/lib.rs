@@ -25,6 +25,7 @@ use std::fmt::Debug;
 use std::io::{stdout, Cursor, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::{mem, thread};
 use wgpu::Extent3d;
@@ -93,6 +94,7 @@ static MC_STATE: Lazy<ArcSwap<MinecraftRenderState>> = Lazy::new(|| {
 
 pub static BACKEND_STATUS: Lazy<RwLock<String>> =
     Lazy::new(|| RwLock::new("wgpu native renderer not initialized".to_string()));
+static VSYNC_RECONFIGURE_PENDING: AtomicBool = AtomicBool::new(false);
 
 static CLEAR_COLOR: Lazy<ArcSwap<[f32; 3]>> = Lazy::new(|| ArcSwap::new(Arc::new([0.0; 3])));
 
@@ -298,6 +300,7 @@ pub fn sendSettings(mut env: JNIEnv, _class: JClass, settings: JString) -> bool 
 
             let mut guard = SETTINGS.write();
             *guard = Some(settings);
+            VSYNC_RECONFIGURE_PENDING.store(true, Ordering::Release);
             persisted
         }
         Err(error) => {
@@ -510,6 +513,11 @@ pub fn render(
     let height = height as u32;
 
     let wm = RENDERER.get().unwrap();
+    if VSYNC_RECONFIGURE_PENDING.load(Ordering::Acquire) {
+        if crate::device::apply_vsync_setting_to_surface() {
+            VSYNC_RECONFIGURE_PENDING.store(false, Ordering::Release);
+        }
+    }
     let render_graph = RENDER_GRAPH.get().unwrap().lock();
     let mut geometry = CUSTOM_GEOMETRY.get().unwrap().lock();
     let scene = unsafe { &mut *(scene as *mut Scene) };

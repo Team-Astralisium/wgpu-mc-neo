@@ -109,17 +109,17 @@ abstract class Option<T>(
 
             return when (type) {
                 "bool" -> {
-                    val value = jsonObject.getAsJsonPrimitive("value").asBoolean
+                    var value = jsonObject.getAsJsonPrimitive("value").asBoolean
                     BoolOption(
                         Component.literal(name),
                         Component.literal(structure.desc ?: ""),
                         structure.needsRestart,
-                        Supplier { value },
-                        Consumer {}
+                        { value },
+                        { newValue -> value = newValue }
                     )
                 }
                 "float" -> {
-                    val value = jsonObject.getAsJsonPrimitive("value").asDouble
+                    var value = jsonObject.getAsJsonPrimitive("value").asDouble
                     val min = jsonObject.getAsJsonPrimitive("min").asDouble
                     val max = jsonObject.getAsJsonPrimitive("max").asDouble
                     val step = jsonObject.getAsJsonPrimitive("step").asDouble
@@ -128,14 +128,14 @@ abstract class Option<T>(
                         Component.literal(name),
                         Component.literal(structure.desc ?: ""),
                         structure.needsRestart,
-                        Supplier { value },
-                        Consumer {},
+                        { value },
+                        { newValue -> value = newValue },
                         min, max, step,
                         FloatOption.STANDARD_FORMATTER
                     )
                 }
                 "int" -> {
-                    val value = jsonObject.getAsJsonPrimitive("value").asInt
+                    var value = jsonObject.getAsJsonPrimitive("value").asInt
                     val min = jsonObject.getAsJsonPrimitive("min").asInt
                     val max = jsonObject.getAsJsonPrimitive("max").asInt
                     val step = jsonObject.getAsJsonPrimitive("step").asInt
@@ -144,20 +144,20 @@ abstract class Option<T>(
                         Component.literal(name),
                         Component.literal(structure.desc ?: ""),
                         structure.needsRestart,
-                        Supplier { value },
-                        Consumer {},
+                        { value },
+                        { newValue -> value = newValue },
                         min, max, step,
                         IntOption.STANDARD_FORMATTER
                     )
                 }
                 "enum" -> {
-                    val selected = jsonObject.getAsJsonPrimitive("selected").asInt
-                    TextEnumOption(
+                    var selected = jsonObject.getAsJsonPrimitive("selected").asInt
+                    TextEnumOption  (
                         Component.literal(name),
                         Component.literal(structure.desc ?: ""),
                         structure.needsRestart,
-                        Supplier { selected },
-                        Consumer {},
+                        { selected },
+                        { newValue -> selected = newValue },
                         structure.variants
                     )
                 }

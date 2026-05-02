@@ -226,7 +226,9 @@ class OptionPages : Iterable<OptionPages.Page> {
                 val json = GSON.toJson(options, SETTINGS_TYPE_TOKEN.type)
                 if (!WgpuNative.sendSettings(json)) {
                     WgpuMcMod.LOGGER.error("Failed to save Electrum renderer settings")
+                    return
                 }
+                options.forEach { it.apply() }
                 return
             }
 

@@ -13,7 +13,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.util.List;
 
 @Mixin(DebugScreenOverlay.class)
-public class DebugHudMixin {
+public class DebugHUDMixin {
 
     @Inject(method = "getSystemInformation", at = @At("RETURN"))
     private void getSystemInformation(CallbackInfoReturnable<List<String>> cir) {
@@ -22,7 +22,7 @@ public class DebugHudMixin {
         try {
             backendInfo = WgpuNative.getBackend();
         } catch (Throwable t) {
-            backendInfo = "unavailable";
+            backendInfo = "NaN";
         }
 
         int gpuDriverLineIndex = lines.lastIndexOf(GlUtil.getOpenGLVersion());
@@ -30,8 +30,8 @@ public class DebugHudMixin {
         lines.add(insertIndex, "Render backend: " + backendInfo);
 
         if (WgpuMcMod.ENTRIES > 0) {
-            lines.add("[Electrum] texSubImage2D call count: " + Wgpu.getTimesTexSubImageCalled());
-            lines.add("[Electrum] avg uploading entities: " + (WgpuMcMod.TIME_SPENT_ENTITIES / WgpuMcMod.ENTRIES) + "ns");
+            lines.add("[Neolectrum] texSubImage2D call count: " + Wgpu.getTimesTexSubImageCalled());
+            lines.add("[Neolectrum] avg uploading entities: " + (WgpuMcMod.TIME_SPENT_ENTITIES / WgpuMcMod.ENTRIES) + "ns");
         }
     }
 

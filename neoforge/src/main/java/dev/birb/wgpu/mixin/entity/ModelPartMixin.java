@@ -19,11 +19,13 @@ import java.util.Map;
 public abstract class ModelPartMixin implements ModelPartNameAccessor, ModelPartAccessor {
 
     @Shadow public boolean visible;
+    @Shadow public boolean skipDraw;
 
     @Shadow @Final private List<ModelPart.Cube> cubes;
     @Shadow @Final public Map<String, ModelPart> children;
 
     @Shadow public abstract void translateAndRotate(PoseStack matrices);
+    @Shadow private void compile(PoseStack.Pose pose, VertexConsumer vertices, int light, int overlay, int color) {}
 
     private String name;
     private int partIndex;
@@ -44,35 +46,31 @@ public abstract class ModelPartMixin implements ModelPartNameAccessor, ModelPart
      */
     @Overwrite
     public void render(PoseStack matrices, VertexConsumer vertices, int light, int overlay, int color) {
-        if (!this.cubes.isEmpty() || !this.children.isEmpty()) {
-            int actualOverlay = EntityState.instanceOverlay;
+        if (this.visible) {
+            if (!this.cubes.isEmpty() || !this.children.isEmpty()) {
+                matrices.pushPose();
+                this.translateAndRotate(matrices);
+                if (!this.skipDraw) {
+                    this.compile(matrices.last(), vertices, light, overlay, color);
+                }
 
-            if (!this.visible) {
-                actualOverlay = 0;
+                Matrix4f mat4 = matrices.last().pose();
+                String thisPartName = ((ModelPartNameAccessor) (Object) this).getName();
+                if (thisPartName == null) {
+                    thisPartName = "root";
+                }
+
+                EntityState.ModelPartState state = new EntityState.ModelPartState();
+                state.overlay = color;
+                state.mat = mat4;
+                EntityState.entityModelPartStates.put(thisPartName, state);
+
+                for (ModelPart modelPart : this.children.values()) {
+                    modelPart.render(matrices, vertices, light, overlay, color);
+                }
+
+                matrices.popPose();
             }
-
-            matrices.pushPose();
-
-            this.translateAndRotate(matrices);
-            Matrix4f mat4 = matrices.last().pose();
-
-            String thisPartName = ((ModelPartNameAccessor) (Object) this).getName();
-
-            if (thisPartName == null) {
-                thisPartName = "root";
-            }
-
-            EntityState.ModelPartState state = new EntityState.ModelPartState();
-            state.overlay = actualOverlay;
-            state.mat = mat4;
-
-            EntityState.entityModelPartStates.put(thisPartName, state);
-
-            for (ModelPart modelPart : this.children.values()) {
-                modelPart.render(matrices, vertices, light, overlay, color);
-            }
-
-            matrices.popPose();
         }
     }
 
