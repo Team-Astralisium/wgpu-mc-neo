@@ -1,3 +1,32 @@
 {
-  "wgpu_mc.options.vsync": "启用垂直同步"
+  "wgpu_mc.screen.video_options": "视频设置",
+  "wgpu_mc.page.general": "常规",
+  "wgpu_mc.page.electrum": "Electrum",
+  "wgpu_mc.page.quality": "画质",
+  "wgpu_mc.button.apply": "应用",
+  "wgpu_mc.button.close": "关闭",
+  "wgpu_mc.button.undo": "撤销",
+  "wgpu_mc.section.debug": "调试",
+  "wgpu_mc.tooltip.requires_restart": "* 需要重启",
+  "wgpu_mc.notice.restart_pending": "重启 Minecraft 以应用标记的设置",
+  "wgpu_mc.notice.restart_applied": "重启 Minecraft 后这些设置才会生效",
+
+  "wgpu_mc.option.backend": "图形后端",
+  "wgpu_mc.option.backend.tooltip": "wgpu 使用的图形 API。Vulkan 在 Windows 和 Linux 上可用，DirectX 12 仅在 Windows 上可用。两者在运行中无法互换：wgpu 实例、适配器以及其下所有资源都是为某一个后端创建的，并会一直存活到游戏结束，所以切换要等到下次启动才生效。",
+  "wgpu_mc.option.backend.vulkan": "Vulkan",
+  "wgpu_mc.option.backend.directx12": "DirectX 12",
+  "wgpu_mc.option.vsync": "垂直同步",
+  "wgpu_mc.option.vsync.tooltip": "是否把帧率同步到显示器的刷新率。可以减少画面撕裂，代价是延迟增加。应用后立即生效：交换链会用另一种呈现模式重新配置。",
+  "wgpu_mc.option.gpu_based_validation": "GPU 侧校验",
+  "wgpu_mc.option.gpu_based_validation.tooltip": "让驱动自带的校验层检查 GPU 实际被要求做什么，而不只是 wgpu 被要求记录什么。它能发现主机侧校验看不到的错误——资源释放后仍被读取、着色器越过绑定读取、屏障放错位置——并通过驱动的调试输出报告。它会拖慢性能，属于开发工具，因此默认关闭。wgpu 实例在创建时就带上这个标志，所以切换要等到下次启动才生效。",
+  "wgpu_mc.option.diagnostics": "诊断信息",
+  "wgpu_mc.option.diagnostics.tooltip": "报告渲染器正在做什么：每条管线第一次被使用时、每个渲染通道、每秒一次的绘制计数器，以及预处理后的着色器。它同时也是帧与纹理转储的总开关——具体转储仍要用 wgpu-dump-now 文件来请求，因为转储针对的是某一帧。这个开关就是原先的 wgpu-dump-frames 标记文件；标记文件依然有效。",
+  "wgpu_mc.option.bind_group_cache": "绑定组缓存",
+  "wgpu_mc.option.bind_group_cache.tooltip": "在绑定相同资源、只是动态偏移不同的绘制之间复用绑定组，而不是每次绘制都新建。默认开启；关闭它可以把缓存排除（或认定为）画面差异的原因，代价是每次绘制都要创建一个 wgpu::BindGroup。这是 wgpu-no-bind-group-cache 标记文件的开关形式，标记文件仍然会关闭缓存。",
+  "wgpu_mc.option.dynamic_offsets": "动态偏移",
+  "wgpu_mc.option.dynamic_offsets.tooltip": "用偏移来绑定 uniform 缓冲，而不是把偏移烘焙进绑定组。默认开启，这也是绑定组缓存有价值的原因：Minecraft 几乎每次绘制都会以新的偏移重新绑定缓冲。关闭后会重新把偏移烘焙进去，也就是动态偏移出现之前渲染器的做法。这是 wgpu-no-dynamic-offsets 标记文件的开关形式。",
+  "wgpu_mc.option.trace_dynamic_offsets": "追踪动态偏移",
+  "wgpu_mc.option.trace_dynamic_offsets.tooltip": "记录每次绘制的绑定——绑定计划、按槽位顺序的每条绑定、随之传递的偏移——以及绑定组缓存被查询的 key。非常吵：每次绘制一行，所以只适合开几帧再把日志读回来。这是 wgpu-trace-dynamic-offsets 标记文件的开关形式。",
+  "wgpu_mc.option.dump_shaders": "转储着色器",
+  "wgpu_mc.option.dump_shaders.tooltip": "把经过本渲染器预处理、最终送进着色器编译器的 GLSL 写入 wgpu-shaders/。naga 看到的源码并不是 Minecraft 提供的源码——uniform 被标注了绑定计划给它们的 binding、隐式块被补上、采样器被拆分——而这里是唯一能看出其中哪一步出了错的地方。这是 wgpu-dump-shaders 标记文件的开关形式。"
 }

@@ -1,16 +1,14 @@
 package dev.birb.wgpu.mixin.render;
 
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.GameRenderer;
-import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.Lightmap;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(LightTexture.class)
+/**
+ * 26.1 renamed {@code LightTexture} to {@code Lightmap} and dropped its
+ * {@code (GameRenderer, Minecraft)} constructor in favour of a no-arg one, so the
+ * legacy constructor hook no longer has a target. The mixin is retained as an
+ * anchor for the upcoming lightmap upload path.
+ */
+@Mixin(Lightmap.class)
 public class LightmapTextureManagerMixin {
-    @Inject(at = @At("RETURN"), method = "<init>")
-    private void constructor(GameRenderer renderer, Minecraft client, CallbackInfo ci) {
-    }
 }

@@ -1,3 +1,24 @@
 {
-  "wgpu_mc.options.vsync": "Enable V-sync"
+  "wgpu_mc.screen.video_options": "Video Options",
+  "wgpu_mc.page.general": "General",
+  "wgpu_mc.page.electrum": "Electrum",
+  "wgpu_mc.page.quality": "Quality",
+  "wgpu_mc.button.apply": "Apply",
+  "wgpu_mc.button.close": "Close",
+  "wgpu_mc.button.undo": "Undo",
+  "wgpu_mc.section.debug": "Debug",
+  "wgpu_mc.tooltip.requires_restart": "* Requires restart",
+  "wgpu_mc.notice.restart_pending": "Restart Minecraft to apply the marked settings",
+  "wgpu_mc.notice.restart_applied": "Restart Minecraft for these settings to take effect",
+
+  "wgpu_mc.option.backend": "Graphics backend",
+  "wgpu_mc.option.backend.vulkan": "Vulkan",
+  "wgpu_mc.option.backend.directx12": "DirectX 12",
+  "wgpu_mc.option.vsync": "V-sync",
+  "wgpu_mc.option.gpu_based_validation": "GPU-based validation",
+  "wgpu_mc.option.diagnostics": "Diagnostics",
+  "wgpu_mc.option.bind_group_cache": "Bind group cache",
+  "wgpu_mc.option.dynamic_offsets": "Dynamic offsets",
+  "wgpu_mc.option.trace_dynamic_offsets": "Trace dynamic offsets",
+  "wgpu_mc.option.dump_shaders": "Dump shaders"
 }

@@ -2,7 +2,8 @@ package dev.birb.wgpu.gui.widgets
 
 import dev.birb.wgpu.gui.WidgetRenderer
 import dev.birb.wgpu.gui.options.Option
-import net.minecraft.util.FastColor
+import net.minecraft.network.chat.Component
+import net.minecraft.util.ARGB
 import net.minecraft.util.Mth
 import java.util.function.Supplier
 
@@ -46,7 +47,7 @@ class TooltipWidget(x: Int, y: Int, private val hoveredOption: Supplier<Option<*
         if (option.requiresRestart) height += renderer.textHeight() + 4
 
         // Background
-        renderer.rect(x + 1, y + 1, x + width - 2, y + height - 2, FastColor.ARGB32.color(225, 0, 0, 0))
+        renderer.rect(x + 1, y + 1, x + width - 2, y + height - 2, ARGB.color(225, 0, 0, 0))
 
         // Outline
         renderer.rect(x, y, x + width, y + 1, Widget.ACCENT)
@@ -58,6 +59,13 @@ class TooltipWidget(x: Int, y: Int, private val hoveredOption: Supplier<Option<*
         renderer.wrappedText(option.tooltip, x + 5, y + 5, Widget.WHITE, width - 8)
 
         // Requires restart
-        if (option.requiresRestart) renderer.text("* Requires restart", x + 5, y + tooltipHeight, Widget.RED)
+        if (option.requiresRestart) {
+            renderer.text(
+                Component.translatable("wgpu_mc.tooltip.requires_restart"),
+                x + 5,
+                y + tooltipHeight,
+                Widget.RED,
+            )
+        }
     }
 }

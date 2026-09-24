@@ -13,7 +13,7 @@ class TextEnumOption(
     requiresRestart: Boolean,
     getter: Supplier<Int>,
     setter: Consumer<Int>,
-    private val values: Array<String>
+    private val values: Array<Component>
 ) : Option<Int>(name, tooltip, requiresRestart, getter, setter) {
 
     fun cycle(direction: Int): Int {
@@ -32,6 +32,13 @@ class TextEnumOption(
     }
 
     companion object {
-        val FORMATTER = Function<TextEnumOption, Component> { option -> Component.literal(option.values[option.get()]) }
+        /**
+         * The component to show for the selected value.
+         *
+         * The values arrive translated from the schema (`OptionText.value`), so this is a lookup
+         * rather than `Component.literal(values[index])`, which is what it was when the schema
+         * carried display names only.
+         */
+        val FORMATTER = Function<TextEnumOption, Component> { option -> option.values[option.get()] }
     }
 }

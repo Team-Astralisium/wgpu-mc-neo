@@ -1,7 +1,7 @@
 package dev.birb.wgpu.rust
 
 import net.minecraft.client.Minecraft
-import net.minecraft.resources.ResourceLocation
+import net.minecraft.resources.Identifier
 import net.minecraft.server.packs.resources.ResourceManager
 import java.io.IOException
 
@@ -13,7 +13,7 @@ object WgpuResourceProvider {
 	@JvmStatic
 	fun getResource(path: String): ByteArray {
 		val id = try {
-			ResourceLocation.parse(path)
+			Identifier.parse(path)
 		} catch (_: Exception) {
 			return ByteArray(0)
 		}
@@ -29,7 +29,7 @@ object WgpuResourceProvider {
 		return readResource(minecraft.resourceManager, id)
 	}
 
-	private fun readResource(manager: ResourceManager, id: ResourceLocation): ByteArray {
+	private fun readResource(manager: ResourceManager, id: Identifier): ByteArray {
 		return try {
 			val resource = manager.getResource(id)
 			if (resource.isEmpty) {

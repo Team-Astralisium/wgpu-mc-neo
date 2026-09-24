@@ -12,9 +12,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(targets = "net.minecraft.client.renderer.chunk.SectionRenderDispatcher$RenderSection")
 public class BuiltChunkMixin {
+    // 26.1 renamed SectionRenderDispatcher$RenderSection#origin to #renderOrigin.
     @Shadow
     @Final
-    BlockPos.MutableBlockPos origin;
+    BlockPos.MutableBlockPos renderOrigin;
 
     @Inject(method = "createCompileTask", at = @At("RETURN"))
     private void wgpu_mc$wireCompileTaskOwner(

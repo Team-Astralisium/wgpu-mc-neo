@@ -1,34 +1,1294 @@
 # wgpu-mc NeoForge - Neolectrum
 
-This module is the first-stage NeoForge port of the Fabric Electrum mod.
+This module is the NeoForge port of the Fabric Electrum mod.
 
 ## Current Baseline
 
-- Loader: NeoForge 21.1.228
-- Minecraft: 1.21.1
-- Java: 21 and above
-- Native bridge: reuses rust/wgpu-mc-jni through rustImport
+- Loader: NeoForge 26.1.2.109 (NeoGradle userdev 7.1.21)
+- Minecraft: 26.1 (hotfix 2)
+- Java: 25
+- Mod loader metadata: `META-INF/neoforge.mods.toml`
+- Native bridge: reuses `rust/wgpu-mc-jni`
 
-## Port Scope in This Stage
+## What Was Migrated For 26.1
 
-- Rebased metadata and package naming to `wgpu_mc` / `dev.birb.wgpu`
-- Wired NeoForge client lifecycle:
-  - native library bootstrap
-  - client resource reload listener registration
-- Rewired Video Options entry point to a NeoForge-side `OptionPageScreen`
-- Ported custom option GUI stack:
-  - `OptionPageScreen`, `OptionPages`, `WidgetRenderer`
-  - option model types (`BoolOption`, `IntOption`, `FloatOption`, enum option variants)
-  - custom widget controls and tooltips
-- Migrated JNI-facing Java classes that must keep original names:
-  - `dev.birb.wgpu.rust.WgpuNative`
-  - `dev.birb.wgpu.rust.WgpuResourceProvider`
-  - `dev.birb.wgpu.render.Wgpu`
-- Brought over shader assets under `assets/wgpu_mc`
+Minecraft 26.1 is a large platform break for this mod, because it removed GL-level
+control of the render backend. The concrete changes handled here:
 
-## Known Gaps 
+### Toolchain
 
-- Fabric target is 25w17a, NeoForge target is 1.21.1 stable.
-- Deobfuscations that Fabric mixins are not yet remapped from Yarn names to Mojmap names.
-- Parts of the access Widener rules are not yet translated to NeoForge access transformers.
-- Rendering pipeline hooks still include scaffold-level mixins that need deeper NeoForge-side integration.
+- `net.neoforged.gradle.userdev` 7.1.25 -> 7.1.21, NeoForge `21.1.228` -> `26.1.2.109`
+- Java toolchain 21 -> 25 (Minecraft 26.1 moved to Java 25)
+- Minecraft 26.1 is **no longer obfuscated**, so Parchment/mappings configuration was dropped
+- NeoForge moved to four-part versions (`<minecraft>.<hotfix>.<release>`)
+- The module is now actually wired into `settings.gradle`; previously it was not included
+  in the build at all and referenced `neoforge_*` properties that did not exist
+
+### Renames applied (26.1 uses official/Yarn-style names)
+
+| 1.21.1 (Mojmap) | 26.1 |
+| --- | --- |
+| `net.minecraft.resources.ResourceLocation` | `net.minecraft.resources.Identifier` |
+| `net.minecraft.client.gui.GuiGraphics` | `net.minecraft.client.gui.GuiGraphicsExtractor` |
+| `net.minecraft.util.FastColor.ARGB32` | `net.minecraft.util.ARGB` |
+| `net.minecraft.client.renderer.LightTexture` | `net.minecraft.client.renderer.Lightmap` |
+| `net.minecraft.client.GraphicsStatus` | `net.minecraft.client.GraphicsPreset` |
+| `net.minecraft.client.ParticleStatus` | `net.minecraft.server.level.ParticleStatus` |
+| `net.minecraft.client.renderer.entity.ItemRenderer` | removed (use `ItemInHandRenderer`) |
+| `SectionRenderDispatcher$RenderSection#origin` | `#renderOrigin` |
+| `SectionRenderDispatcher$SectionTaskResult` | `$RenderSection$CompileTask$SectionTaskResult` |
+| `PalettedContainer$Configuration` | `net.minecraft.world.level.chunk.Configuration` |
+| `PalettedContainer$Strategy` | `PalettedContainerFactory` |
+| `LayerLightEngine` | `LayerLightEventListener` + `BlockLightEngine` / `SkyLightEngine` |
+| `SkyLightSectionStorage$SkyData` | `SkyLightSectionStorage$SkyDataLayerStorageMap` |
+| `RegisterClientReloadListenersEvent` | `AddClientReloadListenersEvent` |
+
+### Behavioural API changes
+
+- `Screen#render` -> `Screen#extractRenderState`, `Screen#renderBackground` -> `#extractBackground`
+- `GuiGraphics#drawString` -> `GuiGraphicsExtractor#text` / `#textWithWordWrap`
+- `Gui#renderVignette` -> `#extractVignette`
+- `DebugScreenOverlay#getSystemInformation` was removed; the F3 lines are now collected in
+  `DebugHUDMixin` and the renderer's own line in `DebugEntrySystemSpecsMixin`, which appends it to
+  vanilla's system block
+- `BlockColors#getColor(...)` -> the `BlockTintSource` pipeline (`getTintSource` + `colorInWorld`)
+- Mouse handling now uses `MouseButtonEvent` records instead of `(double, double, int)`
+- `Window#window` is private; the GLFW handle is `Window#handle()`
+- `Minecraft#resizeDisplay` -> `#resizeGui`
+- `GameRenderer#bobView` now takes a `CameraRenderState`
+- `VertexConsumer` gained `setColor(int)` and `setLineWidth(float)`
+- `AddClientReloadListenersEvent` registers via `addListener(Identifier, listener)`
+
+## The 26.1 render backend
+
+26.1 replaced Blaze3D's GL-level seam with a backend abstraction, so the port now implements it
+the same way the Fabric module does.
+
+`dev.birb.wgpu.mixin.core.WgpuBackendSelectionMixin` swaps the `GlBackend` instance that
+`Minecraft` builds into its backend list for `WgpuBackend`. From there the whole renderer comes
+up on wgpu:
+
+| Blaze3D interface | Implementation |
+| --- | --- |
+| `GpuBackend` | `backend/WgpuBackend.kt` |
+| `GpuDeviceBackend` | `backend/WgpuDevice.kt` |
+| `CommandEncoderBackend` | `backend/WgpuCommandEncoder.kt` |
+| `RenderPassBackend` | `backend/WgpuRenderPass.java` |
+| `GpuTexture` / `GpuTextureView` | `backend/WgpuTexture.kt` |
+| `GpuBuffer` | `backend/WgpuBuffer.kt` |
+| `GpuSampler` | `backend/WgpuSampler.kt` |
+| `CompiledRenderPipeline` | `backend/WgpuCompiledRenderPipeline.kt` |
+
+Everything except the render pass is Kotlin. `WgpuRenderPass` stays in Java because
+`RenderPassBackend` declares `<T> void drawMultipleIndexed(...)` with an unbounded type parameter,
+which Kotlin cannot override; the mixins are Java as well.
+
+### Native bridge
+
+The backend talks to `rust/wgpu-mc-jni` two ways, both addressing the *same* `WmRenderer`:
+
+- **JNI** creates the renderer and returns its pointer.
+  `WgpuNative.createWmRendererOnWindow(display, window)` is the entry point the backend uses: the
+  window handles are passed in so Rust can create the surface *before* it asks for an adapter, and
+  therefore require the adapter to support it. `createWmRenderer()` still exists and creates a
+  renderer with no surface.
+- **C ABI** (`rust/WmNative.kt`) is the FFI layer for everything after that. The Fabric module
+  generates it with the `jextract` Gradle plugin; here it is bound by hand in one file with the
+  struct layouts and field offsets written out next to the `bindings.h` declarations they mirror.
+
+Both bridges are checked against the Rust side by `cargo test` - see "Neither compiler checks the
+two bridges, so a test does".
+
+### How presenting works in 26.1
+
+26.1 has no `GpuSurfaceBackend` (that arrives in 26.2). `Minecraft` calls
+`mainRenderTarget.blitToScreen()`, which routes to `CommandEncoderBackend.presentTexture`. That is
+where `WgpuSurface` acquires the swapchain image, blits the colour view into it and presents.
+`GpuDeviceBackend.presentFrame` is a no-op safety net, because a wgpu surface cannot be presented
+with `glfwSwapBuffers`.
+
+The swapchain format, present mode and alpha mode are negotiated from
+`Surface::get_capabilities` rather than assumed. The format is a non-sRGB 8-bit one where the
+driver offers it (`Bgra8Unorm`, else `Rgba8Unorm`), because Minecraft's main render target already
+holds display-referred colour and an sRGB swapchain would encode it twice. The blit is built for
+whatever format won, so the two cannot disagree; it is this backend's own `PresentBlit` rather than
+`wgpu::util::TextureBlitter`, because it also has to turn the image over - see "Widget backgrounds
+were missing because render targets are the other way up".
+`desired_maximum_frame_latency` is 2, which is what DXGI's flip model and Vulkan's default both
+expect.
+
+A swapchain that goes stale is recovered in Rust: `acquire_next_texture` reconfigures and retries
+once on `Outdated`/`Lost` instead of dropping the frame forever. DX12 reports those after a
+monitor change or a fullscreen toggle far more readily than Vulkan does, and the Kotlin side only
+reconfigures on a size change, so this cannot be left to the caller.
+
+## Choosing the graphics backend
+
+wgpu renders through one API per `Instance`. Two are wired up: **Vulkan** (the default) and
+**DirectX 12**, which is Windows-only. The setting is owned by the native renderer, so both the
+options screen and the config file edit the same value.
+
+- **In game**: Video Options -> the **Electrum** tab -> `backend`.
+- **On disk**: `config/wgpu-mc-renderer.json` in the game directory:
+
+  ```json
+  "backend": { "type": "enum", "selected": 0 }
+  ```
+
+  `selected` indexes the variant list in declaration order, so `0` is Vulkan and `1` is
+  DirectX 12. `config/fabric/wgpu-mc-renderer.json` is still read if it exists, because that is
+  where the config used to live and NeoForge never creates the `fabric/` directory.
+
+The options screen is generated from the schema Rust serialises (`getSettingsStructure`), so the
+only two entries are the ones the renderer actually has: `backend` and `vsync`. The three
+placeholder settings the schema used to ship (`test_enum`, `test_float`, `test_int`) are gone,
+along with the `TestEnumSetting` enum they needed; a config file that still has them keeps loading,
+because every field is `#[serde(default)]` and unknown keys are ignored.
+
+### Which settings need a restart, and which do not
+
+`backend` does, and nothing can change that: the wgpu instance is created for exactly one backend,
+and the adapter, device, queue and every texture and buffer below them are built from it - none of
+that can be replaced while the game runs. It is declared `needs_restart: true` in
+`rust/wgpu-mc-jni/src/settings.rs`, and three things in the UI follow from that flag:
+
+- the setting's tooltip gains a red `* Requires restart` line;
+- as soon as a restart-only setting is edited, a red *"Restart Minecraft to apply the marked
+  settings"* notice appears above the Apply button, so it is visible without hovering;
+- after Apply the notice stays up in the past tense, because otherwise the only signal that the
+  restart is still pending would vanish at the moment the change was committed.
+
+Applied settings are written to disk by the Rust side (`sendSettings`), which is what makes the
+restart actually pick the new backend up.
+
+**`vsync` does not need one, and no longer asks for it.** It only chooses the swapchain's present
+mode, and a surface can be reconfigured whenever the game likes - this backend already does it on
+every resize and whenever the swapchain goes stale. `sendSettings` therefore re-resolves the mode
+from the settings it has just stored and reconfigures the surface if it changed
+(`reapply_present_mode` in `device.rs`); `configure_surface_inner` compares the present mode along
+with the size, so reconfiguring at an unchanged size still applies the new one. In a world, a
+toggle moves the swapchain between `Fifo` and `Mailbox` with no restart and no dropped frame the
+player can see:
+
+```
+wgpu-mc: swapchain 2560x1334, Bgra8Unorm, Mailbox, alpha Opaque, …
+wgpu-mc: swapchain 2560x1334, Bgra8Unorm, Fifo,    alpha Opaque, …   ← vsync turned on
+```
+
+**Minecraft's own VSync option is deliberately inert here, hidden, and kept in step.** On the
+OpenGL backend it is `glfwSwapInterval`, whose only equivalent on this side is the present mode -
+which the renderer's own setting owns, because that is the one the player sees in the Electrum tab
+and the one that applies without a restart. Letting both drive it would mean two owners of one
+value: Minecraft calls `GpuDevice#setVsync` from `Window#updateVsync`, which runs at startup
+(`Minecraft`'s constructor) and on every fullscreen toggle, so the vanilla toggle would silently
+undo the player's choice on the next launch. So:
+
+- `WgpuSurface.setVsync` accepts the call and does nothing with it;
+- the vanilla toggle is not in the Video Settings list any more, rather than sitting there changing
+  nothing;
+- its *value* is still synced from ours - on apply, and once when the device is created - because it
+  is not private to this mod. The F3 overlay prints "vsync" from `options.enableVsync()`
+  (`DebugEntryFps`), and other mods read it to know whether frames are being synced; a stale value
+  there would make both lie. The sync runs on the render thread, at device creation: changing the
+  option runs Minecraft's own consumer, which asserts it is on that thread, and a mod-loading
+  worker is not.
+
+### The options are localised, and a missing translation is a test failure
+
+The settings screen is built from the renderer's schema, which names a setting (`vsync`) and
+describes it in English. Neither of those is what a player reads. The screen turns the name into the
+key `wgpu_mc.option.<name>` - and the description into `wgpu_mc.option.<name>.tooltip` - and looks
+both up in `assets/wgpu_mc/lang/`, so the wording lives where a resource pack or a translator can
+reach it:
+
+| Key | Text (en_us / zh_cn) |
+| --- | --- |
+| `wgpu_mc.screen.video_options` | Video Options / 视频设置 |
+| `wgpu_mc.page.general`, `.electrum`, `.quality` | General, Electrum, Quality / 常规, Electrum, 画质 |
+| `wgpu_mc.button.apply`, `.close`, `.undo` | Apply, Close, Undo / 应用, 关闭, 撤销 |
+| `wgpu_mc.section.debug` | Debug / 调试 |
+| `wgpu_mc.tooltip.requires_restart` | `* Requires restart` / `* 需要重启` |
+| `wgpu_mc.notice.restart_pending`, `.restart_applied` | the two red restart notices |
+| `wgpu_mc.option.<setting>` | the setting's name |
+| `wgpu_mc.option.<setting>.tooltip` | the setting's description |
+| `wgpu_mc.option.backend.vulkan`, `.directx12` | the values of an enum setting |
+
+Two things make this survive a setting being added. The first is that a name no language file has is
+still shown as *something*: the screen asks for `translatableWithFallback`, so an untranslated name
+falls back to the schema key made readable (`bind_group_cache` as "Bind group cache") and an
+untranslated description to the English the renderer sent with it. The second is
+`cargo test`: three tests in `settings.rs` pull both language files in with `include_str!` - so
+editing one re-runs them - and check that every setting in the schema has a name in `en_us` *and*
+`zh_cn`, that every value of an enum setting does, and that neither file defines a key outside this
+mod's namespace. Adding a setting without a translation fails the build's tests rather than quietly
+shipping a row called `dump_shaders`.
+
+The renderer's own spelling is kept beside the translated one (`Option.setting` next to
+`Option.name`), because three places still need it: the JSON sent back to the renderer is a config
+file and is keyed by `vsync`, not by `wgpu_mc.option.vsync`; the schema lookup that puts a setting
+under its heading uses it; and so does the check that keeps vanilla's own vsync option in step. The
+values of an enum setting travel as a key *and* a display name for the same reason: the key is what
+a translation is found under, the display name is what a language that has never heard of the
+setting - or a language file that is missing the key - falls back to.
+
+en_us carries the names and the screen's wording; the descriptions are the renderer's English and
+reach it as fallbacks, so only a language that wants to say something different needs a
+`*.tooltip` entry. That is why `zh_cn.json` has all eight of them and `en_us.json` has none.
+
+Vanilla's half of the screen (General and Quality) was already localised - the option names are
+vanilla keys such as `options.renderDistance` - with two exceptions that are now fixed:
+
+- the GUI scale row's "Auto" is vanilla's own `options.guiScale.auto` rather than a literal;
+- the graphics preset row asked for `options.graphics`, which **26.1 renamed**. The old key is in
+  `assets/minecraft/lang/deprecated.json`'s `removed` list, and `DeprecatedTranslationsInfo`
+  *strips* removed keys from every language file as it loads them - so the key resolved to nothing
+  in every language and the row was drawn labelled with the key itself:
+
+  ```
+  视频设置 → 画质:   options.graphics      高品质      ← before
+                     预设                  高品质      ← after (`options.graphics.preset`)
+  ```
+
+  A key that resolves to nothing is drawn as itself, and there is no compile error on either side
+  of the lookup, so the screen names them now: `OptionPages` walks every name, description and
+  heading it built once per session, checks each `TranslatableContents` against `I18n.exists`, and
+  logs the ones that are missing - skipping any that carry a fallback, since falling back is what
+  this mod's own descriptions do on purpose. That line is what found the `options.graphics` bug:
+
+  ```
+  wgpu: 1 key(s) the options screen asks for are not in the loaded language, so those rows show
+        the key itself: options.graphics
+  ```
+
+The F3 overlay's `Render backend:` line is deliberately still English, because vanilla's debug
+overlay is English throughout.
+
+### Falling back
+
+If the configured backend cannot be created, the other one is tried before giving up, and the log
+says so at error level. A backend named in the config but unusable on the machine - a DX12 config
+carried over, or a driver with no Vulkan ICD - would otherwise leave the game with no renderer at
+all and no way to reach the options screen that would let the player change it back. If neither
+backend comes up, `createDevice` throws `BackendCreationException`, which turns into Minecraft's
+own "No supported graphics backend was found" screen rather than a crash later on.
+
+To see which backend the *running* renderer ended up on, open the F3 overlay: the `Render backend`
+line reports the adapter wgpu selected, which is not necessarily the one that was requested.
+
+### What the F3 overlay says about the graphics card
+Vanilla's system block (`DebugEntrySystemSpecs`) asks a `GpuDevice` for a vendor, a renderer name, a
+backend name and a version. On the OpenGL backend those four answers are `GL_VENDOR`, `GL_RENDERER`,
+"OpenGL" and `GL_VERSION` - the graphics driver naming itself - and the port answered "wgpu" and
+"wgpu-mc" for all four, which made the block useless for exactly the kind of report this mod needs.
+
+`WgpuDevice` now answers with the adapter's own `AdapterInfo` (over the `WgpuNative.getAdapterInfo`
+JNI call), so the block looks like it does on GL:
+
+| Accessor | Source | Example |
+| --- | --- | --- |
+| `getVendor()` | the PCI vendor id, named | `NVIDIA` |
+| `getRenderer()` | `AdapterInfo#name` | `NVIDIA GeForce RTX 5070 Laptop GPU` |
+| `getBackendName()` | the API behind wgpu | `Vulkan`, `DirectX 12` |
+| `getVersion()` | `driver` + `driver_info` | `NVIDIA 617.14`, or `32.0.16.1714` on DX12 |
+
+The fourth line joins `driver` and `driver_info` because the two backends fill them in differently:
+Vulkan reports the driver's name and version, DX12 puts the version in `driver` and leaves
+`driver_info` empty. Either way the F3 overlay names the installed graphics driver, which is the
+thing a rendering bug gets reported against.
+
+The wgpu wording did not disappear, it moved: `DebugEntrySystemSpecsMixin` appends
+`Render backend: wgpu 29.0.3 (vulkan)` *into the same group*, so it is drawn directly under the
+vanilla lines instead of at the bottom of the column. In a full F3 column that block reads:
+
+```
+Java: 25.0.3
+CPU: 32x Intel(R) Core(TM) i9-14900HX
+Display: 854x480 (NVIDIA)
+NVIDIA GeForce RTX 5070 Laptop GPU
+Vulkan NVIDIA 617.14
+Render backend: wgpu 29.0.3 (vulkan)
+```
+
+which is what `wgpu: F3 system block:` prints in the log when the diagnostics are on - the block
+sits below the profiler section and is usually off the bottom of the window, so a screenshot is not
+a way to check it.
+
+### Prerequisites and platform notes
+
+- DX12 needs a D3D12-capable adapter and a shader compiler. wgpu uses DXC when `dxcompiler.dll`
+  is present and falls back to FXC otherwise, so a missing DXC costs shader model 5.1 features
+  rather than the backend.
+- Vulkan needs a working ICD. `WGPU_POWER_PREF` overrides the high-performance adapter default,
+  which matters on hybrid-graphics laptops where the two backends may enumerate the same GPU
+  differently.
+
+## What has actually been run
+
+Everything below was observed by launching `:wgpu-mc-neoforge:runClient`, not inferred:
+
+- The backend mixin applies and `Minecraft` calls `WgpuBackend.createDevice` from its constructor.
+- `wgpu_mc_jni.dll` loads, the renderer comes up on Vulkan, and the log line is
+  `wgpu-mc backend initialised through wgpu 29.0.3 (vulkan)`. The crash report's `Backend API`
+  field reads `wgpu 29`, and the process has `vulkan-1.dll`, `igvk64.dll` and `RTSSVkLayer64.dll`
+  mapped in.
+- The window is created with `GLFW_NO_API`: `Window` receives the `WgpuBackend` as its
+  constructor argument, so `setWindowHints` never asks for a GL context.
+- Resource reloading runs to completion, every pipeline the game precompiles is accepted, and the
+  renderer draws whole screens and presents them, on **both** Vulkan and DirectX 12: the title
+  screen (panorama, logo, splash text, every button with its background, both corner strings), the
+  vanilla options screen, and the video options screen on top of a loaded world, which exercises
+  the sprite atlases, the blurred background and the GUI item atlas at once. The renderer's own
+  dumps were compared against the swapchain image and match byte for byte.
+- The in-game HUD and the world it is drawn over come from the same run: terrain, sky and the
+  scenery behind the options panel are drawn by this backend.
+- Uploaded textures were checked byte for byte against the resource pack's own files: the uploaded
+  panorama cubemap faces match `panorama_1.png` with `mad=0.00` and no channel permutation. The
+  title screen's sky is blue and its cherry blossoms are pink in the presented frame, not orange and
+  purple.
+- The F3 overlay's system block names the installed graphics driver (`NVIDIA GeForce RTX 5070
+  Laptop GPU` over `Vulkan NVIDIA 617.14`, observed on both Vulkan and DirectX 12) with the wgpu
+  line under it, and the adapter it reports agrees with the `backend` setting. A run on the DX12
+  backend prints, from the mixin that reads vanilla's own group back:
+
+  ```
+  Java: 25.0.3
+  CPU: 32x Intel(R) Core(TM) i9-14900HX
+  Display: 2560x1334 (NVIDIA)
+  NVIDIA GeForce RTX 5070 Laptop GPU
+  DirectX 12 32.0.16.1714
+  Render backend: wgpu 29.0.3 (dx12)
+  ```
+
+- A world was created and played: terrain, sky, clouds, the block atlas, the held item and the
+  hotbar all drawn, over 5280 presented frames with `acquired=true` on every one of them. The
+  window was resized three times before entering the world and maximised to 2560x1334 with the
+  world loaded, which is the path that rebuilds a render target and used to end the process.
+
+### Reading a frame without a GPU debugger
+
+When a frame comes out wrong there is nothing to attach a debugger to, and the two halves of the
+problem - "the renderer drew nothing" and "the renderer drew something nobody presented" - look
+identical from outside the process. `dev.birb.wgpu.backend.Diagnostics` is the switch that makes
+the backend answer those questions, and it is a setting now: **Video Options → Electrum → Debug →
+Diagnostics**, applied on the next frame.
+
+```powershell
+# or, with no launcher support and no trip through the menus
+New-Item neoforge/runs/client/wgpu-dump-frames
+```
+
+With it on, every `runClient` writes, into `neoforge/runs/client/wgpu-frames/`:
+
+| File | What it is |
+| --- | --- |
+| `frame-<n>-source.raw` | the main colour target at present *n*, turned the right way up |
+| `frame-<n>-surface.raw` | the swapchain image that was actually presented |
+| `tex-<label>-layer<l>.raw` | a texture right after it was uploaded |
+| `atlas-<label>.raw` | a sprite atlas, right after the pass that builds it was submitted |
+
+The frames are 2, 300, 900, 1800, 3000, 4200, 5400, 6600, 7800 and 9000, spread out because the
+first ones are the loading splash and a world is only reached a minute or two in. A dump can also be
+asked for at any moment, which is what makes "look at the frame I am looking at right now" possible:
+
+```powershell
+New-Item neoforge/runs/client/wgpu-dump-now   # dumps the next presented frame, then deletes itself
+```
+
+Each file is `u32 width`, `u32 height`, then RGBA8 rows; the
+swapchain image is `Bgra8Unorm`, so its bytes are BGRA. A render target is written out turned over,
+because that is how the backend holds it - see the clip-space section below - so `frame-<n>-source`
+and `frame-<n>-surface` are directly comparable and are byte-identical apart from that swizzle.
+
+An atlas has to be dumped through the pass that builds it rather than through an upload, and only
+after the pass has been submitted; the first pass for a label is the one that counts, because that
+is the level-0 pass and everything after it is a mip level. A `tex-` dump is the only way to tell a
+texture that arrived wrong apart from a shader that samples it wrong: compare it against the
+resource pack's own PNG under every channel permutation and flip, and exactly one combination
+should come out at `mad=0.00` with the identity permutation among the channels - see "A colour
+coming out of a texture is a texture problem". `frame-<n>-source.raw` is flipped row-wise on the
+way out, because a render target holds the frame the OpenGL way round.
+
+The same switch turns on the per-pass trace
+(`wgpu-mc: pass -> <label>: N draws, clear=..., depth=..., pipelines [...]`), the one-shot
+pipeline and render-target descriptions, the present/stats counters, and the line that found the
+twenty-gigabyte leak:
+
+```
+wgpu-mc: live resources: 767 textures (74 MB), 786 views, 47 buffers (0 MB, 5 quarantined),
+         1 encoders, 0 passes, 0 bind groups, 0 builders
+```
+
+`-Dwgpu_mc.diagnostics=true` and `WGPU_MC_DIAGNOSTICS=1` do the same thing, but the marker file is
+the one that works whatever the launcher does with JVM arguments.
+
+### The debug switches are settings, and the diagnostics cost nothing when they are off
+
+Every diagnostic in this renderer grew as a marker file, which is the right shape for a switch that
+has to work without a launcher and the wrong one for a player who wants a single frame dumped. They
+are options under **Electrum → Debug** now, separated from the backend and vsync by a blank row,
+with `GPU-based validation` at the top:
+
+| Setting | Default | Applies |
+| --- | --- | --- |
+| GPU-based validation | off | next launch - it is an `wgpu::InstanceFlags` bit, and the instance is created once |
+| Diagnostics | off | next frame |
+| Bind group cache | on | next frame |
+| Dynamic offsets | on | next frame |
+| Trace dynamic offsets | off | next frame |
+| Dump shaders | off | next frame |
+
+The section is what made the settings list taller than the window at the GUI scales a small window
+allows, so the list scrolls with the wheel now instead of running under the Apply button - which is
+also what the General page's last row needed, and it is why a row is only drawn when it fits whole.
+
+`GPU-based validation` is the one that changed behaviour rather than moving: the instance used to be
+created with it unconditionally, so every launch paid for a driver validation layer that only a
+renderer being debugged wants. Host-side `VALIDATION` and `DEBUG` stay on always - they are what
+makes a wgpu error name the call that caused it.
+
+Each of them is also still a marker file (`wgpu-dump-frames`, `wgpu-no-bind-group-cache`,
+`wgpu-no-dynamic-offsets`, `wgpu-trace-dynamic-offsets`, `wgpu-dump-shaders`), and a marker wins
+where the two disagree - including the two that are spelled as the *off* switch, where the file
+turns the feature off regardless of the setting. The schema says which settings are debug switches
+(`"section": "Debug"`), so the options screen draws the heading without knowing what any of them do,
+and the Rust side resolves them into atomics when the settings are loaded or applied: the draw path
+reads a flag, never a config file or a lock.
+
+That is what made the gating worth doing at all. Three of these were *unconditional* work on the hot
+path before:
+
+- `log_pipeline_once` locked a mutex and hashed a name into a `HashSet<String>` on **every pipeline
+  bind**. It is one `AtomicBool` on the `BlazePipeline` now, and the name is not read again after
+  the first bind reports it;
+- `trace_draw` locked the pass trace on **every draw**, to increment a number only a log line reads;
+- `trace_pipeline` did the same on every pipeline bind, and the per-pass trace formatted the target
+  address on every pass.
+
+All three are behind the diagnostics flag, so a normal run pays one relaxed load per draw for them
+- and the counters behind `log_render_stats` are thread-local `Cell<u64>`s rather than process-wide
+atomics, aggregated when the stat line is written. `LIVE_*` stays atomic, because those are
+decremented by the cleaner thread, and a second recording thread would be a real bug: the counter
+block is per thread, so `log_render_stats` logs a warning once if more than one thread ever counts.
+
+The counters read the same whether the switch is on or off, which is the point: they are a cell
+increment, not a diagnostic.
+
+### A shader may declare more than its pipeline provides
+
+Five pipelines were failing to compile because a shader declared something the pipeline's own
+description did not mention. On the GL side that is legal and the game relies on it:
+
+- `GlProgram::setupUniforms` enumerates the uniform **blocks the shader declares** with
+  `glGetActiveUniformBlockName` and gives `Projection`, `Lighting`, `Fog` and `Globals` a binding
+  of their own, so `RenderSystem.bindDefaultUniforms` finds them even when the pipeline never asked
+  for them. `core/terrain` imports `globals.glsl` and reads `CameraBlockPos`, while
+  `TERRAIN_SNIPPET` only lists `Projection` and `ChunkSection`.
+- Attribute locations are bound from the pipeline's vertex format, and an attribute with no binding
+  reads the default generic value. `core/rendertype_crumbling.vsh` declares `in vec3 Normal` while
+  `CRUMBLING` draws with `DefaultVertexFormat.BLOCK`, which has no Normal - and the shader never
+  reads it.
+
+wgpu has neither behaviour, so the Rust preprocessing shim now reproduces the observable result:
+
+- `add_implicit_uniforms` walks the blocks the shaders declare and gives the ones the pipeline left
+  out a binding, appended after everything it did declare. `with_implicit_uniforms` appends matching
+  entries to the pipeline's own descriptor, which is what puts them in the pipeline layout *and* in
+  every bind group built from it, so `bindDefaultUniforms` fills them by name.
+- `drop_unprovided_inputs` removes an `in` declaration nothing will provide, before locations are
+  numbered. Leaving it in place is what produced `Multiple bindings at location 0 are present`.
+- Both were `.expect`s that aborted the process. What is left of that - a uniform or a shimmed
+  sampler the pipeline cannot bind at all - now logs and gets a binding that cannot collide, so the
+  shader still compiles and wgpu reports the unmatched binding by number.
+
+### NeoForge's early loading window has to be off
+
+`ClientModLoader.finish` ticks FML's early loading screen, and that renders through OpenGL **from
+Minecraft's render thread**:
+
+```
+FATAL ERROR in native method: No context is current or a function that is not available in the
+current context was called. The JVM will abort execution.
+    at org.lwjgl.opengl.GL11C.glIsEnabled(Native Method)
+    at net.neoforged.fml.earlydisplay.render.GlState.readFromOpenGL(GlState.java:129)
+```
+
+That only works in vanilla because Blaze3D's GL backend made a GL context current on that thread.
+This mod deliberately does not, so the first GL call aborts the JVM. Whether the early window
+exists is decided by FML before any mod loads, so the mod cannot turn it off itself; the only lever
+is `earlyWindowControl` in `config/fml.toml`, which the `configureEarlyWindow` Gradle task now
+writes before every `runClient`. With it off the log says
+`ImmediateWindowProvider not loading because splash screen is disabled` and startup goes through.
+**Anyone running this mod needs the same setting**, and loses the early loading screen with it.
+
+### Getting past the constructor took three fixes
+
+All three were latent bugs that had never been reached, because the mod used to die while the mod
+list was still being constructed:
+
+1. **`WgpuNative`'s own initialisation order.** The object loads the native library from an `init`
+   block declared above `NATIVE_RESOURCE_ROOTS`, and Kotlin runs an object's initializers in
+   declaration order, so the resource-root list was still `null` when the loader searched it. The
+   list is now a file-level declaration, where the ordering cannot be got wrong.
+2. **`loadWm` called two JNI functions that do not exist.** `CoreLib.init()` asked Rust to install
+   LWJGL's allocator, but that shim is commented out in `rust/wgpu-mc-jni/src/alloc.rs`, and
+   `setClassLoader` has no Rust counterpart at all. `UnsatisfiedLinkError` is an `Error`, so the
+   `catch (e: Exception)` around the call did not see it and the game died in `Minecraft`'s
+   constructor. `loadWm` now only loads the library, exactly like the Fabric module's
+   `WgpuNative.loadWm`, and `CoreLib` is gone. **Anything added there needs a matching `#[jni_fn]`
+   on the Rust side, or the first touch of `WgpuNative` kills the game.**
+3. **`DebugHUDMixin` contributed a public static method to its target.** Mixin rejects that
+   outright. The lines it collected were never rendered anyway, because 26.1 builds the F3 line
+   list as a local and passes it to the private `extractLines`. The mixin now appends to that list
+   through `@ModifyArg`, which is both legal and makes the diagnostics actually appear.
+
+### Why the game rendered black, and then pink
+
+The last two things between "the renderer comes up" and "the game is playable" were both state
+translations that looked right and were not, and both were found by dumping the renderer's own
+output rather than by reading code.
+
+1. **A render pass with no clear value cleared anyway.** `BlazeAttachmentDescriptor::clear_value`
+   is null when Minecraft asks for no clear - that is `OptionalInt.empty()` - and OpenGL loads the
+   attachment in that case. The port used `wgpu::Operations::default()` for it, and wgpu's
+   `Default` for `Operations` is `LoadOp::Clear(V::default())`, i.e. *clear to transparent black*.
+   Every pass without an explicit clear therefore wiped the target first, which is why the title
+   screen presented as its bare panorama: the panorama pass ran last and erased the GUI pass before
+   it. It is now `LoadOp::Load`, and the depth attachment honours the clear value it is given
+   instead of always loading (`clearDepth` used to be dropped on the floor).
+2. **`NativeImage` pixels were uploaded big-endian.** `NativeImage#pixels` packs a pixel per int as
+   **ABGR**; the four bytes of an `Rgba8Unorm` texel are R, G, B, A, which is that int written
+   *little*-endian. `ByteBuffer` is big-endian unless told otherwise, so every texture arrived as
+   `(A, B, G, R)`: alpha in red, green and blue swapped. That is the washed-out pink the whole game
+   was drawn in - red pinned at 255 everywhere, because the alpha channel is 255 nearly everywhere.
+   One `.order(ByteOrder.LITTLE_ENDIAN)` fixes every texture in the game at once.
+3. **"No depth state" was turned into a depth test.** A pipeline whose `depthStencilState` is null
+   means the depth test is off, which is how every GUI pipeline is declared - the title screen, the
+   HUD, the debug overlay. The port filled that in with `LESS_THAN_OR_EQUAL` *and* depth writes on,
+   so the GUI was depth-tested against whatever the panorama had just written and lost. wgpu will
+   not accept a pipeline with no depth-stencil state in a pass that has a depth attachment, so "off"
+   is now spelt `Always` with writes disabled, which is the same thing.
+
+The bytes and the depth state are also why the two symptoms looked unrelated: the pink was in the
+textures, the missing GUI was in the pipeline state.
+
+### A colour coming out of a texture is a texture problem
+
+The dump above is what settled it, twice.
+
+**First round: alpha in red.** `tex-minecraft-textures-gui-title-background-panorama-layer0.raw` held
+the panorama's face 1 rotated by 180°, with `r` equal to the source's alpha and `g`/`b` swapped -
+which is a *channel permutation*, not a shading bug, and no amount of looking at blends, uniforms or
+projections would have found it. Matching the dumped bytes against the PNG's own pixels (24
+candidate permutations x two flips) reported `mad=0.00` for exactly one of them, and that is what
+named the bug: the upload wrote the image's pixel ints big-endian, so an `(R, G, B, A)` texel came
+out `(A, B, G, R)`.
+
+**Second round: red and blue swapped.** The fix for the first round - write those ints
+little-endian - was still one channel pair off, and it put the sky in orange with the blue GUI
+icons in red. The trap is that 26.1 has two pixel representations and they are one conversion apart:
+
+- `NativeImage` stores **ABGR** ints and `GlCommandEncoder` uploads the image's own buffer, so
+  `glTexSubImage2D(GL_RGBA, GL_UNSIGNED_BYTE, pointer)` reads an ABGR int's little-endian bytes,
+  which are `R, G, B, A` - the layout an `Rgba8Unorm` texel wants;
+- `NativeImage#getPixels()` is **not** that buffer. It copies and converts every element through
+  `ARGB.fromABGR`, so it hands back ARGB, and an ARGB int's little-endian bytes are `B, G, R, A`.
+
+The upload used `getPixels()` and then trusted the endianness, which is what swapped red and blue.
+It now takes the four channels apart explicitly (`R` is bits 16-23, `G` 8-15, `B` 0-7, `A` 24-31)
+and writes them in order, so no int representation can be mistaken for the byte layout again. The
+same measurement confirms it: the uploaded face against `panorama_1.png` reports
+`perm=0123 flipY mad=0.00` - the identity permutation - where it used to report `perm=2103`. The
+`flipY` is the cube face's own orientation and not a colour matter, and the same file also explains
+why this reached everything: every block, item, GUI, font and panorama texture in the game is
+uploaded through that one call.
+
+The other upload entry point, the `ByteBuffer` overload, is passed through unchanged and that is
+correct: `UnihexProvider` is its only caller in 26.1, it fills the buffer with `0xFFFFFFFF` and `0`
+(white and transparent, where no channel order can go wrong), and OpenGL reads the very same four
+bytes per texel as `GL_RGBA`.
+
+### Widget backgrounds were missing because render targets are the other way up
+
+The title screen drew its logo, its splash text, every button *label* and both corner strings - and
+no button backgrounds at all. The labels and the logo come from textures that were uploaded, so the
+one thing they have in common is what the missing part is not: the backgrounds come from
+`minecraft:widget/button`, a sprite in `minecraft:textures/atlas/gui.png`, and that atlas is not
+uploaded. 26.1 *renders* it: `TextureAtlas#uploadInitialContents` draws every static sprite through
+`animate_sprite_blit` into `mipViews[level]`, one pass per mip level, and the GUI later samples the
+result with `u = x / width, v = y / height`.
+
+That works on OpenGL and not here, because OpenGL and every other API disagree about which end of a
+render target clip-space `y = +1` is. In OpenGL a framebuffer's first texel row is its window origin
+row - the bottom-left corner - so `y = +1`, the top of the projection, lands on the *last* texel row.
+Vulkan, D3D and Metal all put it on the *first*, and wgpu normalises them, so the sprite quads were
+drawn into the atlas mirrored. Minecraft then sampled the rectangle it had packed the sprite into and
+found empty atlas, which draws nothing at all.
+
+Nothing notices while the target is only presented - the picture comes out the same either way up -
+and that is why this survived the earlier rounds. It shows the moment a render target is *sampled
+with Minecraft's own texture coordinates*, and in 26.1 that is every sprite atlas, the GUI item
+atlas and the picture-in-picture renderers.
+
+The fix is one statement appended to `main` in every translated vertex shader
+(`preprocessing::EmulateGlClipSpace`), on top of the depth-range patch that was already there:
+
+```glsl
+gl_Position.y = -gl_Position.y;
+```
+
+That is what a translation layer does for the same reason, and it needs one compensation: the
+present blit now turns the image over on its way to the swapchain (`PresentBlit` in `device.rs`,
+replacing `wgpu::util::TextureBlitter`). It also puts `gl_FrontFacing` back the way Minecraft
+expects it, because front-facing is counter-clockwise in *window* coordinates in OpenGL and
+counter-clockwise in *framebuffer* coordinates here, and mirroring the clip space is what
+reconciles the two.
+
+Three things were wrong around the same area and were found while looking for it:
+
+1. **A texture's mip chain was created with one level.** `create_texture` hardcoded
+   `mip_level_count: 1` and ignored the count Minecraft asked for, so `blocks.png` (2048x2048, five
+   levels) had nowhere to put levels 1-4.
+2. **A texture view ignored the mip range it was asked for.** `base_mip_level` was 0 and
+   `mip_level_count` was "the rest" for every view. wgpu only accepts a view with *exactly one* mip
+   level as a render attachment, and the level a view starts at is the size the pass renders at, so
+   the five `Animate blocks.png` passes all rendered into mip 0 - each one a shrunken copy of the
+   whole atlas, on top of the last.
+3. **`write_to_texture` dropped every upload with `mip_level != 0`.** That was a guard against
+   levels that did not exist, and with (1) fixed it is a bounds check instead: Minecraft uploads a
+   sprite's whole chain one level at a time, and a 9x9 sprite in a five-level atlas legitimately has
+   fewer levels than the atlas does.
+
+**How it was found**, because none of this is visible in a log: with the frame dump on, the GUI
+atlas is written out too (`atlas-minecraft-textures-atlas-gui-png.raw`), and matching
+`widget/button` - 200x20 pixels of vanilla resource pack - against it reported its *last* row at
+y = 1022 with the rows running upwards, i.e. the sprite mirrored about the middle of the atlas.
+Flipping the dumped atlas made it look like a normal `gui.png` again. After the fix the same match
+reports the sprite's *first* row at (723, 1), rows running downwards, which is the coordinate the
+stitcher packed it at.
+
+### The scissor rectangle is OpenGL's, and is forwarded as it is
+
+`RenderPassBackend#enableScissor` used to be a no-op on the grounds that 26.1 never calls it. It
+does: a title screen that walks into the options screen logs two rectangles (`0 120 854 262` and
+`0 98 2562 1137`), and `GuiItemAtlas` sets one around every item it renders into its atlas. Both
+callers build the rectangle the OpenGL way - `GuiRenderer#enableScissor` as
+`windowHeight - bottom * guiScale`, `GuiItemAtlas` as `textureSize - bottom` - which is measured
+from the target's origin row, the row this backend renders into. So it is forwarded unchanged, and
+only clamped: OpenGL clips a scissor box that reaches outside the framebuffer and wgpu *rejects*
+one, and the rectangle a scaled GUI hands over can reach past the edge (`2562` wide in an `854` wide
+window).
+
+### Reading the settings before they are needed
+
+`sendRunDirectory` loads `config/wgpu-mc-renderer.json` and was called from
+`FMLClientSetupEvent`, which fires *after* `Minecraft`'s constructor has already created the
+window, the wgpu instance, the adapter and the swapchain. The `backend` setting was therefore read
+after the decision it controls had been made, and switching to DirectX 12 did nothing at all. The
+mod constructor now reads it - `FMLPaths.GAMEDIR` is available that early - and `sendRunDirectory`
+became idempotent, because `OnceCell::set` on the second call used to `unwrap()` into a panic, and
+the panic hook exits the game.
+
+### A shader that came back with the wrong operator
+
+The world drew its sky, its clouds, its sun and its fog and then a *white void* where the terrain
+should be. Every input the terrain shader asks for turned out to be correct - the block atlas bound
+to `Sampler0`, the lightmap to `Sampler2`, `Globals` carrying `ScreenSize` 854x480, `ChunkSection`
+carrying a sane `ModelViewMat` - and the answer was in the *shader source we hand to naga*:
+
+```glsl
+rgssColorLow *= 0.25;   // terrain.fsh, as Minecraft ships it
+rgssColorLow -= 0.25;   // what came out of our preprocessor
+```
+
+`rgssColorLow` is the sum of four rotated-grid samples, so averaging it is a multiplication. Turned
+into a subtraction, every RGSS-filtered surface - the user's `Filtering: RGSS` setting - comes out
+at *four times* its colour minus a quarter, which clips to white. That is the whole symptom: terrain
+that is drawn, in the right place, with the right texture, and then blown out.
+
+The blame is `cyntax`'s lexer, which had a copy-paste error in its two-character punctuators:
+
+```rust
+span!(range, '*') if matches!(self.chars.peek(), Some(span!('='))) => {
+    PreprocessingToken::Punctuator(Punctuator::MinusEqual),   // *= parsed as -=
+```
+
+`*=` was the only operator affected - `+=`, `-=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` all
+survived - which is why nothing else in the game looked wrong. The crate is now **vendored** at
+`rust/cyntax` with the one-line fix, instead of being pinned to a revision of a fork, and
+`preprocessing.rs` carries three tests that run every compound assignment through the preprocessor
+and assert it comes back unchanged. They fail against the old revision.
+
+### Not every Minecraft topology is a triangle list
+
+`PrimitiveTopology` used to be translated with `match … { _ => TriangleList }`, which is right for
+exactly one of the two shapes that matter:
+
+- `QUADS` *is* a triangle list and has to stay one - Minecraft's index buffer for the mode expands
+  each quad into `i, i+1, i+2, i+2, i+3, i` on the CPU - so the GUI and the terrain kept working and
+  hid the bug.
+- `LINES` is not. Its index buffer is `i, i+1, i+2, i+3, i+2, i+1`, three line segments per group of
+  four vertices, because `rendertype_lines.vsh` expands each pair into a quad through
+  `gl_VertexID % 2`. Drawn as triangles, the F3 overlay's 3D crosshair became long thin triangles
+  across the whole screen - the "pointer stretched along the diagonal" - and so did every hitbox and
+  chunk border.
+
+`TRIANGLE_FAN` has no wgpu equivalent at all, so `draw_indexed` expands it: Minecraft's fan indices
+are the sequential range, and the triangles are `(0,1,2), (0,2,3), …`, so a cached index buffer is
+built per size and bound for that draw. The same change had to zero the depth bias for line and
+point topologies, because wgpu rejects it there - `Depth bias is not compatible with non-triangle
+topology LineList` - and OpenGL ignores polygon offset for lines too.
+
+### Two ways a screenshot could not work
+
+Pressing F2 ended the process. `Screenshot.takeScreenshot` reads a whole 854-wide target in one
+`copy_texture_to_buffer` call, this side passed `bytes_per_row = width * 4` straight through, and
+wgpu requires a multiple of 256:
+
+```
+wgpu error: Validation Error
+Bytes per row does not respect `COPY_BYTES_PER_ROW_ALIGNMENT`
+```
+
+A validation error is fatal here - it runs the panic hook - so the fix is the one `dump_texture_rgba`
+had always used: copy through a padded scratch buffer and write the rows back one at a time. With
+that fixed the screenshot was *black*, because the read half of `mapBuffer` had never been
+implemented: the staging buffer was allocated, handed to Blaze3D and freed without ever being filled
+from the GPU. `read_buffer` now maps (through a scratch buffer of this side's own, so a buffer
+Minecraft maps itself is left alone), waits for the GPU and fills it.
+
+Two more diagnostics came out of the same dig, both behind the `wgpu-dump-frames` marker:
+
+- a file named `wgpu-dump-shaders` in the run directory writes every pipeline's *processed* GLSL to
+  `wgpu-shaders/`, which is the only way to see the binding numbers and the operators a shader was
+  actually compiled with;
+- the first bind of each sampler logs *which texture* it got (`pass Section layers for opaque binds
+  Sampler0 to minecraft:textures/atlas/blocks.png`), and the first bind of each uniform reads its
+  bytes back and logs them as floats and ints. Buffers now carry `COPY_SRC` for exactly this - the
+  same thing textures already did - except the mappable ones, where wgpu rejects the combination.
+
+A panic also writes itself to `wgpu-panic.txt` in the run directory now. A native crash takes
+whatever stderr still had buffered with it, which is why the first screenshot crash left a crash
+report with no message anywhere in the log.
+
+### Five crashes that were all one mistake about pointers
+
+The session that first reached a world alive died twice within a minute of getting there, each time
+on a wgpu validation error, and neither death was Minecraft's fault. The liveness registry that
+decides whether a texture may still be used was keyed on `&wgpu::Texture` - and `create_texture`
+registered the address of its own *local*, while the pointer the JVM is handed is the address of the
+`Box` built from it. Every live texture was therefore unlisted, and the allocator hands a freed box's
+address straight back out, so a brand new texture was regularly recognised as its dead predecessor:
+
+- the "after it was closed" warning fired on healthy textures, and the texture was replaced by the
+  placeholder the registry exists to hand out;
+- the placeholder was 1x1, so the pass that drew into it with the real target's scissor died on
+  `Scissor Rect { x: 0, y: 0, w: 878, h: 504 } is not contained in the render target (1, 1, 1)`;
+- a clear whose colour *and* depth texture were both "closed" built a render pass with no
+  attachments at all: `No color attachments or depth attachments were provided`;
+- the swapchain recovery called `configure_surface_inner`, which returned early because the
+  configuration was *unchanged* - and the unchanged configuration is what was broken. It logged
+  `still no swapchain image after reconfiguring: Validation` once per frame for 1633 frames while
+  the window showed nothing;
+- the buffer side had no registry at all, so the same use-after-close ended the run as
+  `In Queue::write_buffer - Buffer with 'Cloud UTB #1' label is invalid`. Minecraft closes that
+  uniform texel buffer and writes to it in the same frame.
+
+Each one is fixed where it belongs. The registry is keyed on the boxed address, which is what
+`drop_texture` sees again, so a live texture is never mistaken for a dropped one; the tombstone
+remembers the label, size and format it was dropped with, because none of those may be read out of a
+freed texture; a placeholder is the size the real texture had, since wgpu checks every scissor
+against the render target; a clear with nothing left to clear returns instead of building an empty
+pass; the swapchain recovery reconfigures *forcibly*; and a closed buffer is quarantined for two
+seconds before it is really dropped, which makes the cloud buffer's write land in a buffer that
+still exists.
+
+What the guards are for - Minecraft rebuilding a render target on a resize and something in the same
+frame still holding the old textures - has not gone away, and a genuine use-after-close now logs the
+label, size and format it was refused for. In a full run of the fixed build there were none.
+
+### The leak was one command encoder per Minecraft command encoder
+
+The game grew from one gigabyte to twenty in a minute and took the machine with it, from the very
+first frames and with no gameplay involved. The counters that eventually found it - live textures,
+views, buffers, passes, bind groups and encoders, printed every 120 frames - showed everything flat
+except one line:
+
+```
+live resources: 767 textures (74 MB), 786 views, 47 buffers (0 MB, 5 quarantined), 1 encoders, ...
+```
+
+The number before that fix was 24000 and climbing by about 960 a second. `CommandEncoder` in
+Blaze3D is **not** `AutoCloseable` and has no `close`: it is a plain object that the garbage
+collector takes away, which is free in the OpenGL backend, whose encoder owns nothing. Here every
+one of them owned a `wgpu::CommandEncoder` - a D3D12 command allocator and command list holding the
+frame's recording - and none of that is visible to the Java heap, so nothing ever collected it:
+
+- three encoders a frame (`Minecraft#runTick` makes one per frame, and the renderer more),
+- a few hundred frames a second, because this backend runs without vsync in the menus,
+- about 200 KB of command buffer each, which is the 200 MB/s the process was growing at.
+
+Every handle now shares **one** native encoder, and the pointer the JVM holds is an empty box. The
+recording order is what matters and everything is recorded on the render thread in call order, so
+one encoder is enough; `flush_encoder` submits what has been recorded and starts a new one, exactly
+as before. A cleaner that gave the encoder back when the object was collected was written first and
+is not enough on its own: the collector has no reason to run, because the memory it cannot see is
+the memory that matters.
+
+Two other things came out of the same dig: `present_surface` now polls the device, because wgpu
+frees a submission's command buffers and staging memory when it is polled and the GPU has caught up,
+and the diagnostics that read a uniform back are rationed to four a second. The readback flood was
+doing 4722 readbacks for the blocks atlas alone - Minecraft binds one uniform *per sprite* while it
+animates an atlas, and keying the "report this again" set by offset instead of by name made every
+sprite a fresh readback, each one allocating, submitting and waiting.
+
+### One plan for a pipeline's bindings
+
+Three things have to agree about where a binding lives: the wgpu `BindGroupLayout` that the pipeline
+is built against, the `layout(binding = N)` annotations written into the GLSL, and the entries and
+dynamic offsets of the bind group handed to `set_bind_group` at draw time. They used to be derived
+separately - by a walk of the pipeline descriptor, by a map built for the shader rewriter, and by
+another walk in `finalize_binding_builder` - and they disagreed, which is how a bind group came to
+carry an offset list in one order while its layout expected another.
+
+`blaze::BindGroupPlan` is now the single description, computed once per pipeline variant:
+
+- `BindGroupPlan::number` numbers the bindings from the pipeline description, one per buffer and two
+  per combined sampler. The GLSL annotations are written from `shader_locations()`, which is that
+  numbering; the wgpu layouts come from `create_layouts()`; the bind group entries and the dynamic
+  offsets come from walking `sets`, so the offsets list cannot be in a different order from the
+  layout's dynamic bindings - it *is* that order.
+- The uniform blocks a shader declares but the pipeline never listed are appended to the plan at the
+  binding numbers the shader rewriter reserved for them. That replaced `with_implicit_uniforms`,
+  which cloned the whole descriptor and leaked a `CString` per entry per pipeline; the descriptor
+  copy is gone with it.
+- `min_binding_size` is no longer left unset. `reflected_block_sizes` parses the preprocessed GLSL
+  with naga and reads each uniform block's size out of it - the same view wgpu validates against - so
+  a layout declares what the shader reads and the binding is checked when it is created rather than
+  being left to wgpu's late per-draw check.
+
+The defects the same review turned up:
+
+- **A dynamic offset is a `u32`** and the slice offsets are `u64`, so an offset past four gigabytes
+  would have been truncated into a binding that pointed somewhere else. An offset that does not fit
+  is now baked into the binding instead of being handed over as a dynamic one.
+- **`roundToward(length, 16)` ran past the end of the buffer.** The JVM rounds a slice's length up to
+  the sixteen bytes a uniform range wants, and a slice whose last byte was the buffer's last byte
+  became a binding four bytes too large, which wgpu refuses. Both sides clamp now: the JVM stops the
+  rounding at the buffer's end, and `binding_size` clamps again where the buffer is in hand, so the
+  size is never past the end and never smaller than the shader's block.
+- **A storage buffer was given a dynamic offset** it cannot have - DX12 has no offset for a storage
+  descriptor - while the layout did not declare one. That was the "BindGroup expects 4 dynamic
+  offsets. However 5 dynamic offsets were provided" that ended a run. Only uniform bindings are
+  dynamic now, and the offsets list is built from the plan's uniform bindings alone.
+
+**Dynamic offsets are on.** The plan gives the order, the offsets are built in it, the alignment and
+the `u32` are checked per binding, and an offset that fails either check is baked into the binding
+instead with a zero offset, which lands on the same range. What held the switch off was that a
+multi-binding layout drew *wrong* with it - which turned out to be the bind group cache keyed on the
+builder's map slot rather than on the resource, so it answered with a set built for a different
+texture; see "The cache was keyed on the wrong address". With that fixed, a world renders correctly
+with 327560 of 327680 draws served from the cache. `wgpu-no-dynamic-offsets` turns the feature off,
+and `wgpu-dynamic-offset-names` (a comma-separated list) restricts it to some uniforms, which is how
+one binding at a time can be ruled in or out.
+
+### The sky came out as one forty-five degree wedge
+
+`SkyRenderer#buildSkyDisc` writes a centre vertex and nine rim vertices forty-five degrees apart,
+draws them with `RenderPass#draw(0, 10)`, and binds a `TRIANGLE_FAN` pipeline. wgpu has no fan
+topology, and this side only expanded fans for *indexed* draws - which is where Minecraft's
+sequential fan index buffer goes. The disc, drawn with no index buffer at all, was forwarded as a
+plain triangle list: wgpu paired the vertices up sequentially, so only `(0, 1, 2)` was a real fan
+triangle and the rest of the sky was missing. What that looks like in a world is a blue wedge 45°
+wide on a white background, which a player reasonably describes as "there is no fog in that
+direction" - the sky is where the fog gradient is.
+
+Non-indexed draws are now expanded by topology as well: a fan becomes `(0, 1, 2), (0, 2, 3), ...`
+over a generated index buffer, and a run of quads becomes Minecraft's own quad pattern
+(`i, i+1, i+2, i+2, i+3, i`). The frame dump made this obvious, which is the whole point of having
+one: `node .dsh-tmp/raw2png.mjs` on `frame-N-source.raw` showed the wedge directly.
+
+### A texel of `CloudFaces` is one byte, not one `int`
+
+The clouds were drawn but wrong: a handful of faces near the camera instead of a layer, which reads
+as "only the chunk I am standing in has clouds". `CloudRenderer#encodeFace` writes **three bytes**
+per face - `cellX >> 1`, `cellZ >> 1`, and a direction-and-flags byte - and
+`rendertype_clouds.vsh` fetches `texelFetch(CloudFaces, face * 3 + n)`, so the buffer's texel format
+is R8I: one texel is one byte. This side's texel-buffer shim declared the SSBO as `int[]` and read
+`inner[index]`, which takes *four* bytes per fetch, so every field after the first came out of the
+wrong place and the decoded cell coordinates were nonsense. The shim now declares a `uint[]` and
+extracts the byte:
+
+```glsl
+ivec4(int((CloudFaces.inner[uint(index) >> 2u] >> ((uint(index) & 3u) << 3u)) & 0xFFu), 0, 0, 1)
+```
+
+Zero-extended rather than sign-extended, because every use of a fetched value in that shader is a
+mask or a shift, which sign extension would not have changed. The three tests it comes with encode
+Minecraft's byte layout, decode it back, and check that the four-byte read the shim used to do gives
+a different answer - so a future change to the layout has to fail a test rather than a screenshot.
+
+### What this side hands out, and what brings it back
+
+Every one of these is a `Box` whose address the JVM holds, and a missing `drop` on the far side
+leaks it and everything it owns. Blaze3D is not much help: `CommandEncoder` and
+`CompiledRenderPipeline` are neither of them `AutoCloseable`, and `RenderPipeline` has no `close`
+either, so two of these lifetimes had to be invented rather than implemented.
+
+| Native object | Held by | Released by | Notes |
+| --- | --- | --- | --- |
+| `wgpu::Texture` | `WgpuTexture` | `close` → `drop_texture` | Minecraft closes its textures; the tombstone keeps the label for a later use-after-close |
+| `wgpu::TextureView` | `WgpuTextureView` | `close` → `drop_texture_view` | |
+| `wgpu::Buffer` | `WgpuBuffer` | `close` → `drop_buffer` | kept alive for two seconds afterwards, because Minecraft writes to the cloud buffer after closing it |
+| `wgpu::Sampler` | `WgpuSampler` | `close` → `drop_sampler` | |
+| `wgpu::CommandEncoder` | every `CommandEncoder` handle | nothing: there is one for the session | Minecraft makes three a frame and never frees any |
+| `BlazePipeline` ×2 | `WgpuCompiledRenderPipeline` | `clearCaches`, or a cleaner → `drop_pipeline` | one per depth state; `clearCaches` is what Minecraft calls on a resource reload |
+| `wgpu::BindGroup`s | one set per plan per pipeline, owned by the pass or the cache | when the pass closes, or when the cache evicts the least recently used set past 256 | see below |
+| `wgpu::RenderPass` | `WgpuRenderPass` | `close` → `drop_render_pass` | with the draw call buffer, which goes back to the thread that owns it |
+
+The caches are all bounded, and they report their size every 120 frames with the diagnostics on
+(`… 184 pipelines, 486 tombstones, 0 fan + 0 quad index buffers`):
+
+| Cache | Bound | Behaviour |
+| --- | --- | --- |
+| compiled pipelines | Minecraft's own pipeline set | reused per `RenderPipeline`; freed on a reload |
+| shader sources | the shader variants in use | reused per `(id, stage, defines)`; cleared with the pipeline cache |
+| dead-texture tombstones | 512, oldest first | a tombstone only has to outlive the frame that closed the texture |
+| placeholder textures | one per format, grown on demand | the stand-in for a closed texture; a window resize used to leave a full-size texture behind at every size it had ever been |
+| fan and quad index buffers | 64 sizes, then emptied | rebuilt on demand; the buffers are a few kilobytes |
+| quarantined buffers | 2 seconds or 1024 entries | |
+| `CommandEncoder` | 1 | see above |
+| diagnostics sets | once per name, or one entry per second | the readback budget keeps its "already warned" second in a field, not in a set that grows once a second for the whole session |
+| interned names | one per name the game asks for | see "A name is encoded once" below; the set follows the loaded assets |
+| draw call buffers | one per pass open at a time, per thread | pooled rather than allocated; see "One downcall per draw" |
+
+A resource reload is the test for the pipeline half: three of them in a row leave the count at 184,
+where it used to climb by 184 each time.
+
+### Bind groups are built per draw, and the cache that was meant to stop it
+
+A bind group was built for every draw and freed as soon as the draw call returned, which the
+counters make plain:
+
+```
+render stats: … 244945 draws (244945 bind groups built), …
+```
+
+That is bounded - the live count is zero whenever it is sampled, and `BindGroups_`'s `Drop` is what
+decrements it - but it is one `wgpu::BindGroup` per draw, sixty to eighty thousand a second at the
+title screen. The obvious fix is to reuse the last set while nothing has been re-bound, so the pass
+now owns its set and rebuilds it only when something changes. Then the measurement that says whether
+that was worth anything:
+
+```
+wgpu: 81025 draws, 81025 of them had to rebuild their bind groups
+```
+
+Every draw. Minecraft re-binds at least one uniform for every draw it makes - a chunk section's
+matrix, an entity's transform, a GUI element's pose - and a bind group bakes the buffer *offset*
+into itself, so no two of them are alike. The reuse path is therefore correct and never taken, which
+is what **dynamic offsets** are for: one bind group per pipeline, with the moving offset passed at
+bind time. `min_uniform_offset_alignment` is exported for it and Minecraft's uniform ring already
+aligns its slices to it.
+
+The offset was then left out of the cache key, so that a set could be shared between draws that
+differ only in it, and the reuse arrived - 99.96% of draws served from the cache - **with the frame
+disassembled**: the world came out as a checkerboard of dark tiles, the hotbar was a cyan smear, and
+every slot of a sprite atlas held the same sprite. See "The cache was keyed on the wrong address"
+for what that turned out to be.
+
+The same pass found the buffer quarantine holding far more than it needs: the use-after-close it
+guards against happens *within a frame*, so two seconds and a thousand entries became half a second
+and a hundred and twenty-eight, and the title screen's 162 quarantined buffers - 676 MB live between
+them, because Minecraft's uniform rings are megabytes each - became 57.
+
+### The cache was keyed on the wrong address
+
+The bind group cache is keyed by a hash of everything a set is built from, and for a buffer that was
+`buffer as *const wgpu::Buffer` - the address of the `wgpu::Buffer` *the builder's map holds*, not of
+the buffer. It is a clone of the handle Rust was handed, stored under the binding's name, so its
+address is the address of that map slot: one per name, reused by every draw that binds that name,
+**whatever it binds to it**.
+
+That is fine while a name always means the same resource. It is not fine for the sprite atlas, where
+Minecraft binds a different texture view to `Sprite` for every sprite, or for the uniform buffers it
+hands out one per draw: the key stayed the same, so the cache answered with the set built for the
+*first* one - a set holding the first sprite's view and the first draw's buffers - and every draw
+after it sampled the wrong texture. Which is exactly what the picture showed: one sprite copied into
+every slot of the atlas, terrain tiles drawn from a single wrong uniform, a hotbar that was one
+stretched quad.
+
+The old key escaped this in baked mode by accident: the uniform offset was part of it, and Minecraft
+hands out a fresh (buffer, offset) pair almost every draw, so the keys almost never repeated - 0.6%
+of draws were cache hits, and those few were the ones that could go wrong. Leaving the offset out of
+the key, which is the whole point of dynamic offsets, turned that rare collision into the common
+case.
+
+The identity is now the pointer the JVM handed over - the address of the box Rust gave it, which
+lives exactly as long as the resource does. It is also, and this is the point, the address
+`invalidate_bind_group_cache` is called with when something is freed, so the cache and the
+invalidation finally agree about what "the same buffer" means. Two smaller things came with it:
+
+- `reflected_block_sizes` read `variable.name` out of naga, which is empty for a GLSL
+  `layout(std140) uniform Block {...};` - the block's name is on the *type* - so it reflected nothing
+  at all and every layout went out with `min_binding_size: None`. With the fallback in place the
+  layouts declare the size the shader reads, which is what the plan was written to be able to do.
+- The trace behind `wgpu-trace-dynamic-offsets` now prints what the plan decided per binding
+  (identity, offset, size, dynamic or baked), which is how this was found at all.
+
+Measured in a world afterwards, with dynamic offsets on and the frame correct:
+
+```
+render stats: 327680 draws (120 bind groups built, 327560 cache hits and 120 misses)
+```
+
+One hundred and twenty bind groups built for a third of a million draws, where it used to be one
+per draw. The switches: `wgpu-no-dynamic-offsets` bakes the offsets instead, `wgpu-no-bind-group-cache`
+builds a set per draw, and `wgpu-dynamic-offset-names` restricts the feature to a list of uniforms.
+
+### One downcall per draw, and bindings by slot
+
+The cache above made the bind groups rare; it did not make the *draw path* short. Every binding was
+still its own downcall - `bind_render_pipeline_to_pass`, `bind_buffer`, `bind_texture_and_sampler`,
+`set_index_buffer`, `set_vertex_buffer`, then `draw` or `draw_indexed` - and behind each one:
+
+- the JVM allocated a `Box` for the pass's binding builder and one per binding resource, and the
+  binding resource owned its name, so every binding copied a `String` into native memory;
+- the native side hashed that name into a map per binding per draw, and `drop_bind_groups` freed
+  the previous set on the way;
+- the pass's bind groups lived behind a `Mutex`, the cache key was built with `DefaultHasher`
+  (SipHash, chosen for HashDoS resistance in a `HashMap` that never sees untrusted input), and the
+  cache's LRU counter was a global `fetch_add` - two atomics and a lock acquisition per draw, all
+  to protect a structure only the render thread could reach.
+
+None of that was measurable in a profile until it was gone, which is the usual argument for not
+having written it. What replaced it:
+
+**The plan is read once.** `pipeline_bindings` fills a caller-supplied array with one entry per
+binding - the name, the declared name, the set, the binding number and the kind - and the JVM turns
+that into a slot table per compiled pipeline (`PlanBindings`). From then on a binding is an index:
+`bindTexture("Sprite", …)` resolves to two slots once and is written into them, and nothing on the
+draw path looks a name up.
+
+**A draw is one call.** `draw_call` carries a `DrawCall`: the pipeline, up to eight vertex buffers
+with a presence mask, the index buffer and its format, up to 32 bindings by slot, and the four draw
+parameters. The JVM writes into a buffer it owns as things are bound and fills in the parameters at
+the draw, so the native side learns the whole state of the draw at once and applies it - pipeline,
+vertex buffers, bind groups, index buffer, draw - in that order.
+
+**The pass owns its bind groups.** `BlazeRenderPass` keeps the set it last bound, the key it was
+built for, and the dynamic offsets per group. A draw that hashes to the key the pass already holds
+reuses the set and hands over new offsets, which is the common case and involves no cache lookup at
+all; the cache is consulted only when the key changes, and it answers with an `Arc` the pass keeps.
+`drop_bind_groups` is gone: the last reference to a set is released when the pass closes or the
+cache evicts it. Both cache maps are now thread-local `RefCell`s, keyed with `FxHasher`, and the
+tick counter that finds the least recently used entry is a plain field. What still needs an atomic
+is invalidation from *another* thread - the cleaner that frees a collected pipeline cannot name
+entries in a cache it does not own - so it bumps an epoch and the next lookup on the render thread
+drops everything.
+
+**A name is encoded once.** `NativeNames` interns the UTF-8 of every name into one `Arena.global()`
+instead of an `Arena.ofConfined()` per call, which is what a buffer or texture label used to cost.
+It reports its size every 4096 names, because the argument for an unbounded intern table is an
+argument about where the names come from: they are labels Minecraft wrote by hand or derived from
+asset names, and the few that carry a number carry a bounded one (`"… animation frame 3"`,
+`"UberBuffer solid 7"`).
+
+**The draw call buffer is pooled.** A pass wrote into `arena.allocate(DrawCall)` from an arena it
+then closed - an arena, an allocation and a close per pass, tens of times a frame. A closed pass now
+returns its buffer to its thread's pool and the next pass takes it back, clearing it first, since a
+reused buffer otherwise still holds the previous pass's bindings, vertex buffer mask and index
+buffer. Nested passes each take their own, so the pool holds one buffer per pass open at a time.
+
+Measured in a world, with the diagnostics on:
+
+```
+render stats: 2160 render passes (0 of them empty, last had 1 draws), 2760 pipeline binds, 385320
+draws (120 bind groups built, 2760 cache hits and 120 misses), 850193400 vertices
+live resources: 774 textures (77 MB), 793 views, 98 buffers (418 MB, 12 quarantined), 1 encoders,
+0 passes, 76 bind groups, 196 pipelines, 412 tombstones, 1 fan + 0 quad index buffers
+```
+
+The `pipeline binds` counter is the one that shows what the pass keeping its state is worth: 2760
+binds for 385320 draws, one per hundred and forty draws, where every draw used to bind its pipeline.
+The `cache hits` number *fell* from 327560 to ~2700 for the same reason - a draw that reuses the set
+its pass already holds does not consult the cache at all - and 120 bind groups are still built per
+interval, one per plan per pipeline. Nothing in the renderer frees a bind group per draw any more,
+which is what the stable bind group count across a resource reload (`F3+T`) is: the cache drops, the
+pipelines are freed, and both come back to the same size.
+
+### Neither compiler checks the two bridges, so a test does
+
+`WgpuNative.kt` names the native methods it wants, `WmNative.kt` names the C entry points and the
+byte offsets of every struct field, and Rust names what it actually exports. Neither language knows
+about the other's list, and every way the two can disagree is a *runtime* failure rather than a
+compile error:
+
+- an `external fun` with no `#[jni_fn]` throws `UnsatisfiedLinkError`, which is an `Error` - not
+  something `catch (e: Exception)` sees - the first time that code path runs, which may be minutes
+  into a session;
+- a `handle("name", ...)` naming a symbol the cdylib does not export throws from
+  `SymbolLookup#find` at whatever moment the handle is first touched;
+- a field offset that drifted reads whatever happens to live at that byte instead, which shows up as
+  a wrong colour or a wrong blend factor, not as an error.
+
+`rust/wgpu-mc-jni/src/abi_tests.rs` therefore reads both Kotlin files, with `include_str!` (so
+editing either one re-runs the test in `cargo test`), and checks them against this crate:
+
+- every `external fun` in `WgpuNative.kt` has a `#[jni_fn]` here, with the same JVM argument count
+  (Rust's two leading parameters are the `JNIEnv` and the class, so they do not count);
+- every `handle("name", ...)` in `WmNative.kt` is a `#[no_mangle] extern "C"` export with the same
+  argument count, and no export is left unbound;
+- every `MemoryLayout.structLayout(...)` in `WmNative.kt` puts its fields where `offset_of!` puts
+  them and is the size `size_of` reports - trailing `paddingLayout` entries included, which is how
+  the 24-byte `BlazeColorTargetState` is spelled out - and the named `*_OFFSET` constants agree with
+  the layout they describe;
+- every `GpuFormat`, `UniformType`, `BlendFactor`, `CompareFunction` and `PrimitiveTopology` number
+  is the one the Rust enum assigns, matched variant by variant, so adding a variant to either side
+  fails the test rather than the frame.
+
+The first run of that check found four things, all now deleted:
+
+- **21 `external fun`s that nothing implemented.** They were the GPU-object half of the old JNI
+  layer - `createTexture`, `createBuffer`, `createCommandEncoder`, `createBufferInit`,
+  `dropTexture`, `dropBuffer`, `presentTexture`, `submitEncoders`, `getMaxTextureSize`,
+  `getMinUniformAlignment`, `getRenderPassCommandSize`, `render`, `setCamera`, `setMatrix`'s
+  neighbours `getMouseX`/`getMouseY`/`setCursorPosition`/`setCursorMode`, `setAllocator`,
+  `updateWindowTitle`, `getTextureId`, `destroyPaletteStorage` - and Rust stopped exporting them
+  when the C ABI took over that job. One of them was live: `WgpuTextureManager#getTextureId` called
+  `WgpuNative.getTextureId`, so the class went with it. The file's own doc comment claimed these
+  "mirror functions that still exist on the Rust side", which was exactly the assumption that made
+  them dangerous.
+- **Six `#[jni_fn]` implementations that nothing declared**, left over from the design where Rust
+  owned the world: `setSectionPos`, `reloadStorage`, `bindRenderEffectsData`, `setLightmapID`,
+  `clearEntities`, `setEntityInstanceBuffer`. Nothing in the crate called them either, so they could
+  not run at all.
+- **`extract_directives`**, a `#[no_mangle]` GLSL-directive dump from before the JNI layer, which
+  nothing called and nothing bound.
+
+What is left is 26 JNI declarations and 52 C-ABI bindings, each with an implementation on the other
+side, and the test keeps it that way. Ten of the 26 are still only reachable from the old
+Rust-renders-the-world path (`bakeSection`, the palette calls, `setMatrix`, `cacheBlockStates`,
+`setWorldRenderState`, `createWmRenderer`): they resolve, and nothing in the backend calls them,
+because chunk baking and skinning happen on the JVM side now. `cacheBlockStates` is the exception -
+`TitleScreenMixin` starts a thread with `WgpuNative::cacheBlockStates` so the block-state colours are
+baked while the title screen is up.
+
+### Nothing ever culled a back face
+
+Leaves and every other translucent surface had black ghosts in them and flickered while the camera
+moved. Leaves are single-sided quads: in fancy graphics Minecraft meshes all six faces of every
+leaf block, including the ones between two leaf blocks, and leaves it to `glCullFace(GL_BACK)` to
+throw away whichever half of them faces away from the camera. This side never turned culling on.
+The ABI had no field for it - 26.1's `RenderPipeline#isCull` was simply not forwarded - and both
+pipeline-creation sites hardcoded `cull_mode: None`, so every quad was rasterized front *and* back.
+On an opaque quad the second copy is hidden behind the first; on a blended one the two land at the
+same depth, where which of them survives the depth test is not defined, and the back copy is shaded
+with the far side's lighting. That is the ghosting, and the flicker is the same coin landing
+differently as the view moves.
+
+`cull` is now a field of the ABI's `RenderPipeline` (offset 80, `PIPELINE_CULL`), filled from
+`RenderPipeline#isCull()` - which defaults to *true*, so a pipeline only gives up culling by asking,
+exactly as `GlCommandEncoder` answers it with `GlStateManager._enableCull()`.
+
+The winding is the part worth writing down, because getting it backwards deletes the world instead
+of fixing it. The vertex shaders flip `gl_Position.y` to emulate GL's clip space (see
+`EmulateGlClipSpace` in `rust/wgpu-mc-jni/src/preprocessing.rs`), and that mirror also mirrors the
+winding: a triangle OpenGL calls counter-clockwise - and therefore front-facing - arrives at wgpu
+clockwise. So the pairing that reproduces `glFrontFace(GL_CCW)` + `glCullFace(GL_BACK)` is
+`front_face: wgpu::FrontFace::Cw` with `cull_mode: Some(wgpu::Face::Back)`.
+
+`Ccw` was tried first, on the reasoning that "counter-clockwise in framebuffer coordinates" was
+what the flip restored. It is not, and the way it fails is worth recognising: a single-sided quad
+has no back face to fall back on, so culling the front ones removes the surface entirely. The world
+came out as a pale blue sky with the sky box's dark lower half where the ground should have been,
+the block outline still drawn around nothing, and the held item in the corner. The frame dump
+(`wgpu-dump-now`, then `node .dsh-tmp/raw2png.mjs <frame>.raw bgra`) showed it as a scanned row of
+`184,210,255` where the terrain used to be.
+
+**One thing this does not forward is `PolygonMode`.** The single pipeline that asks for `WIREFRAME`
+(`pipeline/wireframe`, the chunk-section debug view) still draws filled, because wgpu needs
+`Features::POLYGON_MODE_LINE` for it and this device does not ask for that feature.
+
+### Known gaps
+
+- **The Fabric module's C header is a snapshot from before the 26.1 work.** `fabric/src/main/wgpu-mc.h`
+  is what the Fabric backend's `jextract` bindings are generated from, and it is not
+  `rust/wgpu-mc-jni/bindings.h`: it still declares the exports this session deleted (`dummy`,
+  `thing`, `unmap_buffer`, `drop_buffer_view`, `extract_directives`) and older signatures for the
+  ones that stayed (`create_texture_view` without the mip range, `create_render_pass` without the
+  encoder handle). A Fabric build against the current cdylib would resolve handles that are no
+  longer there, so migrating that module starts with regenerating its header from `bindings.h`.
+
+- **A texture view can outlive its texture.** A long session ended with `In Texture::create_view —
+  Texture with 'FBO 2 / Depth' label is invalid`: Minecraft rebuilt a render target - a resize does
+  that - closed the old depth texture, and something still asked for a view of it. The JVM side used
+  to hand the freed pointer to `create_texture_view`, and wgpu answers that with a validation error,
+  which ends the process. `WgpuDevice#createTextureView` now checks `isClosed` first, logs whose
+  texture it was, and hands back a view of a placeholder of the same format *and size*: one frame of
+  the wrong content is a far better outcome than losing the session. The Rust side refuses a dropped
+  pointer the same way, from the tombstone the drop recorded. The caller that keeps a view past its
+  texture is still out there, and the log line names it.
+- **The swapchain refuses an image** (`get_current_texture` returning `Validation`) when the window
+  has been through something the configuration does not survive - a monitor change, a fullscreen
+  toggle, a long idle. That used to be logged and dropped, frame after frame, for minutes on end.
+  It now takes the same recovery path as `Outdated` and `Lost`: reconfigure from the stored size and
+  present mode - forcibly, since an unchanged configuration is what the recovery is there to
+  replace - and try once more, with the log line rate-limited to one every 120 frames.
+- **The expansions are exercised by the sky and little else.** `TRIANGLE_FAN` and, for non-indexed
+  draws, `QUADS` go through generated index buffers. The sky disc is the fan that matters and it is
+  drawn every frame; the stars and the sun and moon are drawn from Minecraft's own quad index
+  buffer and never take that path. `POINTS` and `DEBUG_LINE_STRIP` have no wgpu equivalent drawn
+  here at all, because nothing in a normal run draws them.
+- **Every `CommandEncoder` shares one native encoder.** That is what fixed the leak, and it is a
+  deliberate assumption: recording happens on the render thread in call order, and wgpu allows one
+  pass at a time, so the sharing is invisible. Two passes open at once - Minecraft holding two
+  encoders each with a pass in flight - would be a wgpu validation error, and none has been seen in
+  a run; if one ever appears, the layout is a per-encoder encoder with a lifetime this side cannot
+  get from Blaze3D.
+
+- **`setViewport` is not forwarded.** 26.1 never calls it - a full run with the diagnostics on logs
+  no viewport request at all - so the default viewport is always in use. The default is the right
+  one now that views carry their mip range: wgpu sizes the render area from the attachment's base
+  mip level, which is what makes the per-level atlas passes render at 1/2, 1/4, 1/8 of the atlas
+  rather than all at full size. A pass that does set a viewport would still be ignored, and would
+  need the same clamping that the scissor rectangle gets.
+- **A region clear widens to the whole attachment.** `glClear` is restricted by the scissor box and
+  a wgpu load-op is not, so `clear_color_and_depth_textures_region` clears everything and warns
+  once. Minecraft only reaches for it when redrawing one stale slot of the GUI item atlas, so the
+  cost is the other cached slots of that atlas until they are allocated again. Doing it properly
+  needs a scissored clear draw, i.e. a pipeline of its own.
+- **`drawMultipleIndexed` replays its draws** instead of batching them, because there is no
+  indirect-draw entry point in the ABI. Correct, just less batched.
+- **Every draw builds its own bind groups.** This was true, and is no longer: dynamic offsets are on
+  by default and the cache answers 99.96% of draws - see "The cache was keyed on the wrong address".
+  What is left is the *first* draw of every distinct binding set, and a set that never repeats is
+  still a `wgpu::BindGroup` of its own.
+- **Timestamp queries and fences** are stubs until Rust exposes them.
+- **`clearStencilTexture` is a no-op.** Nothing in 26.1's main paths calls it, and the depth
+  attachments the port creates have no stencil to clear.
+- **Two pipelines make naga warn about `@invariant`.** `Vertex shader with entry point main outputs
+  a @builtin(position) without the @invariant attribute and is used in a pipeline with Equal` - the
+  vertex stage is translated from GLSL by naga's frontend, which does not emit the attribute, and
+  the pipelines that compare with `EQUAL` are the ones that care. On some drivers that can show as
+  z-fighting between two passes that should match exactly; none was visible in the runs so far, and
+  adding the attribute would mean post-processing naga's output rather than the GLSL.
+- **Some pipelines declare samplers their shaders use, and some do not.** The run logs
+  `the shader declares uniform Sampler0_wm_texshim, which the pipeline does not provide; giving it
+  binding 5, which the pipeline layout will not have` at debug level - the same class of mismatch as
+  `Globals`, in the sampler shim rather than the uniform one. It is not fatal, because naga drops the
+  unused globals, but it means the pipeline cannot bind a sampler the shader may want. The two shim
+  names are this side's own (`shim_samplers` splits a combined sampler in two), which is why they are
+  no longer reported as an error: four alarming lines in every startup log for shaders that render
+  fine.
+- **A `ByteBuffer` upload in any format other than RGBA is stored as if it were RGBA.** That
+  overload is handed a `NativeImage.Format` the native side is never told about; the port logs an
+  error when it sees anything but `NativeImage.Format.RGBA` rather than corrupting the texture
+  quietly. Only RGBA has ever been observed in a run.
+- **Window resizing is exercised, but only on DX12 so far.** Three resizes in a row - including one
+  that asked for a window taller than the screen - and a maximise to 2560x1334 with a world loaded
+  both kept presenting, `acquired=true` on 5280 consecutive frames. The resize path is also what
+  produces every use-after-close this side guards against, so it is the test that matters most; a
+  Vulkan run of the same sequence is still owed.
+- The remaining access-transformer entries were each re-verified against the 26.1 bytecode; entries
+  whose target no longer exists are kept as `# REMOVED:` notes so a future rebase can tell
+  "checked, gone" apart from "not checked yet".

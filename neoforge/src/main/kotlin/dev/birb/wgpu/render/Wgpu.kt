@@ -47,40 +47,25 @@ object Wgpu {
 		this.mayInitialize = mayInitialize
 	}
 
+	/**
+	 * Reports whether the renderer is live.
+	 *
+	 * The 1.21.1 port used this hook to create the device from the title screen, because that was
+	 * the first frame where a window handle existed. In 26.1 that is no longer how the renderer
+	 * comes up: `WgpuBackendSelectionMixin` installs [dev.birb.wgpu.backend.WgpuBackend] as the
+	 * game's GpuBackend, and `WgpuBackend#createDevice` creates the device and attaches the surface
+	 * while the window is still being built. Creating a second renderer here would hand the C ABI
+	 * two different `WmRenderer` pointers, so this now only reports state.
+	 */
 	@JvmStatic
 	fun probeNativeBackendOnce() {
-		if (nativeBackendProbed || !mayInitialize) {
+		if (nativeBackendProbed) {
 			return
 		}
 		nativeBackendProbed = true
 
-		try {
-			val mcWindow = Minecraft.getInstance().window ?: return
-			val windowHandle = mcWindow.window
-			if (windowHandle == 0L) {
-				return
-			}
-
-			val nativeWindow = when (GLFW.glfwGetPlatform()) {
-				GLFW.GLFW_PLATFORM_X11 -> GLFWNativeX11.glfwGetX11Window(windowHandle)
-				GLFW.GLFW_PLATFORM_WIN32 -> GLFWNativeWin32.glfwGetWin32Window(windowHandle)
-				GLFW.GLFW_PLATFORM_COCOA -> GLFWNativeCocoa.glfwGetCocoaWindow(windowHandle)
-				GLFW.GLFW_PLATFORM_WAYLAND -> GLFWNativeWayland.glfwGetWaylandWindow(windowHandle)
-				else -> 0L
-			}
-
-			if (nativeWindow == 0L) {
-				WgpuMcMod.LOGGER.warn("Skipped native backend probe: unknown GLFW platform {}", GLFW.glfwGetPlatform())
-				return
-			}
-
-			WgpuNative.createDevice(windowHandle, nativeWindow, mcWindow.width, mcWindow.height)
-			WgpuMcMod.LOGGER.info("Native backend probe result: {}", WgpuNative.getBackend())
-		} catch (throwable: Throwable) {
-			WgpuMcMod.LOGGER.warn("Native backend probe failed", throwable)
-		}
+		WgpuMcMod.LOGGER.info("wgpu-mc renderer active: {}", runCatching { WgpuNative.getBackend() }.getOrElse { "not initialised" })
 	}
-
 	@JvmStatic
 	fun getTimesTexSubImageCalled(): Int {
 		return timesTexSubImageCalled
@@ -127,10 +112,16 @@ object Wgpu {
 		val level = client.level ?: return 0xFFFFFFFF.toInt()
 
 		val pos = BlockPos(x, y, z)
-		val color = client.blockColors.getColor(level.getBlockState(pos), level, pos, tintIndex)
-		val r = color shr 16 and 255
-		val g = color shr 8 and 255
-		val b = color and 255
+		// 26.1 replaced BlockColors#getColor(state, level, pos, tintIndex) with the
+		// BlockTintSource pipeline: look up the tint source for the index, then ask it
+		// for the world-space colour.
+		val state = level.getBlockState(pos)
+		val tintSource = client.blockColors.getTintSource(state, tintIndex)
+			?: return 0xFFFFFFFF.toInt()
+		val color = tintSource.colorInWorld(state, level, pos)
+		val r = color shr 16 and 0xFF
+		val g = color shr 8 and 0xFF
+		val b = color and 0xFF
 		return r or (g shl 8) or (b shl 16)
 	}
 }

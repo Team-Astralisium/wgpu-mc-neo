@@ -1,23 +1,22 @@
 package dev.birb.wgpu.gui
 
-import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.reflect.TypeToken
 import dev.birb.wgpu.WgpuMcMod
-import dev.birb.wgpu.gui.options.BoolOption
-import dev.birb.wgpu.gui.options.EnumOption
-import dev.birb.wgpu.gui.options.FloatOption
-import dev.birb.wgpu.gui.options.IntOption
-import dev.birb.wgpu.gui.options.Option
-import dev.birb.wgpu.gui.options.RustOptionInfo
+import dev.birb.wgpu.backend.Diagnostics
+import dev.birb.wgpu.gui.options.*
+import dev.birb.wgpu.gui.widgets.HeadingWidget
+import dev.birb.wgpu.gui.widgets.Widget
+import dev.birb.wgpu.rust.RendererSettings
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.AttackIndicatorStatus
 import net.minecraft.client.CloudStatus
-import net.minecraft.client.GraphicsStatus
+import net.minecraft.client.GraphicsPreset
 import net.minecraft.client.Minecraft
-import net.minecraft.client.Options
-import net.minecraft.client.ParticleStatus
+import net.minecraft.client.resources.language.I18n
 import net.minecraft.network.chat.Component
+import net.minecraft.network.chat.contents.TranslatableContents
+import net.minecraft.server.level.ParticleStatus
 
 class OptionPages : Iterable<OptionPages.Page> {
     private val pages: MutableList<Page> = ArrayList()
@@ -26,20 +25,95 @@ class OptionPages : Iterable<OptionPages.Page> {
         pages.add(createGeneral())
         pages.add(createElectrum())
         pages.add(createQuality())
+        reportMissingTranslations()
+    }
+
+    /**
+     * Names every key the screen asks for that the loaded language does not have.
+     *
+     * A key that resolves to nothing is drawn as itself, so a row whose translation went missing is
+     * labelled `options.graphics` - and there is no compile error to catch it, because the key is a
+     * string on both sides of the lookup. This is not hypothetical: 26.1 renamed that very option to
+     * `options.graphics.preset` and put the old key in `assets/minecraft/lang/deprecated.json`'s
+     * `removed` list, which `DeprecatedTranslationsInfo` *strips* from every language file, so the
+     * old key resolves to nothing in every language, including the ones that still spell it out.
+     *
+     * A key that carries a fallback is skipped, because falling back is what this mod's own
+     * descriptions do on purpose - see `OptionText`. What is left is exactly the keys that are
+     * supposed to resolve, which is what makes this worth a warning rather than a debug line.
+     */
+    private fun reportMissingTranslations() {
+        if (!TRANSLATIONS_REPORTED.compareAndSet(false, true)) {
+            return
+        }
+
+        val missing = LinkedHashSet<String>()
+
+        fun check(component: Component) {
+            val contents = component.contents
+            if (contents !is TranslatableContents) return
+            if (contents.fallback != null) return
+            if (!I18n.exists(contents.key)) missing.add(contents.key)
+        }
+
+        for (page in pages) {
+            check(page.name)
+
+            for (group in page) {
+                for (entry in group) {
+                    when (entry) {
+                        is Entry.Heading -> check(entry.text)
+                        is Entry.Setting -> {
+                            check(entry.option.name)
+                            check(entry.option.tooltip)
+                        }
+                    }
+                }
+            }
+        }
+
+        if (missing.isNotEmpty()) {
+            WgpuMcMod.LOGGER.warn(
+                "wgpu: {} key(s) the options screen asks for are not in the loaded language, so " +
+                    "those rows show the key itself: {}",
+                missing.size,
+                missing.joinToString(", "),
+            )
+        }
     }
 
     fun getDefault(): Page = pages[0]
 
+    private var appliedRestartChanges = false
+
     fun isChanged(): Boolean = pages.any { it.isChanged() }
 
-    fun apply() = pages.forEach { it.apply() }
+    /**
+     * Whether anything that has been edited only takes effect on the next launch.
+     *
+     * The renderer's own settings mostly work this way: the graphics backend, for instance, picks
+     * the wgpu instance, the adapter and every resource underneath them, and none of that can be
+     * swapped out while the game is running.
+     */
+    fun hasPendingRestartChanges(): Boolean = pages.any { it.hasPendingRestartChanges() }
+
+    /**
+     * Whether anything that has been applied - as opposed to merely edited - only takes effect on
+     * the next launch. Read after [apply], so the notice survives the edit being committed.
+     */
+    fun hasAppliedRestartChanges(): Boolean = appliedRestartChanges
+
+    fun apply() {
+        if (hasPendingRestartChanges()) appliedRestartChanges = true
+        pages.forEach { it.apply() }
+    }
 
     fun undo() = pages.forEach { it.undo() }
 
     override fun iterator(): Iterator<Page> = pages.iterator()
 
     private fun createGeneral(): Page {
-        val page = Page(Component.literal("General"))
+        val page = Page(Component.translatable("wgpu_mc.page.general"))
         val mc = Minecraft.getInstance()
         val options = mc.options
 
@@ -77,8 +151,12 @@ class OptionPages : Iterable<OptionPages.Page> {
         page.space()
         page.add(IntOption.Builder()
             .setName(Component.translatable("options.guiScale"))
-            .setOption(options.guiScale()) { mc.resizeDisplay() }
-            .setFormatter { integer -> Component.literal(if (integer == 0) "Auto" else "${integer}x") }
+            .setOption(options.guiScale()) { mc.resizeGui() }
+            .setFormatter { integer ->
+                // Vanilla's own word for it, which every language already has.
+                if (integer == 0) Component.translatable("options.guiScale.auto")
+                else Component.literal("${integer}x")
+            }
             .setRange(0, 4)
             .build())
 
@@ -87,10 +165,12 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setOption(options.fullscreen())
             .build())
 
-        page.add(BoolOption.Builder()
-            .setName(Component.translatable("options.vsync"))
-            .setOption(options.enableVsync())
-            .build())
+        // Vanilla's VSync toggle is deliberately not offered here. Its only effect on this backend
+        // would be through `GpuDevice#setVsync`, which this renderer ignores on purpose - the
+        // present mode belongs to the Electrum tab's `vsync` setting, which applies without a
+        // restart. The vanilla option itself is kept in step with that setting, because other mods
+        // and the F3 overlay read it, but leaving a switch in the list that changes nothing would
+        // be worse than leaving it out.
 
         page.add(IntOption.Builder()
             .setName(Component.translatable("options.framerateLimit"))
@@ -112,7 +192,7 @@ class OptionPages : Iterable<OptionPages.Page> {
         page.add(EnumOption.Builder(AttackIndicatorStatus::class.java)
             .setName(Component.translatable("options.attackIndicator"))
             .setOption(options.attackIndicator())
-            .setFormatter { status -> Component.translatable(status.key) }
+            .setFormatter { status -> status.caption() }
             .build())
 
         page.add(BoolOption.Builder()
@@ -124,36 +204,54 @@ class OptionPages : Iterable<OptionPages.Page> {
     }
 
     private fun createElectrum(): Page {
-        val page = Page(Component.literal("Electrum"))
+        val page = Page(Component.translatable("wgpu_mc.page.electrum"))
         val rustSettings = WgpuNative.getSettings()
         val options: List<Option<*>> = GSON.fromJson(rustSettings, SETTINGS_TYPE_TOKEN.type)
+
+        // Which settings belong to a section is the renderer's answer, not this side's: the schema
+        // marks the debug switches with a section name, and the page draws the heading when it
+        // reaches the first one of them. A blank row goes above the heading, so it reads as a break
+        // in the list rather than as a label on the setting before it.
+        var section: String? = null
         for (option in options) {
+            val optionSection = SETTINGS_STRUCTURE[option.setting]?.section
+
+            if (optionSection != null && optionSection != section) {
+                section = optionSection
+                page.blankRow()
+                page.header(Component.translatableWithFallback(OptionText.sectionKey(optionSection), optionSection))
+            }
+
             page.add(option)
         }
+
         return page
     }
 
     private fun createQuality(): Page {
-        val page = Page(Component.literal("Quality"))
+        val page = Page(Component.translatable("wgpu_mc.page.quality"))
         val options = Minecraft.getInstance().options
 
-        page.add(EnumOption.Builder(GraphicsStatus::class.java)
-            .setName(Component.translatable("options.graphics"))
-            .setOption(options.graphicsMode())
-            .setFormatter { graphicsStatus -> Component.translatable(graphicsStatus.key) }
+        page.add(EnumOption.Builder(GraphicsPreset::class.java)
+            // 26.1 renamed this option: `options.graphics` is in the deprecated list, and Minecraft
+            // *strips* deprecated keys from every language file, so the old key resolves to nothing
+            // and the row was labelled with the key itself. `options.graphics.preset` is the live one.
+            .setName(Component.translatable("options.graphics.preset"))
+            .setOption(options.graphicsPreset())
+            .setFormatter { graphicsPreset -> Component.translatable(graphicsPreset.getKey()) }
             .build())
 
         page.space()
         page.add(EnumOption.Builder(CloudStatus::class.java)
             .setName(Component.translatable("options.renderClouds"))
             .setOption(options.cloudStatus())
-            .setFormatter { cloudStatus -> Component.translatable(cloudStatus.key) }
+            .setFormatter { cloudStatus -> cloudStatus.caption() }
             .build())
 
         page.add(EnumOption.Builder(ParticleStatus::class.java)
             .setName(Component.translatable("options.particles"))
             .setOption(options.particles())
-            .setFormatter { particleStatus -> Component.translatable(particleStatus.key) }
+            .setFormatter { particleStatus -> particleStatus.caption() }
             .build())
 
         page.add(BoolOption.Builder()
@@ -196,63 +294,102 @@ class OptionPages : Iterable<OptionPages.Page> {
         return page
     }
 
-    class Page(val name: Component) : Iterable<List<Option<*>>> {
-        private val groups: MutableList<MutableList<Option<*>>> = ArrayList()
+    /**
+     * One page of the options screen, as a list of rows in groups.
+     *
+     * A group is what a `space()` starts: the rows in it are drawn together, and the screen leaves a
+     * small gap between groups.
+     */
+    class Page(val name: Component) : Iterable<List<OptionPages.Entry>> {
+        private val groups: MutableList<MutableList<Entry>> = ArrayList()
 
         init {
             space()
         }
 
-        fun add(option: Option<*>) {
-            groups[groups.size - 1].add(option)
+        fun add(option: Option<*>) = add(Entry.Setting(option))
+
+        fun add(entry: Entry) {
+            groups[groups.size - 1].add(entry)
         }
+
+        /** A sub-heading over the settings that follow it. */
+        fun header(text: Component) = add(Entry.Heading(text))
+
+        /** A row of nothing, which is what separates a section from the setting above it. */
+        fun blankRow() = add(Entry.Heading(Component.empty()))
 
         fun space() {
             groups.add(ArrayList())
         }
 
-        fun isChanged(): Boolean {
-            for (group in groups) {
-                for (option in group) {
-                    if (option.isChanged()) return true
-                }
-            }
-            return false
-        }
+        fun isChanged(): Boolean = options().any { it.isChanged() }
+
+        fun hasPendingRestartChanges(): Boolean =
+            options().any { it.isChanged() && it.requiresRestart }
 
         fun apply() {
             if (name.string == "Electrum") {
-                val options = groups.flatten()
+                val options = options()
                 val json = GSON.toJson(options, SETTINGS_TYPE_TOKEN.type)
                 if (!WgpuNative.sendSettings(json)) {
                     WgpuMcMod.LOGGER.error("Failed to save Electrum renderer settings")
                     return
                 }
+                // `sendSettings` applies what it can immediately - `vsync` reconfigures the
+                // swapchain, and the debug switches are read on the next draw - so by the time this
+                // returns, the renderer is already running with the new values. This side has its
+                // own copy of the diagnostics switch, because it is the side that dumps frames.
                 options.forEach { it.apply() }
+                Diagnostics.refresh()
+                syncVanillaVsync(options)
                 return
             }
 
-            for (group in groups) {
-                for (option in group) {
-                    option.apply()
-                }
-            }
+            options().forEach { it.apply() }
         }
 
-        fun undo() {
-            for (group in groups) {
-                for (option in group) {
-                    option.undo()
-                }
-            }
+        fun undo() = options().forEach { it.undo() }
+
+        override fun iterator(): Iterator<List<Entry>> = groups.iterator()
+
+        /** Every setting on the page, in the order the rows appear. Headings contribute none. */
+        private fun options(): List<Option<*>> = groups.flatten().flatMap { it.options }
+    }
+
+    /**
+     * One row of a page: a setting, or a heading over the settings below it.
+     *
+     * The screen draws rows rather than options so that a section can be part of the list while
+     * still being nothing the player can set - see [Heading].
+     */
+    sealed interface Entry {
+        fun createWidget(x: Int, y: Int, width: Int): Widget
+
+        /** The settings this row contributes, which is none for a heading. */
+        val options: List<Option<*>>
+
+        class Setting(val option: Option<*>) : Entry {
+            override fun createWidget(x: Int, y: Int, width: Int): Widget =
+                option.createWidget(x, y, width)
+
+            override val options: List<Option<*>> get() = listOf(option)
         }
 
-        override fun iterator(): Iterator<List<Option<*>>> = groups.iterator()
+        class Heading(val text: Component) : Entry {
+            override fun createWidget(x: Int, y: Int, width: Int): Widget =
+                HeadingWidget(x, y, width, text)
+
+            override val options: List<Option<*>> get() = emptyList()
+        }
     }
 
     companion object {
         private val SETTINGS_STRUCTURE_TYPE_TOKEN = object : TypeToken<Map<String, RustOptionInfo>>() {}
         private val SETTINGS_TYPE_TOKEN = object : TypeToken<List<Option<*>>>() {}
+
+        /** The missing-translation report is worth one line per session, not one per screen. */
+        private val TRANSLATIONS_REPORTED = java.util.concurrent.atomic.AtomicBoolean()
 
         private val GSON = GsonBuilder()
             .registerTypeAdapter(SETTINGS_TYPE_TOKEN.type, Option.OptionSerializerDeserializer())
@@ -262,5 +399,38 @@ class OptionPages : Iterable<OptionPages.Page> {
             WgpuNative.getSettingsStructure(),
             SETTINGS_STRUCTURE_TYPE_TOKEN.type
         )
+
+        /** The name the renderer's own vsync setting has in the schema. */
+        private const val VSYNC_SETTING = "vsync"
+
+        /**
+         * Copies the renderer's `vsync` setting into Minecraft's own option of the same name.
+         *
+         * The vanilla option no longer decides anything here - the renderer's setting does, and it
+         * applies without a restart - but it is not private to this mod: the F3 overlay prints
+         * "vsync" from `options.enableVsync()`, and other mods read it to know whether frames are
+         * being synced. Leaving it at a stale value would make both lie, so it follows ours.
+         *
+         * Called on apply and once at client setup, so the two agree before the first frame.
+         */
+        fun syncVanillaVsync(options: List<Option<*>>? = null) {
+            val enabled = options?.firstOrNull { it.setting == VSYNC_SETTING }?.get() as? Boolean
+                ?: rendererVsyncSetting()
+
+            if (Minecraft.getInstance().options.enableVsync().get() != enabled) {
+                Minecraft.getInstance().options.enableVsync().set(enabled)
+                WgpuMcMod.LOGGER.info(
+                    "wgpu: vsync is {}; Minecraft's own option of the same name follows it",
+                    enabled,
+                )
+            }
+        }
+
+        /** The `vsync` value the renderer is running with, read back from its settings. */
+        private fun rendererVsyncSetting(): Boolean =
+            RendererSettings.bool(VSYNC_SETTING) ?: true
     }
 }
+
+
+

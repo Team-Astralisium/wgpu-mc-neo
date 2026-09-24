@@ -17,6 +17,18 @@ abstract class Option<T>(
     private val getter: Supplier<T>,
     private val setter: Consumer<T>
 ) {
+    /**
+     * The renderer's own name for this setting, which is also its key in the config file.
+     *
+     * Kept apart from [name], which is what the player reads. The two were the same string until
+     * the names became translatable, and the three places that need the renderer's spelling - the
+     * JSON sent back to it, the schema lookup, and the check that keeps vanilla's vsync option in
+     * step - still need it. Null for an option the renderer knows nothing about, which is every
+     * option on the General and Quality pages.
+     */
+    var setting: String? = null
+        internal set
+
     private var value: T = getter.get()
 
     fun get(): T = value
@@ -46,7 +58,7 @@ abstract class Option<T>(
     }
 
     @Suppress("UNCHECKED_CAST")
-    abstract class Builder<B : Builder<B, T>, T> {
+    abstract class Builder<B : Builder<B, T>, T : Any> {
         protected var name: Component? = null
         protected var tooltip: Component? = null
         protected var requiresRestart: Boolean = false
@@ -107,12 +119,17 @@ abstract class Option<T>(
 
             val type = jsonObject.getAsJsonPrimitive("type").asString
 
-            return when (type) {
+            // The wording is the language file's, and the renderer's own English is the fallback -
+            // see `OptionText`, which is also what turns a setting's name into its key.
+            val displayName = OptionText.name(name)
+            val tooltip = OptionText.tooltip(name, structure.desc)
+
+            val option: Option<*> = when (type) {
                 "bool" -> {
                     var value = jsonObject.getAsJsonPrimitive("value").asBoolean
                     BoolOption(
-                        Component.literal(name),
-                        Component.literal(structure.desc ?: ""),
+                        displayName,
+                        tooltip,
                         structure.needsRestart,
                         { value },
                         { newValue -> value = newValue }
@@ -125,8 +142,8 @@ abstract class Option<T>(
                     val step = jsonObject.getAsJsonPrimitive("step").asDouble
 
                     FloatOption(
-                        Component.literal(name),
-                        Component.literal(structure.desc ?: ""),
+                        displayName,
+                        tooltip,
                         structure.needsRestart,
                         { value },
                         { newValue -> value = newValue },
@@ -141,8 +158,8 @@ abstract class Option<T>(
                     val step = jsonObject.getAsJsonPrimitive("step").asInt
 
                     IntOption(
-                        Component.literal(name),
-                        Component.literal(structure.desc ?: ""),
+                        displayName,
+                        tooltip,
                         structure.needsRestart,
                         { value },
                         { newValue -> value = newValue },
@@ -152,17 +169,28 @@ abstract class Option<T>(
                 }
                 "enum" -> {
                     var selected = jsonObject.getAsJsonPrimitive("selected").asInt
+
+                    // One translated component per value, in the order the schema lists them: the
+                    // widget shows one of these rather than a translated value name per frame.
+                    val values = structure.variants.mapIndexed { index, display ->
+                        OptionText.value(structure.variantKeys.getOrNull(index), display)
+                    }.toTypedArray()
+
                     TextEnumOption  (
-                        Component.literal(name),
-                        Component.literal(structure.desc ?: ""),
+                        displayName,
+                        tooltip,
                         structure.needsRestart,
                         { selected },
                         { newValue -> selected = newValue },
-                        structure.variants
+                        values
                     )
                 }
                 else -> throw JsonParseException("Unexpected value: $type")
             }
+
+            // What the renderer calls it, which is what the settings are sent back under.
+            option.setting = name
+            return option
         }
 
         override fun deserialize(json: JsonElement, typeOfT: Type, context: JsonDeserializationContext): List<Option<*>> {
@@ -185,7 +213,9 @@ abstract class Option<T>(
             val root = JsonObject()
 
             for (option in src) {
-                root.add(option.name.string, serializeOption(option))
+                // The renderer's name, not the translated one: this document is the renderer's
+                // config, and `wgpu_mc.option.vsync` is not a key it has ever heard of.
+                root.add(option.setting ?: option.name.string, serializeOption(option))
             }
 
             return root

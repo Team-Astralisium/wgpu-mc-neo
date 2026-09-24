@@ -3,13 +3,20 @@ package dev.birb.wgpu.gui
 import it.unimi.dsi.fastutil.floats.FloatArrayList
 import it.unimi.dsi.fastutil.floats.FloatStack
 import net.minecraft.client.Minecraft
-import net.minecraft.client.gui.GuiGraphics
+import net.minecraft.client.gui.GuiGraphicsExtractor
 import net.minecraft.network.chat.Component
 import net.minecraft.network.chat.FormattedText
-import net.minecraft.util.FastColor
+import net.minecraft.util.ARGB
 import net.minecraft.util.FormattedCharSequence
 
-class WidgetRenderer(private val context: GuiGraphics) {
+/**
+ * Immediate-mode drawing helper on top of 26.1's [GuiGraphicsExtractor].
+ *
+ * 26.1 replaced the old `GuiGraphics#drawString` API with
+ * `GuiGraphicsExtractor#text` / `#textWithWordWrap`, so the text helpers below
+ * delegate to those instead of walking `Font#split` by hand.
+ */
+class WidgetRenderer(private val context: GuiGraphicsExtractor) {
     private val alphaStack: FloatStack = FloatArrayList()
 
     init {
@@ -29,28 +36,23 @@ class WidgetRenderer(private val context: GuiGraphics) {
     }
 
     fun text(text: String, x: Int, y: Int, color: Int) {
-        context.drawString(font(), text, x, y, applyAlpha(color), false)
+        context.text(font(), text, x, y, applyAlpha(color), false)
     }
 
     fun text(text: Component, x: Int, y: Int, color: Int) {
-        context.drawString(font(), text, x, y, applyAlpha(color), false)
+        context.text(font(), text, x, y, applyAlpha(color), false)
     }
 
     fun text(text: FormattedCharSequence, x: Int, y: Int, color: Int) {
-        context.drawString(font(), text, x, y, applyAlpha(color), false)
+        context.text(font(), text, x, y, applyAlpha(color), false)
     }
 
     fun wrappedText(text: Component, x: Int, y: Int, color: Int, maxWidth: Int) {
-        val finalColor = applyAlpha(color)
-        var currentY = y
-        for (line in font().split(text, maxWidth)) {
-            context.drawString(font(), line, x, currentY, finalColor, false)
-            currentY += textHeight()
-        }
+        context.textWithWordWrap(font(), text, x, y, maxWidth, applyAlpha(color))
     }
 
     fun wrappedTextHeight(text: Component, maxWidth: Int): Int {
-        return font().split(text, maxWidth).size * textHeight()
+        return font().wordWrapHeight(text, maxWidth)
     }
 
     fun trimText(text: FormattedText, width: Int): FormattedText {
@@ -64,11 +66,11 @@ class WidgetRenderer(private val context: GuiGraphics) {
     fun textHeight(): Int = font().lineHeight
 
     private fun applyAlpha(color: Int): Int {
-        return FastColor.ARGB32.color(
-            (FastColor.ARGB32.alpha(color) * alphaStack.peekFloat(0)).toInt(),
-            FastColor.ARGB32.red(color),
-            FastColor.ARGB32.green(color),
-            FastColor.ARGB32.blue(color)
+        return ARGB.color(
+            (ARGB.alpha(color) * alphaStack.peekFloat(0)).toInt(),
+            ARGB.red(color),
+            ARGB.green(color),
+            ARGB.blue(color)
         )
     }
 

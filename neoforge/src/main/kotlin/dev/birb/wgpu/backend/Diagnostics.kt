@@ -1,0 +1,188 @@
+package dev.birb.wgpu.backend
+
+import dev.birb.wgpu.rust.NativeNames
+import dev.birb.wgpu.rust.RendererSettings
+import dev.birb.wgpu.rust.WmNative
+import java.lang.foreign.MemorySegment
+import java.nio.file.Files
+import java.nio.file.Path
+
+/**
+ * The switch behind this backend's diagnostics.
+ *
+ * A normal run should say what it is doing, not what every pass, pipeline and texture is doing -
+ * but when a frame comes out wrong there is no GPU debugger to reach for, and "the GUI is not
+ * drawn" and "the GUI is drawn into a texture nobody presents" look identical from the outside.
+ * Everything that answers those questions is kept, and gated here:
+ *
+ *  - the renderer's own `diagnostics` setting, which is the `Debug` switch on the options screen, or
+ *  - `-Dwgpu_mc.diagnostics=true`, or
+ *  - `WGPU_MC_DIAGNOSTICS=1`, or
+ *  - a file named [MARKER] in the run directory, which needs no launcher support.
+ *
+ * With it on, the backend reports each pipeline once, each render pass once, the frames listed in
+ * [WgpuSurface.DUMP_FRAMES] as raw images, and every uploaded texture whose label contains
+ * [DUMP_TEXTURE_LABEL]. With it off, none of that runs - and neither do the native side's counters
+ * and traces, which are gated on the same setting.
+ */
+object Diagnostics {
+
+    /** Presence of this file next to the run directory turns diagnostics on. */
+    const val MARKER = "wgpu-dump-frames"
+
+    /** The renderer setting that is the switch for everything in this file. */
+    const val SETTING = "diagnostics"
+
+    /** Creating this file dumps the next presented frame, then deletes it. */
+    const val DUMP_NOW = "wgpu-dump-now"
+
+    /** Where frame and texture dumps land. */
+    const val DIRECTORY = "wgpu-frames"
+
+    /** Texture labels containing this (case-insensitively) are dumped after upload. */
+    const val DUMP_TEXTURE_LABEL = "panorama"
+
+    /**
+     * Render passes whose label starts with this have their colour target dumped when they close.
+     *
+     * 26.1 builds a sprite atlas by *rendering* every sprite into it - see
+     * `TextureAtlas#uploadInitialContents`, which draws each sprite through `animate_sprite_blit`
+     * into `mipViews[level]` - so an atlas is not something an upload can be compared against. It
+     * is a render result, and the only way to tell "the atlas was never built" from "the atlas was
+     * built and the GUI samples the wrong part of it" is to look at the atlas itself.
+     */
+    const val DUMP_PASS_PREFIX = "Animate "
+
+    /**
+     * Whether the diagnostics are on.
+     *
+     * Not a `lazy`: the setting is applied from the options screen, and a dump or a counter that
+     * only started working after a restart would be a worse switch than the file it replaced.
+     * [refresh] is what re-resolves it, and the read is a volatile field.
+     */
+    @Volatile
+    private var enabled: Boolean = resolve()
+
+    /** Whether the diagnostics are on. */
+    @JvmStatic
+    fun isEnabled(): Boolean = enabled
+
+    /**
+     * Re-resolves [enabled], which the options screen calls when the debug switches are applied.
+     *
+     * The renderer resolves the same setting on its own side when it receives them, so the two
+     * halves of the switch turn over together.
+     */
+    @JvmStatic
+    fun refresh() {
+        val value = resolve()
+        if (value != enabled) {
+            enabled = value
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: diagnostics are now {}",
+                if (value) "on" else "off",
+            )
+        }
+    }
+
+    /**
+     * The switch, from the first of these that answers: a system property, the environment, the
+     * renderer's setting, then the marker file.
+     *
+     * The marker is an override rather than a fallback, so `touch wgpu-dump-frames` still turns
+     * diagnostics on for a run started without touching the config, and the property and the
+     * environment variable can turn it back *off* - which is what lets a launcher overrule a config
+     * file it did not write.
+     */
+    private fun resolve(): Boolean {
+        System.getProperty("wgpu_mc.diagnostics")?.toBoolean()?.let { return it }
+        System.getenv("WGPU_MC_DIAGNOSTICS")?.let {
+            return it != "0" && !it.equals("false", ignoreCase = true)
+        }
+
+        return RendererSettings.bool(SETTING) == true || Files.exists(Path.of(MARKER))
+    }
+
+    /**
+     * Takes the frame-dump request a marker file represents, if there is one.
+     *
+     * [WgpuSurface] dumps a handful of fixed frame numbers, which is no use for "look at the frame
+     * I am looking at now" - a world is reached after a different number of frames every run, and a
+     * screenshot of the window cannot see a GPU debugger's worth of detail. Creating this file
+     * dumps the next presented frame instead, and deletes the file, so a request is answered once.
+     */
+    @JvmStatic
+    fun consumeDumpRequest(): Boolean {
+        if (!enabled) {
+            return false
+        }
+
+        val request = Path.of(DUMP_NOW)
+        if (!Files.exists(request)) {
+            return false
+        }
+
+        return try {
+            Files.delete(request)
+            true
+        } catch (error: java.io.IOException) {
+            false
+        }
+    }
+
+    /** Returns a path inside [DIRECTORY] for [name], creating the directory. */
+    @JvmStatic
+    fun path(name: String): Path {
+        val path = Path.of(DIRECTORY, name)
+        Files.createDirectories(path.parent)
+        return path
+    }
+
+    /**
+     * Writes a texture out as raw RGBA through [WmNative.dumpTextureRgba].
+     *
+     * Requires the texture to carry `COPY_SRC`, which `create_texture` always asks for.
+     *
+     * [flipRows] is for render targets. This backend gives Minecraft OpenGL's clip-space
+     * orientation (see the clip-space patch in `rust/wgpu-mc-jni/src/preprocessing.rs`), and an
+     * OpenGL render target keeps the first row of the picture at the *bottom* of the texture, so a
+     * render target only matches what was on screen once its rows are turned over. Textures that
+     * were uploaded rather than rendered into - a sprite atlas after the fix, a panorama face, a
+     * font sheet - are already the right way up and are dumped as they are.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun dumpTexture(
+        renderer: MemorySegment,
+        texture: MemorySegment,
+        name: String,
+        flipRows: Boolean = false,
+    ) {
+        val path = path(name)
+        WmNative.dumpTextureRgba.invokeExact(
+            renderer,
+            texture,
+            NativeNames.utf8(path.toString()),
+            flipRows,
+        ) as Boolean
+    }
+
+    /** Labels already dumped by [dumpPassTarget], so an atlas is written once, not once per mip. */
+    private val dumpedPasses = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Dumps the colour target of an `Animate ...` pass once per label.
+     *
+     * Called after the pass has been submitted, so what lands in the file is the atlas as the GPU
+     * had it at the end of that pass rather than whatever the texture held before it ran.
+     */
+    @JvmStatic
+    fun dumpPassTarget(renderer: MemorySegment, label: String, texture: MemorySegment?) {
+        if (texture == null) return
+        if (!label.startsWith(DUMP_PASS_PREFIX)) return
+        if (!dumpedPasses.add(label)) return
+
+        val name = "atlas-" + label.removePrefix(DUMP_PASS_PREFIX).replace(Regex("[^A-Za-z0-9]+"), "-").trim('-') + ".raw"
+        dumpTexture(renderer, texture, name)
+    }
+}

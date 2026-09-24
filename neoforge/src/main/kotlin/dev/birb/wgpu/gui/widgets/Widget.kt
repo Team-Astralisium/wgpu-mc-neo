@@ -4,7 +4,7 @@ import dev.birb.wgpu.gui.WidgetRenderer
 import net.minecraft.client.Minecraft
 import net.minecraft.client.resources.sounds.SimpleSoundInstance
 import net.minecraft.sounds.SoundEvents
-import net.minecraft.util.FastColor
+import net.minecraft.util.ARGB
 
 abstract class Widget(x: Int, y: Int, var width: Int, var height: Int) {
     var x: Int = x
@@ -80,7 +80,7 @@ abstract class Widget(x: Int, y: Int, var width: Int, var height: Int) {
 
         @JvmStatic
         fun getColor(r: Int, g: Int, b: Int, a: Int): Int {
-            return FastColor.ARGB32.color(a, r, g, b)
+            return ARGB.color(a, r, g, b)
         }
     }
 }

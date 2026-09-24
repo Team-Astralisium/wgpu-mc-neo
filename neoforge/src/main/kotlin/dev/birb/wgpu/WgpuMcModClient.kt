@@ -2,12 +2,13 @@ package dev.birb.wgpu
 
 import dev.birb.wgpu.render.ShaderReloadListener
 import dev.birb.wgpu.rust.WgpuNative
+import net.minecraft.resources.Identifier
 import net.neoforged.api.distmarker.Dist
 import net.neoforged.bus.api.IEventBus
 import net.neoforged.fml.common.Mod
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent
 import net.neoforged.fml.loading.FMLPaths
-import net.neoforged.neoforge.client.event.RegisterClientReloadListenersEvent
+import net.neoforged.neoforge.client.event.AddClientReloadListenersEvent
 
 @Mod(value = WgpuMcMod.MOD_ID, dist = [Dist.CLIENT])
 class WgpuMcModClient(modEventBus: IEventBus) {
@@ -29,7 +30,9 @@ class WgpuMcModClient(modEventBus: IEventBus) {
 		}
 	}
 
-	private fun onRegisterClientReloadListeners(event: RegisterClientReloadListenersEvent) {
-		event.registerReloadListener(ShaderReloadListener)
+	private fun onRegisterClientReloadListeners(event: AddClientReloadListenersEvent) {
+		// NeoForge 26.1 replaced RegisterClientReloadListenersEvent's
+		// registerReloadListener(listener) with SortedReloadListenerEvent#addListener(id, listener).
+		event.addListener(Identifier.fromNamespaceAndPath(WgpuMcMod.MOD_ID, "shaders"), ShaderReloadListener)
 	}
 }

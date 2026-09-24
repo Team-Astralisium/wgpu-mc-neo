@@ -12,9 +12,10 @@ import java.util.Map;
 @Mixin(EntityRenderDispatcher.class)
 public abstract class EntityRenderDispatcherMixin {
 
-    @Shadow public abstract <T extends Entity> EntityRenderer<? super T> getRenderer(T entity);
+    // 26.1 gave EntityRenderer a second type parameter (the render state type).
+    @Shadow public abstract <T extends Entity> EntityRenderer<? super T, ?> getRenderer(T entity);
 
-    @Shadow private Map<EntityType<?>, EntityRenderer<?>> renderers;
+    @Shadow private Map<EntityType<?>, EntityRenderer<?, ?>> renderers;
 
     private static int getOverlayColor(int packedUV) {
         int u = packedUV & 0xffff;

@@ -5,7 +5,7 @@ import dev.birb.wgpu.entity.EntityModelUpload;
 import dev.birb.wgpu.render.Wgpu;
 import dev.birb.wgpu.rust.WgpuNative;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.TitleScreen;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -18,8 +18,9 @@ public class TitleScreenMixin {
     @Unique
     private boolean wgpu_mc$updatedTitle = false;
 
-    @Inject(method = "render", at = @At("HEAD"))
-    private void render(GuiGraphics context, int mouseX, int mouseY, float delta, CallbackInfo ci) {
+    // 26.1 renamed Screen#render to Screen#extractRenderState and GuiGraphics to GuiGraphicsExtractor.
+    @Inject(method = "extractRenderState", at = @At("HEAD"))
+    private void render(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta, CallbackInfo ci) {
         Wgpu.probeNativeBackendOnce();
 
         if (!wgpu_mc$updatedTitle && Wgpu.isInitialized()) {
