@@ -7,3 +7,7 @@ members = [
     "wgpu-mc-jni",
     "wgpu-mc-demo"
 ]
+
+# The vendored GLSL preprocessor is a workspace of its own with its own lock file, reached only
+# through the path dependency in `wgpu-mc-jni`, so it stays out of this one.
+exclude = ["cyntax"]

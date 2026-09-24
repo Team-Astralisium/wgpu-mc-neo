@@ -829,14 +829,35 @@ checksum = "96a6ac251f4a2aca6b3f91340350eab87ae57c3f127ffeb585e92bd336717991"
 [[package]]
 name = "cyntax"
 version = "0.1.0"
+dependencies = [
+ "cyntax_common 0.1.0",
+ "cyntax_consteval 0.1.0",
+ "cyntax_errors 0.1.0",
+ "cyntax_lexer 0.1.0",
+ "cyntax_parser 0.1.0",
+ "peekmore",
+]
+
+[[package]]
+name = "cyntax"
+version = "0.1.0"
 source = "git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3#20c1b1f12d7406809c126f3d9ed843b5f08729c3"
 dependencies = [
- "cyntax_common",
- "cyntax_consteval",
- "cyntax_errors",
- "cyntax_lexer",
- "cyntax_parser",
+ "cyntax_common 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_consteval 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_errors 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_lexer 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_parser 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
  "peekmore",
+]
+
+[[package]]
+name = "cyntax_common"
+version = "0.1.0"
+dependencies = [
+ "codespan-reporting 0.12.0",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -852,11 +873,28 @@ dependencies = [
 [[package]]
 name = "cyntax_consteval"
 version = "0.1.0"
+dependencies = [
+ "cyntax_common 0.1.0",
+ "cyntax_errors 0.1.0",
+ "cyntax_parser 0.1.0",
+]
+
+[[package]]
+name = "cyntax_consteval"
+version = "0.1.0"
 source = "git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3#20c1b1f12d7406809c126f3d9ed843b5f08729c3"
 dependencies = [
- "cyntax_common",
- "cyntax_errors",
- "cyntax_parser",
+ "cyntax_common 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_errors 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_parser 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+]
+
+[[package]]
+name = "cyntax_errors"
+version = "0.1.0"
+dependencies = [
+ "codespan-reporting 0.12.0",
+ "cyntax_common 0.1.0",
 ]
 
 [[package]]
@@ -865,7 +903,19 @@ version = "0.1.0"
 source = "git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3#20c1b1f12d7406809c126f3d9ed843b5f08729c3"
 dependencies = [
  "codespan-reporting 0.12.0",
- "cyntax_common",
+ "cyntax_common 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+]
+
+[[package]]
+name = "cyntax_lexer"
+version = "0.1.0"
+dependencies = [
+ "cyntax_common 0.1.0",
+ "cyntax_errors 0.1.0",
+ "peekmore",
+ "smallvec",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -873,8 +923,8 @@ name = "cyntax_lexer"
 version = "0.1.0"
 source = "git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3#20c1b1f12d7406809c126f3d9ed843b5f08729c3"
 dependencies = [
- "cyntax_common",
- "cyntax_errors",
+ "cyntax_common 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_errors 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
  "peekmore",
  "smallvec",
  "strum 0.27.2",
@@ -884,11 +934,21 @@ dependencies = [
 [[package]]
 name = "cyntax_parser"
 version = "0.1.0"
+dependencies = [
+ "cyntax_common 0.1.0",
+ "cyntax_errors 0.1.0",
+ "cyntax_lexer 0.1.0",
+ "peekmore",
+]
+
+[[package]]
+name = "cyntax_parser"
+version = "0.1.0"
 source = "git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3#20c1b1f12d7406809c126f3d9ed843b5f08729c3"
 dependencies = [
- "cyntax_common",
- "cyntax_errors",
- "cyntax_lexer",
+ "cyntax_common 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_errors 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
+ "cyntax_lexer 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
  "peekmore",
 ]
 
@@ -2485,7 +2545,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "pp-rs",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.18",
  "unicode-ident",
@@ -3560,6 +3620,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"
@@ -4887,7 +4953,7 @@ dependencies = [
  "portable-atomic",
  "profiling",
  "raw-window-handle",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "smallvec",
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
@@ -5028,7 +5094,7 @@ dependencies = [
  "bytemuck",
  "codespan-reporting 0.12.0",
  "crate-root",
- "cyntax",
+ "cyntax 0.1.0 (git+https://github.com/wgpu-mc/cyntax.git?rev=20c1b1f12d7406809c126f3d9ed843b5f08729c3)",
  "env_logger",
  "fastanvil",
  "fastnbt",
@@ -5060,7 +5126,7 @@ dependencies = [
  "byteorder",
  "cbindgen",
  "crossbeam-channel",
- "cyntax",
+ "cyntax 0.1.0",
  "env_logger",
  "futures",
  "glam",
@@ -5074,6 +5140,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "rayon",
+ "rustc-hash 2.1.3",
  "serde",
  "serde-binary",
  "serde_json",

@@ -72,6 +72,13 @@ pub struct Gpu {
     pub surface: Mutex<Option<Arc<Surface<'static>>>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Driver-side pipeline compilation results, carried across runs where the backend supports it.
+    ///
+    /// Owned by the device it was created for: a cache from another device - or from the same one
+    /// after a driver update - is rejected entry by entry, so it is kept beside the device rather
+    /// than in a process-wide cell that a backend fallback would leave pointing at a dead device.
+    /// `None` on the backends that do not implement one, which is DX12.
+    pub pipeline_cache: Option<wgpu::PipelineCache>,
 }
 
 /// Tuple of chunk positions and baked layers
@@ -188,5 +195,84 @@ impl WmRenderer {
             env!("WGPUMC_WGPU_VER"),
             self.gpu.adapter.get_info().backend.to_str()
         )
+    }
+
+    /// How the adapter behind this renderer introduces itself, one field per line.
+    ///
+    /// The F3 overlay's vanilla system block asks the device for a vendor, a renderer name, a
+    /// backend name and a version. On the OpenGL backend those four answers are `GL_VENDOR`,
+    /// `GL_RENDERER`, "OpenGL" and `GL_VERSION` - the graphics driver, introducing itself - and
+    /// wgpu carries the same information in `AdapterInfo`. Handing it over lets that block keep
+    /// looking the way it does on GL instead of reading "wgpu / wgpu-mc / vulkan / wgpu 29".
+    ///
+    /// Four lines in this order, none of them empty:
+    ///
+    /// 1. the vendor (`NVIDIA`, `AMD`, ...), named from the PCI id
+    /// 2. the adapter's own name (`NVIDIA GeForce RTX 4060 Laptop GPU`)
+    /// 3. the API it is driven through (`Vulkan`, `DirectX 12`, ...)
+    /// 4. the driver and its version
+    ///
+    /// The fourth line joins `driver` and `driver_info` rather than choosing between them, because
+    /// the backends fill them in differently: Vulkan reports the driver's name and version
+    /// ("NVIDIA" and "552.44"), while DX12 puts the version in `driver` and leaves `driver_info`
+    /// empty ("31.0.101.5333"). Either way the result names the installed graphics driver.
+    pub fn get_adapter_description(&self) -> String {
+        let info = self.gpu.adapter.get_info();
+
+        let vendor = match vendor_name(info.vendor) {
+            "" => format!("vendor 0x{:04x}", info.vendor),
+            name => name.to_string(),
+        };
+        let driver = [info.driver.trim(), info.driver_info.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        [
+            vendor,
+            info.name,
+            backend_name(info.backend).to_string(),
+            if driver.is_empty() {
+                "unknown driver".to_string()
+            } else {
+                driver
+            },
+        ]
+        .join("\n")
+    }
+}
+
+/// PCI vendor ids, as the names the drivers use for themselves.
+///
+/// `AdapterInfo#vendor` is the raw id the driver reports, so this is the only place it becomes
+/// something a person can read; an id that is not listed stays empty and the caller falls back to
+/// printing the number.
+fn vendor_name(vendor: u32) -> &'static str {
+    match vendor {
+        0x10DE => "NVIDIA",
+        0x1002 | 0x1022 => "AMD",
+        0x8086 | 0x8087 => "Intel",
+        0x106B => "Apple",
+        0x13B5 => "ARM",
+        0x5143 => "Qualcomm",
+        0x1010 => "Imagination Technologies",
+        0x1AE0 => "Google",
+        _ => "",
+    }
+}
+
+/// The API's own name, rather than the identifier wgpu uses for it.
+///
+/// Matched exhaustively on purpose: a backend added to wgpu should show up as a compile error here
+/// rather than as a blank line in the overlay.
+fn backend_name(backend: wgpu::Backend) -> &'static str {
+    match backend {
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Dx12 => "DirectX 12",
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Gl => "OpenGL",
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        wgpu::Backend::Noop => "no backend",
     }
 }

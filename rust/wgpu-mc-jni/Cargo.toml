@@ -20,6 +20,7 @@ lazy_static = "1.4.0"
 strum = "0.26"
 strum_macros = "0.26"
 parking_lot = "0.12.1"
+rustc-hash = "2"
 arc-swap = "1.4.0"
 glam = "0.29"
 bytemuck = { version = "1.13", features = ["derive"] }
@@ -37,7 +38,11 @@ serde_yaml = "0.9"
 serde-binary = "0.5.0"
 glsl = { git = "https://github.com/wgpu-mc/glsl.git" }
 
-cyntax = { git = "https://github.com/wgpu-mc/cyntax.git", rev="20c1b1f12d7406809c126f3d9ed843b5f08729c3" }
+# Vendored rather than pulled from the fork: its lexer turned `*=` into `-=`, which made every
+# RGSS-filtered surface four times too bright - see `rust/cyntax/cyntax_lexer/src/lexer.rs` and the
+# round-trip tests at the end of `src/preprocessing.rs`. A one-line fix that has to survive the next
+# `cargo update` belongs in the tree, not in a pinned revision.
+cyntax = { path = "../cyntax" }
 
 [build-dependencies]
 cbindgen = "0.29"

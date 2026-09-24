@@ -1,0 +1,10 @@
+[package]
+name = "cyntax_parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cyntax_lexer = {path = "../cyntax_lexer"}
+cyntax_common = {path = "../cyntax_common"}
+cyntax_errors = {path="../cyntax_errors"}
+peekmore = "1.3.0"

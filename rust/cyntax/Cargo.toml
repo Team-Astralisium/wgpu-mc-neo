@@ -1,0 +1,14 @@
+[package]
+name = "cyntax"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cyntax_lexer = {path = "./cyntax_lexer"} 
+peekmore = "1.3.0"
+cyntax_common = {path="./cyntax_common"}
+cyntax_consteval = {path="./cyntax_consteval"}
+cyntax_errors = {path="./cyntax_errors"}
+cyntax_parser = {path="./cyntax_parser"}
+[workspace]
+members = []

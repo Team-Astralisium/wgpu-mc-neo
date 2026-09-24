@@ -9,10 +9,10 @@ use core::slice;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use glam::{IVec3, Mat4, ivec2, ivec3};
 use jni::objects::{
-    AutoElements, GlobalRef, JByteArray, JClass, JFloatArray, JIntArray, JLongArray, JObject,
-    JObjectArray, JPrimitiveArray, JString, JValue, JValueOwned, ReleaseMode, WeakRef,
+    AutoElements, GlobalRef, JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray,
+    JPrimitiveArray, JString, JValue, JValueOwned, ReleaseMode, WeakRef,
 };
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jfloat, jint, jlong, jsize, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jint, jsize, jstring};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use once_cell::sync::{Lazy, OnceCell};
@@ -31,12 +31,12 @@ use std::time::Instant;
 use std::{mem, thread};
 use wgpu::Extent3d;
 use wgpu_mc::render::graph::{Geometry, RenderGraph, ResourceBacking};
-use wgpu_mc::wgpu::util::{DeviceExt, TextureBlitter};
+use wgpu_mc::wgpu::util::DeviceExt;
 
 use wgpu_mc::mc::block::{BlockstateKey, ChunkBlockState};
 use wgpu_mc::mc::chunk::{BlockStateProvider, LightLevel, bake_section};
 use wgpu_mc::mc::resource::{ResourcePath, ResourceProvider};
-use wgpu_mc::mc::{RenderEffectsData, Scene, SkyState};
+use wgpu_mc::mc::SkyState;
 use wgpu_mc::minecraft_assets::schemas::blockstates::multipart::StateValue;
 use wgpu_mc::render::pipeline::BLOCK_ATLAS;
 use wgpu_mc::texture::{BindableTexture, TextureAndView};
@@ -46,12 +46,12 @@ use wgpu_mc::{Frustum, WmRenderer};
 use crate::lighting::DeserializedLightData;
 use crate::palette::JavaPalette;
 use crate::pia::PackedIntegerArray;
-use crate::renderer::ENTITY_INSTANCES;
 use crate::settings::Settings;
 
 mod alloc;
 mod application;
 pub mod blaze;
+mod debug;
 mod device;
 pub mod entity;
 mod gl;
@@ -61,6 +61,13 @@ mod pia;
 pub mod preprocessing;
 mod renderer;
 mod settings;
+
+/// Checks that the JVM side of the two bridges still matches this crate: the JNI declarations in
+/// `WgpuNative.kt`, the hand-written C-ABI bindings in `WmNative.kt`, and the struct layouts and
+/// enum numbers `bindings.h` describes. Nothing else checks those, and each of them fails at
+/// runtime rather than at compile time.
+#[cfg(test)]
+mod abi_tests;
 
 #[derive(Debug)]
 struct MinecraftRenderState {
@@ -76,7 +83,6 @@ struct MouseState {
 
 // static ENTITIES: OnceCell<HashMap<>> = OnceCell::new();
 static RENDERER: OnceCell<WmRenderer> = OnceCell::new();
-static BLITTER: OnceCell<TextureBlitter> = OnceCell::new();
 
 pub static RENDER_GRAPH: OnceCell<Mutex<RenderGraph>> = OnceCell::new();
 pub static CUSTOM_GEOMETRY: OnceCell<Mutex<HashMap<String, Box<dyn Geometry>>>> = OnceCell::new();
@@ -116,6 +122,16 @@ pub static SETTINGS: RwLock<Option<Settings>> = RwLock::new(None);
 
 pub static CLASSLOADER: OnceCell<WeakRef> = OnceCell::new();
 
+/// Looks up a class through the loader the game was started with, and calls a static method on it.
+///
+/// `FindClass` on a thread that was attached from native code resolves against the *system* class
+/// loader, which cannot see NeoForge's transformed game classes, so the loader has to be handed
+/// over from the JVM side by [`setClassLoader`].
+///
+/// Every failure here is an `Err`, never a panic. This is reached from
+/// [`MinecraftResourceManagerAdapter::get_bytes`], which wgpu-mc calls from whatever thread is
+/// loading a resource, and a panic inside a `#[jni_fn]` cannot unwind - it aborts the whole
+/// process, which is how a missing class loader used to take the game down.
 pub fn call_static_from_class_loader<'env>(
     env: &mut JNIEnv<'env>,
     class: &str,
@@ -123,25 +139,51 @@ pub fn call_static_from_class_loader<'env>(
     sig: &str,
     args: &[JValue],
 ) -> jni::errors::Result<JValueOwned<'env>> {
-    let class_loader = CLASSLOADER
-        .get()
-        .unwrap()
-        .upgrade_local(&*env)
-        .unwrap()
-        .unwrap();
-    let arg = env.new_string(class).unwrap();
+    let Some(class_loader) = CLASSLOADER.get() else {
+        return Err(jni::errors::Error::NullPtr(
+            "the game's class loader was never registered - see setClassLoader",
+        ));
+    };
+
+    // Only a weak reference is held, so it is legitimate for the JVM to have collected it.
+    let Some(class_loader) = class_loader.upgrade_local(&*env)? else {
+        return Err(jni::errors::Error::NullPtr(
+            "the game's class loader has been garbage collected",
+        ));
+    };
+
+    let arg = env.new_string(class)?;
     let class_obj: JClass = env
         .call_method(
             class_loader,
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[JValue::Object(&arg)],
-        )
-        .unwrap()
-        .l()
-        .unwrap()
+        )?
+        .l()?
         .into();
+
     env.call_static_method(class_obj, method, sig, args)
+}
+
+/// Registers the class loader Rust calls back through.
+///
+/// Called by the JVM side as part of loading the native library, before anything can ask for a
+/// resource. A weak reference is enough and is what [`call_static_from_class_loader`] expects: the
+/// loader is owned by the mod loader for the lifetime of the process, so it cannot go away while
+/// the game is running, and holding it strongly here would keep it - and every class it loaded -
+/// alive past shutdown.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setClassLoader(mut env: JNIEnv, _class: JClass, class_loader: JObject) {
+    match env.new_weak_ref(class_loader) {
+        Ok(Some(weak)) => {
+            if CLASSLOADER.set(weak).is_err() {
+                log::warn!("wgpu-mc: the game's class loader was registered more than once");
+            }
+        }
+        Ok(None) => log::error!("wgpu-mc: the game's class loader was null"),
+        Err(err) => log::error!("wgpu-mc: could not register the game's class loader: {err}"),
+    }
 }
 
 #[derive(Debug)]
@@ -230,30 +272,63 @@ struct MinecraftResourceManagerAdapter {
 }
 
 impl ResourceProvider for MinecraftResourceManagerAdapter {
+    /// Reads a resource through the game's own resource provider.
+    ///
+    /// Nothing in here may panic. wgpu-mc calls this from whichever thread is loading a resource,
+    /// and a panic on a `#[jni_fn]` frame cannot unwind - it aborts the JVM, so a single missing
+    /// or unreadable file would take the whole game down instead of just that texture. The trait
+    /// already models "no such resource" as `None`, so every failure becomes one, with a log line.
     fn get_bytes(&self, id: &ResourcePath) -> Option<Vec<u8>> {
-        let mut env = self.jvm.attach_current_thread().unwrap();
+        let mut env = match self.jvm.attach_current_thread() {
+            Ok(env) => env,
+            Err(err) => {
+                log::error!("wgpu-mc: could not attach to the JVM to read {}: {err}", id.0);
+                return None;
+            }
+        };
 
-        let path = env.new_string(&id.0).unwrap();
+        let path = match env.new_string(&id.0) {
+            Ok(path) => path,
+            Err(err) => {
+                log::error!("wgpu-mc: could not pass {} to the JVM: {err}", id.0);
+                return None;
+            }
+        };
 
-        let bytes: JByteArray = call_static_from_class_loader(
+        let bytes: JByteArray = match call_static_from_class_loader(
             &mut env,
             "dev.birb.wgpu.rust.WgpuResourceProvider",
             "getResource",
             "(Ljava/lang/String;)[B",
             &[JValue::Object(&path.into())],
         )
-        .expect(&id.0)
-        .l()
-        .expect(&id.0)
-        .into();
+        .and_then(|value| value.l())
+        {
+            Ok(bytes) => bytes.into(),
+            Err(err) => {
+                log::error!("wgpu-mc: {} could not be read: {err}", id.0);
+                return None;
+            }
+        };
 
-        println!("we good?");
+        // The provider answers with an empty array for a resource it does not have.
+        if bytes.is_null() {
+            return None;
+        }
 
         let elements: AutoElements<jbyte> =
-            unsafe { env.get_array_elements(&bytes, ReleaseMode::NoCopyBack) }.unwrap();
+            match unsafe { env.get_array_elements(&bytes, ReleaseMode::NoCopyBack) } {
+                Ok(elements) => elements,
+                Err(err) => {
+                    log::error!("wgpu-mc: could not read the bytes of {}: {err}", id.0);
+                    return None;
+                }
+            };
 
         let size = elements.len();
-        // let vec = elements.iter().map(|&x| x as u8).collect::<Vec<_>>();
+        if size == 0 {
+            return None;
+        }
 
         Some(Vec::from(unsafe {
             slice::from_raw_parts(elements.as_ptr() as *const u8, size)
@@ -270,31 +345,81 @@ pub fn getSettingsStructure(env: JNIEnv, _class: JClass) -> jstring {
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn getSettings(env: JNIEnv, _class: JClass) -> jstring {
-    let json = serde_json::to_string(&SETTINGS.read().as_ref().unwrap()).unwrap();
+    let json = match SETTINGS.read().as_ref() {
+        Some(settings) => serde_json::to_string(settings).unwrap_or_else(|_| "{}".to_string()),
+        None => {
+            // The options screen is reachable before client setup in principle, and an `unwrap`
+            // here would run the panic hook, which exits the game.
+            log::warn!("wgpu-mc: settings were read before the run directory was sent");
+            "{}".to_string()
+        }
+    };
+
     env.new_string(json).unwrap().into_raw()
 }
 
-/// Returns true if succeeded and false if not.
+/// Applies the settings the options screen sent, and persists them.
+///
+/// The write to disk is not optional: `sendRunDirectory` loads the settings from
+/// `config/wgpu-mc-renderer.json` at startup, so a setting that is only stored in memory is lost
+/// on the next launch. That matters most for `backend`, which by design cannot take effect until
+/// the game is restarted - forgetting it would make the switch look like it did nothing at all.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn sendSettings(mut env: JNIEnv, _class: JClass, settings: JString) -> bool {
-    let json: String = env.get_string(&settings).unwrap().into();
-    if let Ok(settings) = serde_json::from_str(json.as_str()) {
-        let mut guard = SETTINGS.write();
-        *guard = Some(settings);
-        true
-    } else {
-        false
+    if SETTINGS.read().is_none() {
+        // `getSettings` hands out `{}` in this state, and every field has a serde default, so
+        // accepting that would quietly write the defaults over the player's config.
+        log::error!("wgpu-mc: refusing to save settings before the run directory was sent");
+        return false;
     }
+
+    let json: String = env.get_string(&settings).unwrap().into();
+    let Ok(settings) = serde_json::from_str::<Settings>(json.as_str()) else {
+        log::error!("wgpu-mc: the options screen sent settings that could not be parsed");
+        return false;
+    };
+
+    if !settings.write() {
+        // The settings are still applied below, so the running game behaves as asked; only the
+        // next launch will not see them.
+        log::error!("wgpu-mc: the renderer settings could not be saved and will be lost on exit");
+    }
+
+    // The debug switches are read on the draw path, so they are copied out of the settings rather
+    // than looked up per draw. This is what makes an option on the debug page take effect the
+    // moment it is applied - the switch is on the next draw, not on the next launch.
+    crate::debug::apply(&settings);
+
+    *SETTINGS.write() = Some(settings);
+
+    // `vsync` only picks the swapchain's present mode, so unlike `backend` it can be applied here
+    // and now: this re-resolves the mode from the settings that were just stored and reconfigures
+    // the surface when it differs. A no-op for every other setting, and for a value that did not
+    // change.
+    crate::device::reapply_present_mode();
+
+    true
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn sendRunDirectory(mut env: JNIEnv, _class: JClass, dir: JString) {
     let dir: String = env.get_string(&dir).unwrap().into();
     let path = PathBuf::from(dir);
-    RUN_DIRECTORY.set(path).unwrap();
+
+    // Called twice on purpose: once from the mod constructor, before the renderer exists and the
+    // backend setting still matters, and once from client setup, which is where this used to live.
+    // `OnceCell::set` fails the second time, and unwrapping that failure used to be a panic - which
+    // runs the panic hook, which exits the game.
+    if RUN_DIRECTORY.set(path).is_err() {
+        return;
+    }
 
     let mut write = SETTINGS.write();
-    *write = Some(Settings::load_or_default());
+    let settings = Settings::load_or_default();
+    // Before the renderer exists in most launches, so the debug switches are already resolved by
+    // the time the first draw asks for them.
+    crate::debug::apply(&settings);
+    *write = Some(settings);
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
@@ -303,6 +428,21 @@ pub fn getBackend(env: JNIEnv, _class: JClass) -> jstring {
     let backend = renderer.get_backend_description();
 
     env.new_string(backend).unwrap().into_raw()
+}
+
+/// The adapter's vendor, name, API and driver, one per line.
+///
+/// Unlike [`getBackend`] this one answers with an empty string when there is no renderer yet - the
+/// F3 overlay can be opened before one exists, and the JVM side has its own wording to fall back
+/// to. See `WmRenderer#get_adapter_description` for why the four fields are the four it asks for.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn getAdapterInfo(env: JNIEnv, _class: JClass) -> jstring {
+    let description = RENDERER
+        .get()
+        .map(WmRenderer::get_adapter_description)
+        .unwrap_or_default();
+
+    env.new_string(description).unwrap().into_raw()
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
@@ -321,21 +461,6 @@ pub fn registerBlockState(
     BLOCK_STATES
         .lock()
         .push((block_name, state_key, global_ref));
-}
-
-#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn reloadStorage(_env: JNIEnv, _class: JClass, clampedViewDistance: jint, scene: jlong) {
-    let scene = unsafe { &mut *(scene as *mut Scene) };
-
-    let mut section_storage = scene.section_storage.write();
-    section_storage.clear();
-    section_storage.set_width(clampedViewDistance);
-}
-
-#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn setSectionPos(_env: JNIEnv, _class: JClass, x: jint, z: jint, scene: jlong) {
-    let scene = unsafe { &mut *(scene as *mut Scene) };
-    *scene.camera_section_pos.write() = ivec2(x, z);
 }
 
 struct MinecraftBlockStateProviderWrapper<'a> {
@@ -606,13 +731,33 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
 #[allow(unused_must_use)]
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn setPanicHook(env: JNIEnv, _class: JClass) {
-    env_logger::init();
+    // `env_logger::init` alone drops everything below `error`, which hides the renderer's own
+    // reporting (swapchain configuration, adapter choice, the frame dump). The default filter keeps
+    // this crate and `wgpu-mc` at `info` while leaving `wgpu` and `naga` at `warn`, so what is
+    // printed is the mod's own, and `RUST_LOG` still overrides it.
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("wgpu_mc_jni=info,wgpu_mc=info,wgpu=warn,naga=warn"),
+    )
+    .init();
 
     let jvm = env.get_java_vm().unwrap();
     let jvm_ptr = jvm.get_java_vm_pointer() as usize;
 
     std::panic::set_hook(Box::new(move |panic_info| {
         println!("{panic_info}");
+
+        // A panic that unwinds through the C ABI ends the process, and the process ending takes
+        // whatever stderr still had buffered with it - a crash report with no message in the log is
+        // exactly what the last screenshot crash looked like. So it also goes to a file, which is
+        // flushed as it is written.
+        if let Some(run_directory) = RUN_DIRECTORY.get() {
+            let path = run_directory.join("wgpu-panic.txt");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                use std::io::Write;
+                let _ = writeln!(file, "{panic_info}");
+            }
+        }
 
         let jvm = unsafe { JavaVM::from_raw(jvm_ptr as _).unwrap() };
         let mut env = jvm.attach_current_thread_permanently().unwrap();
@@ -637,61 +782,3 @@ pub fn setWorldRenderState(_env: JNIEnv, _class: JClass, boolean: jboolean) {
     }));
 }
 
-#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn bindRenderEffectsData(
-    env: JNIEnv,
-    _class: JClass,
-    fog_start: jfloat,
-    fog_end: jfloat,
-    fog_shape: jint,
-    fog_color: JFloatArray,
-    color_modulator: JFloatArray,
-    dimension_fog_color: JFloatArray,
-    scene: jlong,
-) {
-    let scene = unsafe { &mut *(scene as *mut Scene) };
-
-    let mut render_effects_data = RenderEffectsData {
-        fog_start,
-        fog_end,
-        fog_shape: fog_shape as f32,
-        ..Default::default()
-    };
-
-    let mut fog_color_vec = vec![0f32; env.get_array_length(&fog_color).unwrap() as usize];
-    env.get_float_array_region(&fog_color, 0, &mut fog_color_vec[..])
-        .unwrap();
-
-    let mut color_modulator_vec =
-        vec![0f32; env.get_array_length(&color_modulator).unwrap() as usize];
-    env.get_float_array_region(&color_modulator, 0, &mut color_modulator_vec[..])
-        .unwrap();
-
-    let mut dimension_fog_color_vec =
-        vec![0f32; env.get_array_length(&dimension_fog_color).unwrap() as usize];
-    env.get_float_array_region(&dimension_fog_color, 0, &mut dimension_fog_color_vec[..])
-        .unwrap();
-
-    render_effects_data.fog_color = [
-        fog_color_vec[0],
-        fog_color_vec[1],
-        fog_color_vec[2],
-        fog_color_vec[3],
-    ];
-    render_effects_data.color_modulator = [
-        color_modulator_vec[0],
-        color_modulator_vec[1],
-        color_modulator_vec[2],
-        color_modulator_vec[3],
-    ];
-    render_effects_data.dimension_fog_color = [
-        dimension_fog_color_vec[0],
-        dimension_fog_color_vec[1],
-        dimension_fog_color_vec[2],
-        dimension_fog_color_vec[3],
-    ];
-
-    CLEAR_COLOR.swap([fog_color_vec[0], fog_color_vec[1], fog_color_vec[2]].into());
-
-    scene.render_effects.swap(render_effects_data.into());
-}

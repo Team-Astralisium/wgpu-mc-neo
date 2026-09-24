@@ -1,0 +1,9 @@
+[package]
+name = "cyntax_consteval"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cyntax_common = {path="../cyntax_common"}
+cyntax_parser = {path="../cyntax_parser"}
+cyntax_errors = {path="../cyntax_errors"}
