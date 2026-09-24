@@ -19,6 +19,8 @@ bin/
 
 # Project
 run/
+# NeoGradle writes per-run directories for the generated run configs
+neoforge/runs/
 rust/wgpu-mc-demo/tmp
 rust/wgpu-mc-demo/res/assets
 
@@ -26,6 +28,9 @@ fabric/src/main/wgpu-mc.h
 
 # Ignore Gradle project-specific cache directory
 .gradle
+
+# Workspace-local GRADLE_USER_HOME used when the sandbox cannot write to ~/.gradle
+.gradle-home/
 
 # Ignore Gradle build output directory
 build/
@@ -41,3 +46,10 @@ target/
 
 # nix
 result
+
+# harness
+/.dsh-tmp/
+
+# throwaway 26.1 bytecode-inspection helpers
+neoforge/.analysis/
+neoforge/tools/
