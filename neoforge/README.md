@@ -422,7 +422,6 @@ wgpu-mc: live resources: 767 textures (74 MB), 786 views, 47 buffers (0 MB, 5 qu
 the one that works whatever the launcher does with JVM arguments.
 
 ### The debug switches are settings, and the diagnostics cost nothing when they are off
-
 Every diagnostic in this renderer grew as a marker file, which is the right shape for a switch that
 has to work without a launcher and the wrong one for a player who wants a single frame dumped. They
 are options under **Electrum → Debug** now, separated from the backend and vsync by a blank row,
@@ -436,6 +435,8 @@ with `GPU-based validation` at the top:
 | Dynamic offsets | on | next frame |
 | Trace dynamic offsets | off | next frame |
 | Dump shaders | off | next frame |
+| GPU timestamps | off | next frame |
+| PIX capture | off | next frame - see "The GPU's own clock, and a PIX capture" |
 
 The section is what made the settings list taller than the window at the GUI scales a small window
 allows, so the list scrolls with the wheel now instead of running under the Apply button - which is
@@ -472,6 +473,82 @@ block is per thread, so `log_render_stats` logs a warning once if more than one 
 
 The counters read the same whether the switch is on or off, which is the point: they are a cell
 increment, not a diagnostic.
+
+### The GPU's own clock, and a PIX capture
+
+Two of the debug switches measure or record the GPU itself rather than the renderer's own work.
+
+**`GPU timestamps`** measures how long each presented frame takes *on the GPU*, which is the one
+number no amount of CPU instrumentation can produce. It writes a timestamp at the start of the
+frame's first submission and another at the end of its last one - the start goes into the fresh
+encoder the frame's first flush leaves behind, the end into the blit that closes the frame - and
+reads the pair back a couple of frames later, once the mapping of its readback buffer completes. The
+render thread never waits for the GPU: the results arrive through `map_async` when they arrive:
+
+```
+wgpu-mc: gpu frame time: 5.22 ms average over 9240 frames (last 4.50 ms, worst 3741.82 ms)
+```
+
+The `worst` is a startup frame - the loading screen to a world, where the CPU stalls between two
+submissions that a timestamp pair brackets - while the average is what a frame really costs (5.2 ms
+of GPU work while the frame rate was around 120, DX12, vsync off). The queries need
+`Features::TIMESTAMP_QUERY | TIMESTAMP_QUERY_INSIDE_ENCODERS`; both are requested when the adapter
+has them, and with the switch off not a single timestamp is written, so a disabled switch costs
+nothing.
+
+The first version of this crashed the game, which is worth writing down: a resolve's destination
+offset has to be aligned to `QUERY_RESOLVE_BUFFER_ALIGNMENT`, and the frames' pairs were 16 bytes
+apart. wgpu reported *"Resolve buffer offset has to be aligned to QUERY_RESOLVE_BUFFER_ALIGNMENT"*,
+and a validation error on the render thread ends the process. Each frame now gets its own 256-byte
+slice of the resolve buffer, of which the first 16 bytes are used.
+
+**`PIX capture`** asks Microsoft's D3D12 debugger for a programmatic timing capture -
+`PIXBeginCapture(PIX_CAPTURE_TIMING, ...)`, which is the documented call, and the reason the
+parameters struct is written out by hand in `rust/wgpu-mc-jni/src/pix.rs`: `pix3.h` is not part of
+any SDK this crate builds against, so the layout is spelled out from Microsoft's documentation
+rather than included. Both halves of what PIX needs are loaded on demand:
+
+- `WinPixTimingCapturer.dll`, from PIX's own installation (`C:\Program Files\Microsoft PIX\<version>`,
+  newest version first); a timing capture needs the capturer *in the process*, which is what
+  `PIXLoadLatestWinPixTimingCapturerLibrary()` does in `pix3.h` - a header function, so the search
+  is written out here;
+- the event runtime, where `PIXBeginCapture` itself lives: `WinPixEventRuntime.dll` beside the game
+  or on `PATH` if it is there, otherwise PIX's own `WinPixEventRuntime_OneCore.dll`, whose
+  `PIXBeginCapture2` is documented as equivalent.
+
+Nothing is linked against, because most machines have no PIX and a missing import would stop the
+mod loading at all. On a machine with PIX installed the log says what it found, and what PIX said:
+
+```
+wgpu-mc: PIX: timing capturer C:\Program Files\Microsoft PIX\2603.25\WinPixTimingCapturer.dll
+wgpu-mc: PIX: using C:\Program Files\Microsoft PIX\2603.25\WinPixEventRuntime_OneCore.dll
+[WinPixServices]: Starting
+Starting ETW session PixSysMonSession.…
+wgpu-mc: PIX refused to start a timing capture (HRESULT 0x80070005). A programmatic timing capture
+         needs the game to run elevated (PIX asks for administrator for timing captures), PIX's
+         WinPixTimingCapturer.dll loaded in the process, and no capture already running
+```
+
+`0x80070005` is `E_ACCESSDENIED`, which is the one requirement this side cannot satisfy for you:
+PIX's documentation asks for the game to run **as Administrator** for a programmatic timing capture,
+and the development session this was written in is not elevated. Everything before that point works
+- PIX's service starts and the ETW session is attempted - so a launcher started as Administrator
+should produce the capture. On success the log reads:
+
+```
+wgpu-mc: PIX timing capture started, written to ...\wgpu-mc-capture-1.wpix
+wgpu-mc: PIX timing capture stopped
+wgpu-mc: PIX timing capture reached its 600 frames and stopped
+```
+
+Two things about the call itself are worth knowing. It runs on a **thread of its own**: PIX's runtime
+sets up COM as it loads, and from the render thread - whose apartment is already set - every call
+answered `RPC_E_CHANGED_MODE` (0x80010106); a fresh thread has no apartment yet. And a capture is
+**bounded to 600 frames** (about ten seconds), because a programmatic capture runs until it is
+stopped and fills tooling memory measured in gigabytes; turning the switch back on takes the next
+capture into the next numbered file. The begin/end pairing, the wide-string file name,
+`flags=0x1` (the `PIX_CAPTURE_TIMING` bit) and `discard=0` were all checked against a stand-in
+runtime that writes down what it was asked to do.
 
 ### A shader may declare more than its pipeline provides
 
@@ -798,9 +875,9 @@ Each one is fixed where it belongs. The registry is keyed on the boxed address, 
 remembers the label, size and format it was dropped with, because none of those may be read out of a
 freed texture; a placeholder is the size the real texture had, since wgpu checks every scissor
 against the render target; a clear with nothing left to clear returns instead of building an empty
-pass; the swapchain recovery reconfigures *forcibly*; and a closed buffer is quarantined for two
-seconds before it is really dropped, which makes the cloud buffer's write land in a buffer that
-still exists.
+pass; the swapchain recovery reconfigures *forcibly*; and a closed buffer is quarantined for half a
+second - or until the quarantine is over its byte budget - before it is really dropped, which makes
+the cloud buffer's write land in a buffer that still exists.
 
 What the guards are for - Minecraft rebuilding a render target on a resize and something in the same
 frame still holding the old textures - has not gone away, and a genuine use-after-close now logs the
@@ -950,12 +1027,13 @@ The caches are all bounded, and they report their size every 120 frames with the
 
 | Cache | Bound | Behaviour |
 | --- | --- | --- |
-| compiled pipelines | Minecraft's own pipeline set | reused per `RenderPipeline`; freed on a reload |
+| compiled pipelines | Minecraft's own pipeline set, one depth variant at a time | reused per `RenderPipeline`; freed on a reload; the other depth variant is compiled when a pass first needs it - see "One depth variant, compiled when a pass asks for it" |
 | shader sources | the shader variants in use | reused per `(id, stage, defines)`; cleared with the pipeline cache |
+| driver pipeline cache | one file per adapter, ~1 MB | wgpu's `PipelineCache`, written by Vulkan; nothing to persist on DX12 |
 | dead-texture tombstones | 512, oldest first | a tombstone only has to outlive the frame that closed the texture |
 | placeholder textures | one per format, grown on demand | the stand-in for a closed texture; a window resize used to leave a full-size texture behind at every size it had ever been |
 | fan and quad index buffers | 64 sizes, then emptied | rebuilt on demand; the buffers are a few kilobytes |
-| quarantined buffers | 2 seconds or 1024 entries | |
+| quarantined buffers | 500 ms or 32 MB, oldest evicted first | a byte budget rather than a count: the entries are megabytes each, and a count of them was hundreds of megabytes |
 | `CommandEncoder` | 1 | see above |
 | diagnostics sets | once per name, or one entry per second | the readback budget keeps its "already warned" second in a field, not in a set that grows once a second for the whole session |
 | interned names | one per name the game asks for | see "A name is encoded once" below; the set follows the loaded assets |
@@ -1000,6 +1078,13 @@ The same pass found the buffer quarantine holding far more than it needs: the us
 guards against happens *within a frame*, so two seconds and a thousand entries became half a second
 and a hundred and twenty-eight, and the title screen's 162 quarantined buffers - 676 MB live between
 them, because Minecraft's uniform rings are megabytes each - became 57.
+
+A count was still the wrong unit, because the entries are not one size. It is a **byte budget** now:
+half a second or 32 MB, oldest evicted first, and the stat line says how much is held rather than
+only how many. In the runs since, a world holds 100-odd quarantined buffers in 5-25 MB, where the
+same count could have been hundreds of megabytes. A single buffer larger than the budget still gets
+its quarantine - dropping it would mean the write Minecraft is about to make hits a buffer that is
+already gone, which is the fatal case this exists for - so the budget is a target, not a hard cap.
 
 ### The cache was keyed on the wrong address
 
@@ -1115,6 +1200,59 @@ its pass already holds does not consult the cache at all - and 120 bind groups a
 interval, one per plan per pipeline. Nothing in the renderer frees a bind group per draw any more,
 which is what the stable bind group count across a resource reload (`F3+T`) is: the cache drops, the
 pipelines are freed, and both come back to the same size.
+
+### One depth variant, compiled when a pass asks for it
+
+A pipeline needs two `wgpu::RenderPipeline`s: a pass with a depth attachment cannot use one without
+a depth-stencil state, and a pass without one cannot use a pipeline that has it. This side built
+both, for every pipeline, the moment Minecraft precompiled it - and Minecraft precompiles *every*
+pipeline it ships with, in `ShaderManager#apply`, whether or not a frame ever draws with it.
+
+What made that expensive is not the driver's pipeline creation alone. `compile_render_pipeline`
+preprocesses the GLSL, reflects it with naga, creates the shader modules and numbers the plan, and
+all of that is the same for both variants; only `depth_stencil` differs. Doing it twice per pipeline
+doubled the slowest part of startup for a variant that half the pipelines never used.
+
+So a compiled pipeline is now one variant, plus a `PipelineRecipe`:
+
+- `compile_render_pipeline` builds the recipe - shader modules, pipeline layout, vertex buffers,
+  colour targets, topology, cull - and writes **one** pipeline from it. The JVM asks for the variant
+  the binding pass needs (`precompilePipeline` asks for the one without depth state, since it does
+  not know); the recipe is kept on the pipeline, so the shader work is over.
+- The other variant is written by `create_pipeline_variant(pipeline, depth_state)` the first time a
+  pass of the other kind draws with it: a `render_pipeline` from the modules and layout already in
+  hand, and nothing else. That is also the call the pipeline cache accelerates.
+- `drop_render_pipeline` takes a *nullable* pointer, because only one of the two slots may ever have
+  been filled: freeing a compiled pipeline frees whichever variants exist.
+- The plan is shared by both variants rather than numbered twice, and the ABI exposes a
+  `variant_keys`-style single entry point rather than two descriptor compiles.
+
+```
+live resources: ... 85 bind groups, 115 pipelines, 500 tombstones, ...     ← 98 pipelines × 1 variant
+                                                                              + the depth variants
+                                                                              actually drawn with
+```
+
+**The driver's own cache is persistent.** `RenderPipelineDescriptor::cache` was `None`; it is now a
+`wgpu::PipelineCache` created with the device, seeded from a file beside the config
+(`wgpu_pipeline_cache_vulkan_<vendor>_<device>.bin`, the key wgpu's own `pipeline_cache_key`
+suggests) and rewritten every 16 pipelines through a temporary file and a rename. Where it helps is
+where the driver lets it: Vulkan implements it as `vkPipelineCache`, and DX12 has no serialisable
+form at all - its adapter does not even offer the `PIPELINE_CACHE` feature - so on DX12 there is no
+cache and no file, which the log says once instead of leaving a missing file unexplained:
+
+```
+wgpu-mc: pipeline cache: 1.2 MB written to ...\wgpu_pipeline_cache_vulkan_4318_11544.bin (started from 1.2 MB)
+wgpu-mc: this device has no pipeline cache; every launch compiles every pipeline     ← the DX12 run
+```
+
+The two lines are one report: `report_pipeline_cache_once` runs from the first `log_render_stats`,
+because the cache is created during mod construction, before the logger is up. The Vulkan numbers
+above are a second launch - the first one wrote 1.29 MB, and the next one started from it and grew
+no further, which is what "the driver reused its compilation" looks like from here.
+
+The counter that says whether the laziness worked is `live resources`' pipeline count: 115 for a
+world session, where compiling both variants of every precompiled pipeline put it at 196.
 
 ### Neither compiler checks the two bridges, so a test does
 

@@ -33,6 +33,12 @@ static TRACE_DYNAMIC_OFFSETS: AtomicBool = AtomicBool::new(false);
 /// Whether the GLSL that reaches the shader compiler is written out.
 static DUMP_SHADERS: AtomicBool = AtomicBool::new(false);
 
+/// Whether frame timings are measured with GPU timestamp queries.
+static GPU_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
+
+/// Whether a PIX timing capture has been asked for.
+static PIX_CAPTURE: AtomicBool = AtomicBool::new(false);
+
 /// Whether the wgpu instance is created with the driver's GPU-based validation.
 ///
 /// Read once, when the instance is built: an instance flag cannot be changed afterwards, which is
@@ -65,6 +71,16 @@ pub fn dump_shaders() -> bool {
 }
 
 #[inline]
+pub fn gpu_timestamps() -> bool {
+    GPU_TIMESTAMPS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn pix_capture() -> bool {
+    PIX_CAPTURE.load(Ordering::Relaxed)
+}
+
+#[inline]
 pub fn gpu_based_validation() -> bool {
     GPU_BASED_VALIDATION.load(Ordering::Relaxed)
 }
@@ -78,6 +94,8 @@ pub fn apply(settings: &Settings) {
         dynamic_offsets,
         trace_dynamic_offsets,
         dump_shaders,
+        gpu_timestamps,
+        pix_capture,
     } = settings.debug();
 
     set(&DIAGNOSTICS, diagnostics || marker("wgpu-dump-frames"));
@@ -96,6 +114,15 @@ pub fn apply(settings: &Settings) {
     );
     set(&DUMP_SHADERS, dump_shaders || marker("wgpu-dump-shaders"));
     set(&GPU_BASED_VALIDATION, gpu_based_validation);
+
+    // These two are not flags to be read somewhere: they *are* the action, so the switch does
+    // something the moment it moves. Both are gated on the setting alone - a marker file has no way
+    // to end a capture, and a capture that never ends is worse than none.
+    set(&GPU_TIMESTAMPS, gpu_timestamps);
+    set(&PIX_CAPTURE, pix_capture);
+
+    crate::timing::set_enabled(gpu_timestamps);
+    crate::pix::set_capturing(pix_capture);
 }
 
 fn set(flag: &AtomicBool, value: bool) {
@@ -116,6 +143,8 @@ fn name(flag: &AtomicBool) -> &'static str {
         f if std::ptr::eq(f, &DYNAMIC_OFFSETS) => "dynamic offsets",
         f if std::ptr::eq(f, &TRACE_DYNAMIC_OFFSETS) => "trace dynamic offsets",
         f if std::ptr::eq(f, &DUMP_SHADERS) => "dump shaders",
+        f if std::ptr::eq(f, &GPU_TIMESTAMPS) => "gpu timestamps",
+        f if std::ptr::eq(f, &PIX_CAPTURE) => "pix capture",
         _ => "gpu based validation",
     }
 }

@@ -45,18 +45,14 @@ class WgpuCompiledRenderPipeline private constructor(
     firstHasDepth: Boolean,
 ) : CompiledRenderPipeline, AutoCloseable {
 
-    private val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-
     /**
-     * The two native pipelines, one of which may not exist yet.
+     * The two native slots, in an object of their own.
      *
-     * Guarded by the lock because a pipeline can be bound from more than one place in a frame - a
-     * pass that draws the same pipeline twice with different depth configurations would otherwise
-     * compile it twice - and the compile is not cheap.
+     * A separate object rather than fields on this class, because the cleaner's action must hold
+     * nothing that reaches the pipeline: an action that references its own referent keeps it alive
+     * forever, and the action would never run at all.
      */
-    private val lock = Any()
-    private var withDepth: MemorySegment? = if (firstHasDepth) first else null
-    private var withoutDepth: MemorySegment? = if (firstHasDepth) null else first
+    private val variants = Variants(if (firstHasDepth) first else null, if (firstHasDepth) null else first)
 
     override fun isValid(): Boolean = true
 
@@ -67,14 +63,7 @@ class WgpuCompiledRenderPipeline private constructor(
      * is only ever drawn in one kind of pass never pays for the other one's shader modules, layouts
      * and driver compilation.
      */
-    fun forDepth(wantsDepth: Boolean): MemorySegment {
-        val existing = if (wantsDepth) withDepth else withoutDepth
-        if (existing != null) {
-            return existing
-        }
-
-        return createVariant(wantsDepth)
-    }
+    fun forDepth(wantsDepth: Boolean): MemorySegment = variants.get(wantsDepth) { createVariant(it) }
 
     /**
      * Builds the missing variant from the one that exists.
@@ -83,13 +72,10 @@ class WgpuCompiledRenderPipeline private constructor(
      * the other one's shader modules and layouts rather than recompiled from the descriptor: that
      * is what makes the second variant cost a driver pipeline creation and nothing else.
      */
-    private fun createVariant(wantsDepth: Boolean): MemorySegment = synchronized(lock) {
-        val existing = if (wantsDepth) withDepth else withoutDepth
-        if (existing != null) {
-            return existing
-        }
+    private fun createVariant(wantsDepth: Boolean): MemorySegment = synchronized(variants.lock) {
+        variants[wantsDepth]?.let { return it }
 
-        val source = withDepth ?: withoutDepth
+        val source = variants.withDepth ?: variants.withoutDepth
             ?: throw IllegalStateException("wgpu: ${pipeline.location} has no compiled variant to build from")
 
         val segment = Arena.ofConfined().use { arena ->
@@ -102,7 +88,7 @@ class WgpuCompiledRenderPipeline private constructor(
             ) as MemorySegment
         }
 
-        if (wantsDepth) withDepth = segment else withoutDepth = segment
+        variants[wantsDepth] = segment
         segment
     }
 
@@ -151,11 +137,12 @@ class WgpuCompiledRenderPipeline private constructor(
     /**
      * The plan's binding slots, read out of the native pipeline once.
      *
-     * Both depth variants are built from the same plan, so one table serves them both. `null` when
-     * the plan is wider than the ABI's binding array, which `bindingsOf` already logged.
+     * Both depth variants are built from the same plan, so one table serves them both, and it does
+     * not matter which of them the table is read from. One always exists: a compiled pipeline is
+     * created with the variant its first bind asked for.
      */
     val planBindings: PlanBindings? by lazy {
-        readPlanBindings(withDepth ?: withoutDepth ?: MemorySegment.NULL)
+        readPlanBindings(variants.withDepth ?: variants.withoutDepth ?: MemorySegment.NULL)
     }
 
     /** [planBindings] for the Java side, which reads it once when a pass binds this pipeline. */
@@ -172,26 +159,10 @@ class WgpuCompiledRenderPipeline private constructor(
      * two `wgpu::RenderPipeline`s, their bind group layouts and a copy of the whole descriptor with
      * it, and nothing on the native side ever hears about it.
      */
-    override fun close() {
-        if (!closed.compareAndSet(false, true)) {
-            return
-        }
-
-        val with = synchronized(lock) {
-            val slots = arrayOf(withDepth, withoutDepth)
-            withDepth = null
-            withoutDepth = null
-            slots
-        }
-
-        for (variant in with) {
-            // Null for a variant that was never asked for, which the native side ignores.
-            WmNative.dropRenderPipeline.invokeExact(variant ?: MemorySegment.NULL) as Unit
-        }
-    }
+    override fun close() = variants.release()
 
     init {
-        CLEANER.register(this, PipelineReleaser(this, closed))
+        CLEANER.register(this, VariantsReleaser(variants))
     }
 
     companion object {
@@ -585,25 +556,63 @@ class WgpuCompiledRenderPipeline private constructor(
 }
 
 /**
- * Frees a collected pipeline's native handles, on the cleaner's thread.
+ * The native slots of one compiled pipeline, and the lock that guards them.
  *
- * A separate class holding the pipeline itself rather than its two pointers: the variants are
- * compiled lazily, so which of them exist is only known at the moment they are freed, and the
- * pipeline is unreachable from the collector's side either way - what the object must not capture
- * is anything that keeps the *pipeline* alive, and it held nothing else to begin with.
+ * Not part of [WgpuCompiledRenderPipeline] itself because the cleaner's action holds this object,
+ * and an action that can reach its own referent keeps it alive forever - the leak the separate
+ * releaser class existed to avoid in the first place.
  */
-private class PipelineReleaser(
-    private val compiled: WgpuCompiledRenderPipeline,
-    private val closed: java.util.concurrent.atomic.AtomicBoolean,
-) : Runnable {
+private class Variants(withDepth: MemorySegment?, withoutDepth: MemorySegment?) {
 
-    override fun run() {
-        if (!closed.compareAndSet(false, true)) {
+    /** Held while a missing variant is compiled, so two binds cannot compile it twice. */
+    val lock = Any()
+
+    @Volatile
+    var withDepth: MemorySegment? = withDepth
+
+    @Volatile
+    var withoutDepth: MemorySegment? = withoutDepth
+
+    /** Frees both slots once, whoever gets there first: [WgpuCompiledRenderPipeline.close] or the
+     *  cleaner. */
+    private val released = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    operator fun get(wantsDepth: Boolean): MemorySegment? =
+        if (wantsDepth) withDepth else withoutDepth
+
+    operator fun set(wantsDepth: Boolean, segment: MemorySegment) {
+        if (wantsDepth) withDepth = segment else withoutDepth = segment
+    }
+
+    /** The variant, compiling it with [create] if this is the first bind that needs it. */
+    fun get(wantsDepth: Boolean, create: (Boolean) -> MemorySegment): MemorySegment =
+        get(wantsDepth) ?: create(wantsDepth)
+
+    fun release() {
+        if (!released.compareAndSet(false, true)) {
             return
         }
 
+        val slots = synchronized(lock) {
+            val slots = arrayOf(withDepth, withoutDepth)
+            withDepth = null
+            withoutDepth = null
+            slots
+        }
+
+        for (variant in slots) {
+            // Null for a variant no pass ever asked for, which the native side ignores.
+            WmNative.dropRenderPipeline.invokeExact(variant ?: MemorySegment.NULL) as Unit
+        }
+    }
+}
+
+/** Frees a collected pipeline's variants, on the cleaner's thread. */
+private class VariantsReleaser(private val variants: Variants) : Runnable {
+
+    override fun run() {
         try {
-            compiled.close()
+            variants.release()
         } catch (error: Throwable) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.warn("wgpu: could not free a compiled pipeline", error)
         }

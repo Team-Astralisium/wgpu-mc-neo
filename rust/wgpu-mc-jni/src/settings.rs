@@ -51,6 +51,10 @@ pub struct Settings {
     pub trace_dynamic_offsets: BoolSetting,
     #[serde(default = "off")]
     pub dump_shaders: BoolSetting,
+    #[serde(default = "off")]
+    pub gpu_timestamps: BoolSetting,
+    #[serde(default = "off")]
+    pub pix_capture: BoolSetting,
 }
 
 /// The default of a setting that is off unless a player asks for it.
@@ -71,6 +75,8 @@ pub struct SettingsInfo {
     dynamic_offsets: SettingInfo,
     trace_dynamic_offsets: SettingInfo,
     dump_shaders: SettingInfo,
+    gpu_timestamps: SettingInfo,
+    pix_capture: SettingInfo,
 }
 
 /// The section the options screen puts a setting under, when it is not one of the plain ones.
@@ -145,6 +151,25 @@ lazy_static! {
             uniforms are annotated with the binding the plan gave them, implicit blocks are added, \
             samplers are split - and it is the only place that shows which of those went wrong. \
             This is the `wgpu-dump-shaders` marker as a switch.",
+            false,
+        ),
+        gpu_timestamps: SettingInfo::debug(
+            "Measure how long each presented frame takes on the GPU, with timestamp queries at the \
+            start of the frame's first submission and the end of its last one. The number is the \
+            GPU's own clock, so it says what the driver actually spent - the frame's passes, not \
+            the CPU time spent recording them - and it is reported with the render stats. Nothing \
+            is measured while this is off: the queries are written into the frame's command stream, \
+            so a disabled switch costs nothing at all.",
+            false,
+        ),
+        pix_capture: SettingInfo::debug(
+            "Ask PIX for a timing capture, written next to the game as `wgpu-mc-capture-N.wpix` and \
+            stopped when this is switched off again. It is the documented `PIXBeginCapture` timing \
+            capture, so it needs the PIX tooling on the machine: the WinPixEventRuntime beside the \
+            game (or on `PATH`), and PIX itself to open the result. Without it the switch logs what \
+            is missing and nothing else happens. This is a programmatic capture, so it records from \
+            the moment it is switched on - a few frames of a world are usually enough, and the file \
+            is finished when the switch goes back off.",
             false,
         ),
     };
@@ -280,6 +305,8 @@ impl Default for Settings {
             dynamic_offsets: BoolSetting::of(true),
             trace_dynamic_offsets: BoolSetting::of(false),
             dump_shaders: BoolSetting::of(false),
+            gpu_timestamps: BoolSetting::of(false),
+            pix_capture: BoolSetting::of(false),
         }
     }
 }
@@ -296,6 +323,8 @@ pub struct DebugSettings {
     pub dynamic_offsets: bool,
     pub trace_dynamic_offsets: bool,
     pub dump_shaders: bool,
+    pub gpu_timestamps: bool,
+    pub pix_capture: bool,
 }
 
 impl Settings {
@@ -307,6 +336,8 @@ impl Settings {
             dynamic_offsets: self.dynamic_offsets.value,
             trace_dynamic_offsets: self.trace_dynamic_offsets.value,
             dump_shaders: self.dump_shaders.value,
+            gpu_timestamps: self.gpu_timestamps.value,
+            pix_capture: self.pix_capture.value,
         }
     }
 }
@@ -573,6 +604,8 @@ mod tests {
             "dynamic_offsets",
             "trace_dynamic_offsets",
             "dump_shaders",
+            "gpu_timestamps",
+            "pix_capture",
         ] {
             assert_eq!(
                 info[name]["section"],
@@ -682,6 +715,8 @@ mod tests {
             "dynamic_offsets",
             "trace_dynamic_offsets",
             "dump_shaders",
+            "gpu_timestamps",
+            "pix_capture",
         ] {
             assert_eq!(
                 info[name]["needs_restart"],
@@ -698,6 +733,8 @@ mod tests {
         assert!(!debug.diagnostics, "logging was off");
         assert!(!debug.trace_dynamic_offsets, "tracing was off");
         assert!(!debug.dump_shaders, "shader dumps were off");
+        assert!(!debug.gpu_timestamps, "nothing measured the GPU");
+        assert!(!debug.pix_capture, "no capture was being taken");
         assert!(debug.bind_group_cache, "the cache was on");
         assert!(debug.dynamic_offsets, "dynamic offsets were on");
         assert!(
@@ -742,3 +779,4 @@ mod tests {
         );
     }
 }
+

@@ -58,9 +58,11 @@ mod gl;
 mod lighting;
 mod palette;
 mod pia;
+mod pix;
 pub mod preprocessing;
 mod renderer;
 mod settings;
+mod timing;
 
 /// Checks that the JVM side of the two bridges still matches this crate: the JNI declarations in
 /// `WgpuNative.kt`, the hand-written C-ABI bindings in `WmNative.kt`, and the struct layouts and

@@ -1,7 +1,7 @@
 {
   "wgpu_mc.screen.video_options": "视频设置",
   "wgpu_mc.page.general": "常规",
-  "wgpu_mc.page.electrum": "Electrum",
+  "wgpu_mc.page.electrum": "Neolectrum",
   "wgpu_mc.page.quality": "画质",
   "wgpu_mc.button.apply": "应用",
   "wgpu_mc.button.close": "关闭",
@@ -28,5 +28,9 @@
   "wgpu_mc.option.trace_dynamic_offsets": "追踪动态偏移",
   "wgpu_mc.option.trace_dynamic_offsets.tooltip": "记录每次绘制的绑定——绑定计划、按槽位顺序的每条绑定、随之传递的偏移——以及绑定组缓存被查询的 key。非常吵：每次绘制一行，所以只适合开几帧再把日志读回来。这是 wgpu-trace-dynamic-offsets 标记文件的开关形式。",
   "wgpu_mc.option.dump_shaders": "转储着色器",
+  "wgpu_mc.option.gpu_timestamps": "GPU 计时",
+  "wgpu_mc.option.gpu_timestamps.tooltip": "用时间戳查询测量每个呈现帧在 GPU 上实际花了多久：在本帧第一次提交的开头与最后一次提交的结尾各写一个时间戳。这个数字来自 GPU 自己的时钟，因此反映的是驱动真正花掉的时间——本帧的那些渲染通道，而不是 CPU 记录它们的时间——并随渲染统计一起打印。关闭时什么都不测：时间戳是写进本帧命令流里的，所以关掉的开关完全不产生开销。",
+  "wgpu_mc.option.pix_capture": "PIX 捕获",
+  "wgpu_mc.option.pix_capture.tooltip": "向 PIX 请求一次计时捕获，写到游戏目录下的 wgpu-mc-capture-N.wpix，关闭该开关时结束捕获。它调用的是文档中的 PIXBeginCapture 计时捕获，因此机器上需要 PIX 工具链：游戏目录旁或 PATH 中的 WinPixEventRuntime，以及用来打开结果的 PIX 本体。缺少时开关只会把缺什么写进日志，其它什么都不做。这是程序化捕获，从打开的瞬间就开始记录——世界里的几帧通常就够了，关闭开关时文件才写完。",
   "wgpu_mc.option.dump_shaders.tooltip": "把经过本渲染器预处理、最终送进着色器编译器的 GLSL 写入 wgpu-shaders/。naga 看到的源码并不是 Minecraft 提供的源码——uniform 被标注了绑定计划给它们的 binding、隐式块被补上、采样器被拆分——而这里是唯一能看出其中哪一步出了错的地方。这是 wgpu-dump-shaders 标记文件的开关形式。"
 }

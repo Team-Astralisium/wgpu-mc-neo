@@ -602,6 +602,16 @@ fn try_create_renderer(
         required_features |= wgpu::Features::PIPELINE_CACHE;
     }
 
+    // Timestamp queries, for the `gpu timestamps` debug switch. Asked for whenever the adapter has
+    // them - requesting a feature does not change how anything renders, only what may be asked of
+    // the device later - and the switch decides whether any are written.
+    if adapter
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    }
+
     let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: None,
         required_features,
@@ -808,6 +818,11 @@ fn flush_shared_encoder(wm: &WmRenderer) {
 
     // Safety: as above - the render thread is the only one recording, and it is here.
     let finished = unsafe { std::mem::replace(&mut *pointer, new_encoder(wm)) };
+
+    // The encoder that was just installed is where the next frame starts recording, so if the last
+    // frame has already been presented, its start timestamp goes here - see `timing`.
+    crate::timing::frame_begin(wm, unsafe { &mut *pointer });
+
     wm.gpu.queue.submit([finished.finish()]);
 }
 
@@ -2176,6 +2191,9 @@ fn trace_marker(name: &str) {
 /// two apart without a GPU debugger.
 #[unsafe(no_mangle)]
 pub extern "C" fn log_render_stats() {
+    report_pipeline_cache_once();
+    crate::timing::report();
+
     // The counters live on the thread that counts, and this is that thread: a draw is recorded on
     // the render thread, so its block is the whole of the last interval. `RECORDING_THREADS` is
     // what makes the assumption checkable, because a second recording thread would be counted in a
@@ -2215,6 +2233,20 @@ pub extern "C" fn log_render_stats() {
          {hits} cache hits and {misses} misses), {vertices} vertices"
     );
 
+    // Read in one lock rather than two: a guard taken inside the `info!` argument list lives until
+    // the end of the statement, so a second lock of the same mutex inside it deadlocks the render
+    // thread - which is exactly what it did.
+    let (quarantined_count, quarantined_bytes) = {
+        let quarantined = QUARANTINED_BUFFERS.lock();
+        (
+            quarantined.len(),
+            quarantined
+                .iter()
+                .map(|(buffer, _)| buffer.size())
+                .sum::<u64>(),
+        )
+    };
+
     info!(
         "wgpu-mc: live resources: {} textures ({} MB), {} views, {} buffers ({} MB, {} quarantined \
          in {} MB), {} encoders, {} passes, {} bind groups, {} pipelines, {} tombstones, \
@@ -2224,8 +2256,8 @@ pub extern "C" fn log_render_stats() {
         LIVE_VIEW_COUNT.load(Ordering::Relaxed),
         LIVE_BUFFER_COUNT.load(Ordering::Relaxed),
         LIVE_BUFFER_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
-        QUARANTINED_BUFFERS.lock().len(),
-        quarantined_bytes() / (1024 * 1024),
+        quarantined_count,
+        quarantined_bytes / (1024 * 1024),
         LIVE_ENCODER_COUNT.load(Ordering::Relaxed),
         LIVE_PASS_COUNT.load(Ordering::Relaxed),
         LIVE_BIND_GROUP_COUNT.load(Ordering::Relaxed),
@@ -2673,6 +2705,61 @@ pub unsafe extern "C" fn compile_render_pipeline(
 /// write is never more than a few pipelines stale.
 const PIPELINE_CACHE_SAVE_EVERY: u64 = 16;
 
+/// What this launch's pipeline cache turned out to be.
+///
+/// The cache is created during mod construction, which is before the logger is up, so which of
+/// these three cases applies is recorded here and printed by the first `log_render_stats` - the
+/// question "why is there no cache file" deserves an answer in the log.
+static PIPELINE_CACHE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(STATE_UNKNOWN);
+
+const STATE_UNKNOWN: u8 = 0;
+/// The device has no `PIPELINE_CACHE` feature, so there is nothing to create.
+const STATE_ABSENT: u8 = 1;
+/// There is a cache, but the backend does not hand its contents back - DX12.
+const STATE_PRIVATE: u8 = 2;
+/// The cache is on disk, and is written as pipelines are compiled.
+const STATE_PERSISTED: u8 = 3;
+
+/// Says once which kind of pipeline cache this backend ended up with.
+fn report_pipeline_cache_once() {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let loaded = LOADED_PIPELINE_CACHE_BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+    let file = crate::RENDERER
+        .get()
+        .and_then(|wm| pipeline_cache_file(&wm.gpu.adapter));
+
+    match PIPELINE_CACHE_STATE.load(Ordering::Relaxed) {
+        STATE_ABSENT => info!(
+            "wgpu-mc: this device has no pipeline cache; every launch compiles every pipeline"
+        ),
+        STATE_PRIVATE => info!(
+            "wgpu-mc: this backend keeps its pipeline cache to itself; every launch compiles every \
+             pipeline"
+        ),
+        STATE_PERSISTED => info!(
+            "wgpu-mc: pipeline cache: started from {:.1} MB, written to {} every {} pipelines",
+            loaded,
+            file.map(|file| file.display().to_string()).unwrap_or_default(),
+            PIPELINE_CACHE_SAVE_EVERY,
+        ),
+        // No pipeline was compiled before the stats line, which cannot happen in a real frame, but
+        // the report is not worth a panic either.
+        _ => {}
+    }
+}
+
+/// What this launch's cache file held, so the first write can say whether it was used.
+///
+/// The load happens during mod construction, before the logger is up, so the line about *loading*
+/// the cache would be lost; this is what carries that number to the first save, which happens once
+/// the first pipelines have been compiled.
+static LOADED_PIPELINE_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Creates the device's pipeline cache, seeded with whatever the last run left behind.
 ///
 /// What this buys is the driver's own pipeline compilation: without it, every launch compiles every
@@ -2684,20 +2771,27 @@ const PIPELINE_CACHE_SAVE_EVERY: u64 = 16;
 /// ever written on that path. See [`pipeline_cache_file`] for why the data is kept per adapter.
 fn create_pipeline_cache(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Option<wgpu::PipelineCache> {
     if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
-        info!("wgpu-mc: this device has no pipeline cache; every launch compiles every pipeline");
+        // The logger is not up yet at this point in a launch - the device is created during mod
+        // construction - so the case is recorded here and printed by `report_pipeline_cache_once`.
+        PIPELINE_CACHE_STATE.store(STATE_ABSENT, Ordering::Relaxed);
         return None;
     }
 
     let file = pipeline_cache_file(adapter)?;
     let data = std::fs::read(&file).ok().filter(|data| !data.is_empty());
 
+    LOADED_PIPELINE_CACHE_BYTES.store(
+        data.as_ref().map(|data| data.len() as u64).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+
     match &data {
-        Some(data) => info!(
+        Some(data) => log::info!(
             "wgpu-mc: pipeline cache: {:.1} MB loaded from {}",
             data.len() as f64 / (1024.0 * 1024.0),
             file.display()
         ),
-        None => info!("wgpu-mc: pipeline cache: nothing to load from {}", file.display()),
+        None => log::info!("wgpu-mc: pipeline cache: nothing to load from {}", file.display()),
     }
 
     // Safety: the data is what a previous `PipelineCache::get_data` wrote to this file for this
@@ -2742,6 +2836,7 @@ fn save_pipeline_cache(wm: &WmRenderer) {
     static SINCE_LAST_SAVE: AtomicU64 = AtomicU64::new(0);
 
     let Some(cache) = wm.gpu.pipeline_cache.as_ref() else {
+        PIPELINE_CACHE_STATE.store(STATE_ABSENT, Ordering::Relaxed);
         return;
     };
 
@@ -2752,14 +2847,13 @@ fn save_pipeline_cache(wm: &WmRenderer) {
     SINCE_LAST_SAVE.store(0, Ordering::Relaxed);
 
     let Some(data) = cache.get_data() else {
-        // DX12: the device reports the feature but the backend stores nothing, so there is nothing
-        // to persist and no point asking again.
-        static REPORTED: AtomicBool = AtomicBool::new(false);
-        if !REPORTED.swap(true, Ordering::Relaxed) {
-            info!("wgpu-mc: this backend keeps its pipeline cache to itself; nothing to persist");
-        }
+        // A cache the backend keeps to itself: wgpu creates one for DX12, but there is no way to
+        // read it back, so there is nothing to persist and no point asking again.
+        PIPELINE_CACHE_STATE.store(STATE_PRIVATE, Ordering::Relaxed);
         return;
     };
+
+    PIPELINE_CACHE_STATE.store(STATE_PERSISTED, Ordering::Relaxed);
 
     let Some(file) = pipeline_cache_file(&wm.gpu.adapter) else {
         return;
@@ -2780,9 +2874,10 @@ fn save_pipeline_cache(wm: &WmRenderer) {
     }
 
     info!(
-        "wgpu-mc: pipeline cache: {:.1} MB written to {}",
+        "wgpu-mc: pipeline cache: {:.1} MB written to {} (started from {:.1} MB)",
         data.len() as f64 / (1024.0 * 1024.0),
-        file.display()
+        file.display(),
+        LOADED_PIPELINE_CACHE_BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
     );
 }
 
@@ -3030,6 +3125,11 @@ pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceT
     if let Err(error) = wm.gpu.device.poll(wgpu::PollType::Poll) {
         warn!("wgpu-mc: polling the device after a present failed: {error:?}");
     }
+
+    // A frame has been presented: a finished frame's timestamps can be picked up, and the `pix
+    // capture` switch is followed here - a capture starts and ends at a frame boundary.
+    crate::timing::frame_presented(wm);
+    crate::pix::tick();
 }
 
 #[unsafe(no_mangle)]
@@ -3253,6 +3353,9 @@ pub extern "C" fn blit_from_texture(
             state
                 .blitter
                 .copy(&wm.gpu.device, encoder, texture_view, &view);
+
+            // The blit is the last thing a frame submits, so this is where its end timestamp goes.
+            crate::timing::frame_end(encoder, wm);
         });
     };
 
@@ -3422,15 +3525,6 @@ fn quarantine_buffer(buffer: Box<wgpu::Buffer>) {
     quarantined.push((buffer, now));
 }
 
-/// How many bytes are held by the quarantine, for the `live resources` line.
-fn quarantined_bytes() -> u64 {
-    QUARANTINED_BUFFERS
-        .lock()
-        .iter()
-        .map(|(buffer, _)| buffer.size())
-        .sum()
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn drop_buffer(buffer: Box<wgpu::Buffer>) {
     LIVE_BUFFER_COUNT.fetch_sub(1, Ordering::Relaxed);
@@ -3453,6 +3547,7 @@ pub extern "C" fn max_texture_size(wm: &WmRenderer) -> u32 {
 pub extern "C" fn min_uniform_offset_alignment(wm: &WmRenderer) -> u32 {
     wm.gpu.device.limits().min_uniform_buffer_offset_alignment
 }
+
 
 
 

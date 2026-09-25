@@ -1,7 +1,7 @@
 {
   "wgpu_mc.screen.video_options": "Video Options",
   "wgpu_mc.page.general": "General",
-  "wgpu_mc.page.electrum": "Electrum",
+  "wgpu_mc.page.electrum": "Neolectrum",
   "wgpu_mc.page.quality": "Quality",
   "wgpu_mc.button.apply": "Apply",
   "wgpu_mc.button.close": "Close",
@@ -20,5 +20,7 @@
   "wgpu_mc.option.bind_group_cache": "Bind group cache",
   "wgpu_mc.option.dynamic_offsets": "Dynamic offsets",
   "wgpu_mc.option.trace_dynamic_offsets": "Trace dynamic offsets",
-  "wgpu_mc.option.dump_shaders": "Dump shaders"
+  "wgpu_mc.option.dump_shaders": "Dump shaders",
+  "wgpu_mc.option.gpu_timestamps": "GPU timestamps",
+  "wgpu_mc.option.pix_capture": "PIX capture"
 }
