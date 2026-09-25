@@ -54,3 +54,4 @@ result
 neoforge/.analysis/
 neoforge/tools/
 /.kotlin
+/logs

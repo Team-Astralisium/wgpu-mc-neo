@@ -19,8 +19,8 @@ val neoforgeMavenGroup = providers.gradleProperty("neoforge_maven_group").get()
 val neoforgeKotlinVersion = providers.gradleProperty("neoforge_kotlin_version").getOrElse("2.3.20")
 
 val modId = "wgpu_mc"
-val modName = "wgpu-mc"
-val modLicense = "LGPLv2.1"
+val modName = "Neolectrum"
+val modLicense = "MPLv2"
 val loaderVersionRange = "[3,)"
 // Minecraft 26.1 is the new stable modding baseline; 26.2 is the next feature release.
 val minecraftVersionRange = "[$neoforgeMinecraftVersion,$neoforgeMinecraftVersion.999)"
@@ -53,13 +53,32 @@ kotlin {
 	jvmToolchain(25)
 }
 
-// Align the Kotlin stdlib with the one shipped by NeoForge's own Kotlin support.
+// ---------------------------------------------------------------------------
+// The Kotlin runtime has to be inside the jar.
+//
+// This module is written in Kotlin, and nothing else on a player's classpath brings the runtime:
+// FML and NeoForge are Java, and Minecraft does not ship Kotlin either. A development run does not
+// show the omission, because the Kotlin Gradle plugin puts the stdlib on the *run* classpath - which
+// is why it survived until the first jar was started in a real instance. There the game dies the
+// moment a Kotlin class is loaded, and the first one it loads is the mixin that runs on `Main.main`:
+//
+//   java.lang.NoClassDefFoundError: kotlin/jvm/internal/Intrinsics
+//
+// `jarJar` embeds the stdlib under `META-INF/jarjar/` next to the metadata FML's jar-in-jar loader
+// reads, so the published `<name>-all.jar` carries its own runtime. KotlinForForge ships one as
+// well; two copies is the ordinary jar-in-jar situation and the versions are compatible, so an
+// instance that has it keeps working - an instance that does not is the case this fixes.
+// ---------------------------------------------------------------------------
 dependencies {
 	constraints {
 		implementation("org.jetbrains.kotlin:kotlin-stdlib:$neoforgeKotlinVersion") {
-			because("NeoForge 26.1 ships a Kotlin runtime; keep the compile/runtime classpath aligned.")
+			because("The Kotlin plugin adds the stdlib at its own version; pin it to the one jarJar embeds.")
 		}
 	}
+
+	// Adding a dependency to `jarJar` is what enables the `jarJar` task; its output (classifier
+	// `all`) is the artifact `assemble` and `publish` hand out.
+	add("jarJar", "org.jetbrains.kotlin:kotlin-stdlib:$neoforgeKotlinVersion")
 }
 
 val localRuntime = configurations.named("localRuntime")
@@ -94,10 +113,11 @@ val nativeLibraryFileName = System.mapLibraryName("wgpu_mc_jni")
 val nativeLibrary = rustReleaseDir.file(nativeLibraryFileName)
 
 // The PDB the release build writes beside the library, when the profile asks for one (`debug =
-// "line-tables-only"` in `rust/Cargo.toml`). It rides along into this module's resources for one
-// reason: the game extracts the library into `<run>/lib`, and PIX resolves a timing capture's
-// function names through the PDB that sits *there* - a debugger looks for symbols beside the module,
-// not in the mod's jar. Absent when the Rust build produced none, which is not an error.
+// "line-tables-only"` in `rust/Cargo.toml`). It rides along into this module's resources, and into
+// the published jar with them, for one reason: the game unpacks both into the launcher's natives
+// directory, and PIX resolves a timing capture's function names through the PDB that sits *there* - a
+// debugger looks for symbols beside the module, not inside the mod's jar. Absent when the Rust build
+// produced none, which is not an error.
 val nativeSymbols = rustReleaseDir.file(nativeLibraryFileName.substringBeforeLast('.') + ".pdb")
 
 val copyNatives = tasks.register<Copy>("copyNatives") {
@@ -153,10 +173,10 @@ tasks.named<ProcessResources>("processResources") {
 tasks.named<Jar>("jar") {
 	dependsOn(unpackExports, "deleteExports")
 
-	// The debug symbols ride along to a development run, where the game extracts them beside the
-	// library for PIX to find, but not into the mod jar: it is tens of megabytes of line tables, and
-	// a packaged build is not the one anybody profiles.
-	exclude("**/*.pdb")
+	// The PDB stays in the jar. It is ~47 MB of line tables uncompressed, and it is the only way a
+	// capture taken on a machine that runs the published jar can show function names - which is the
+	// machine a report about a slow frame comes from. `jarJar` copies this task's output into the
+	// published jar, so the symbols travel with the library they match.
 }
 
 listOf("runClient", "runData", "runGameTestServer", "runServer").forEach { runTaskName ->
@@ -166,20 +186,19 @@ listOf("runClient", "runData", "runGameTestServer", "runServer").forEach { runTa
 }
 
 // ---------------------------------------------------------------------------
-// NeoForge's early loading window is incompatible with this mod.
+// NeoForge's early loading window, turned off for development runs.
 //
-// It draws its splash screen through OpenGL *from Minecraft's render thread*, which only works
-// because Blaze3D's GL backend makes a context current on that thread. This mod deliberately does
-// not (`WgpuBackend#setWindowHints` asks for GLFW_NO_API), so the first GL call from that thread
-// aborts the JVM:
+// It draws its splash screen through OpenGL from Minecraft's render thread, which this mod cannot
+// survive without an abort - a production instance hits exactly that, and
+// `dev.birb.wgpu.backend.EarlyWindow` now takes the screen out of the way there (the README has the
+// stack and the reasoning). This task is the cruder, older answer to the same problem: it writes
+// FML's own switch, which is read before any mod is loaded, so a dev run never creates the screen at
+// all and opens straight into the game window.
 //
-//   FATAL ERROR in native method: No context is current ...
-//       at org.lwjgl.opengl.GL11C.glIsEnabled(Native Method)
-//       at net.neoforged.fml.earlydisplay.render.GlState.readFromOpenGL(GlState.java:129)
-//
-// Whether the early window is created is decided by FML before any mod is loaded, so the mod
-// cannot turn it off itself - the only place to say so is FML's own config. This task writes that
-// one key, so a fresh run directory works without anyone having to remember why it is needed.
+// The cost is that the dev loop does not exercise `EarlyWindow`, so this is deliberately only a
+// convenience - deleting `earlyWindowControl` from runs/client/config/fml.toml makes runClient take
+// the same path a player's instance does. The task edits that one key and leaves the rest of the
+// file to FML, which fills in everything it does not find.
 // ---------------------------------------------------------------------------
 val configureEarlyWindow = tasks.register("configureEarlyWindow") {
 	description = "Disables NeoForge's early loading window, which needs a GL context this mod never creates."

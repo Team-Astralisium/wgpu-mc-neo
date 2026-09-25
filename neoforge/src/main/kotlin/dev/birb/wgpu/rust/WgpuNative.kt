@@ -19,6 +19,52 @@ import java.util.HashMap
 private val NATIVE_RESOURCE_ROOTS = listOf("META-INF/natives/", "assets/wgpu_mc/natives/")
 
 /**
+ * The properties a launcher uses to name the directory it unpacks the game's natives into, in probe
+ * order. NeoForge's own version JSON sets every one of them to `${natives_directory}`.
+ */
+private val NATIVE_DIRECTORY_PROPERTIES = listOf(
+	"org.lwjgl.system.SharedLibraryExtractPath",
+	"jna.tmpdir",
+	"io.netty.native.workdir",
+	"org.lwjgl.librarypath",
+)
+
+/**
+ * The directory the native library and its symbols are unpacked into.
+ *
+ * The launcher's natives directory rather than a `lib` folder of this mod's own: that is where the
+ * game's other natives (LWJGL, GLFW, jemalloc, JNA) already sit, it is on `java.library.path`, and it
+ * is the directory a debugger searches when it resolves a module's symbols - which is what PIX needs
+ * the PDB for. The launcher names it in [NATIVE_DIRECTORY_PROPERTIES]; failing that it is found by
+ * looking through `java.library.path` for the directory holding LWJGL's own libraries, identified by
+ * their names rather than by the directory's, so it works on every platform and cannot be confused
+ * with the JDK's own `bin`.
+ *
+ * A development run has neither, so the fallback is `natives/` under the working directory, which is
+ * the same layout one level down.
+ */
+private fun nativeDirectory(): File {
+	for (property in NATIVE_DIRECTORY_PROPERTIES) {
+		val configured = System.getProperty(property)?.takeIf { it.isNotBlank() } ?: continue
+		val directory = File(configured)
+		if (directory.isDirectory) return directory
+	}
+
+	val searchPath = System.getProperty("java.library.path").orEmpty()
+	for (entry in searchPath.split(File.pathSeparator)) {
+		val directory = File(entry)
+		if (!directory.isDirectory) continue
+		val holdsLwjgl = directory.listFiles()?.any { file ->
+			val name = file.name.lowercase()
+			name.contains("lwjgl") || name.contains("glfw")
+		} == true
+		if (holdsLwjgl) return directory
+	}
+
+	return File("natives")
+}
+
+/**
  * JNI side of the native bridge: shader settings, entity model registration, block-state baking,
  * palettes, panic handling and the renderer handle itself.
  *
@@ -101,15 +147,15 @@ object WgpuNative {
 	 * The path is what [java.lang.foreign.SymbolLookup.libraryLookup] needs in order to bind
 	 * the C ABI surface exposed by the same cdylib that backs the JNI entry points.
 	 *
-	 * Both the NeoForge-style `META-INF/natives/` location and the Fabric-style
-	 * `assets/wgpu_mc/natives/` location are probed, because the Rust build writes to the
-	 * latter and the Gradle `copyNatives` task writes to the former.
+	 * Both roots in [NATIVE_RESOURCE_ROOTS] are probed. This build populates the
+	 * `assets/wgpu_mc/natives/` one - `copyNatives` in build.gradle.kts puts the Rust build's
+	 * library and its PDB there - so the other is only for a jar assembled the other way around.
 	 */
 	@JvmStatic
 	@Throws(IOException::class)
 	fun resolveNativeLibrary(name: String, forceOverwrite: Boolean = false): String {
 		val mappedName = System.mapLibraryName(name)
-		val libraryFile = File("lib", mappedName)
+		val libraryFile = File(nativeDirectory(), mappedName)
 		// Fast path: the prebuilt library sits in the Rust workspace output.
 		if (!libraryFile.exists() || forceOverwrite) {
 			libraryFile.parentFile?.mkdirs()
@@ -163,7 +209,7 @@ object WgpuNative {
 			.firstOrNull { WgpuNative::class.java.classLoader.getResource(it + symbolsName) != null }
 			?: return
 
-		val symbolsFile = File("lib", symbolsName)
+		val symbolsFile = File(nativeDirectory(), symbolsName)
 
 		try {
 			WgpuNative::class.java.classLoader.getResourceAsStream(resourceName + symbolsName).use { input ->

@@ -1,4 +1,4 @@
-# wgpu-mc NeoForge - Neolectrum
+ wgpu-mc NeoForge - Neolectrum
 
 This module is the NeoForge port of the Fabric Electrum mod.
 
@@ -490,6 +490,12 @@ Everything below was observed by launching `:wgpu-mc-neoforge:runClient`, not in
   hotbar all drawn, over 5280 presented frames with `acquired=true` on every one of them. The
   window was resized three times before entering the world and maximised to 2560x1334 with the
   world loaded, which is the path that rebuilds a render target and used to end the process.
+- The packaged jar was also started the way a player starts it: a scratch instance whose `mods`
+  folder holds `wgpu_mc-<version>-all.jar` and nothing else, with no `config/fml.toml`, so FML's
+  early loading screen is on - which is what a fresh instance has. It reached the title screen,
+  created a world, presented frames, and exited cleanly; the same jar was then run beside
+  KotlinForForge 6.3.0 with the same result. This is the run that covers both fixes above, because
+  neither the missing stdlib nor the early loading screen is reachable from `runClient`.
 
 ### Reading a frame without a GPU debugger
 
@@ -835,9 +841,11 @@ in it (6 MB, not one `.rs` name in it), so every native frame was an address. Th
 - `rust/Cargo.toml` asks for `debug = "line-tables-only"` in the release profile - line tables, no
   locals, nothing added to the code at runtime, and the PDB grows to ~47 MB;
 - `copyNatives` copies that PDB into the mod's resources, and `WgpuNative` extracts it next to the
-  library it extracts (`<run>/lib/wgpu_mc_jni.pdb`), because a debugger looks for symbols *beside the
-  module* rather than in the mod's jar; the jar itself excludes `**/*.pdb`, since nobody profiles a
-  packaged build;
+  library it extracts - both into the launcher's natives directory, because a debugger looks for
+  symbols *beside the module* rather than in the mod's jar, and because that directory is already on
+  `java.library.path`. The PDB travels inside the jar as well now: a packaged build is exactly the one
+  somebody profiles when a player reports a frame that took 40 ms, and the alternative was asking
+  them for a second download;
 - PIX still needs a symbol path for everything else (the JDK's `java.exe`, the driver, Windows):
   *Configure PIX → Debug symbols*, or `_NT_SYMBOL_PATH=srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
 
@@ -943,25 +951,75 @@ wgpu has neither behaviour, so the Rust preprocessing shim now reproduces the ob
   sampler the pipeline cannot bind at all - now logs and gets a binding that cannot collide, so the
   shader still compiles and wgpu reports the unmatched binding by number.
 
-### NeoForge's early loading window has to be off
+### The first jar had no Kotlin in it
 
-`ClientModLoader.finish` ticks FML's early loading screen, and that renders through OpenGL **from
-Minecraft's render thread**:
+Dropping the exported jar into an instance did not start the game. Three runs stopped in the same
+place - immediately after the mixin that runs on `Main.main` had been applied - and none of them put
+an error in `debug.log`, because a class-loading failure is reported on stderr and a launcher does
+not put stderr in that file. What it was is not in doubt: the mod is Kotlin, nothing on a player's
+classpath carries the runtime (FML and NeoForge are Java, Minecraft ships no Kotlin), and the first
+Kotlin class the game touches is that mixin's handler. The run after KotlinForForge 6.3.0 was added
+is the confirmation: the same jar went on to the title screen.
+
+A development run cannot show this, because the Kotlin Gradle plugin puts the stdlib on the *run*
+classpath - `runClient` has had it since the first build, and only the published jar did not.
+`neoforge/build.gradle.kts` now sends the stdlib through `jarJar`, which embeds it at
+`META-INF/jarjar/kotlin-stdlib-<version>.jar` beside the `metadata.json` FML's jar-in-jar loader
+reads, so the artifact to install is the one with the `-all` classifier:
 
 ```
-FATAL ERROR in native method: No context is current or a function that is not available in the
-current context was called. The JVM will abort execution.
+neoforge/build/libs/wgpu_mc-<version>-all.jar
+```
+
+The plain jar is the input to that task and still cannot start on its own. KotlinForForge ships a
+stdlib too, and the run above had both on the classpath, so an instance that has it keeps working.
+
+### NeoForge hands the game a window that was made for OpenGL
+
+With the runtime in the jar the game got further and then aborted, and this one is not a Java
+exception - there is nothing to catch:
+
+```
+FATAL ERROR in native method: Thread[#3,Render thread,5,main]: No context is current or a function
+that is not available in the current context was called. The JVM will abort execution.
     at org.lwjgl.opengl.GL11C.glIsEnabled(Native Method)
     at net.neoforged.fml.earlydisplay.render.GlState.readFromOpenGL(GlState.java:129)
+    at net.neoforged.fml.earlydisplay.render.LoadingScreenRenderer.renderToScreen(LoadingScreenRenderer.java:230)
+    at net.neoforged.fml.earlydisplay.DisplayWindow.periodicTick(DisplayWindow.java:525)
+    at net.neoforged.neoforge.client.loading.ClientModLoader.finish(ClientModLoader.java:66)
+    at net.minecraft.client.Minecraft.<init>(Minecraft.java:695)
+    at net.minecraft.client.main.Main.main(Main.java:231)
 ```
 
-That only works in vanilla because Blaze3D's GL backend made a GL context current on that thread.
-This mod deliberately does not, so the first GL call aborts the JVM. Whether the early window
-exists is decided by FML before any mod loads, so the mod cannot turn it off itself; the only lever
-is `earlyWindowControl` in `config/fml.toml`, which the `configureEarlyWindow` Gradle task now
-writes before every `runClient`. With it off the log says
-`ImmediateWindowProvider not loading because splash screen is disabled` and startup goes through.
-**Anyone running this mod needs the same setting**, and loses the early loading screen with it.
+FML creates a GLFW window *with an OpenGL context* before a single mod is loaded, draws the splash
+screen into it, and later hands that same window to the game: `Window#createGlfwWindow` asks
+`EarlyLoadingScreenController.current()` for it instead of calling `glfwCreateWindow`. Adopting it is
+fine for wgpu - the surface is attached to that handle and the device comes up normally - but the
+loading screen keeps a repaint tick installed across the hand over, and NeoForge drives that tick from
+the render thread while the last of mod loading runs. The tick is OpenGL, the context it needs is the
+one the loading screen created on its own thread, and in this mod the render thread never has it (nor
+`GLCapabilities`, which is what `LoadingScreenRenderer#close` complains about once the tick is out of
+the way) - so the first GL call aborts the JVM.
+
+Whether the early screen exists at all is decided by FML from `config/fml.toml` *before* any mod is
+loaded, so a mod cannot switch it off: a fresh instance has `earlyWindowControl = true`, and all the
+mod can do is defuse the screen it is handed. `dev.birb.wgpu.backend.EarlyWindow` does that in two
+steps - from the head of `Main.main` (`mixin/core/EarlyWindowMixin`) and from the hand-over call
+itself (`mixin/render/WindowMixin`):
+
+1. take the window over (`takeOverGlfwWindow`, which stops the loading screen's own render loop) and
+   close it. A closed loading screen is skipped by the tick above, so no GL call is left for the
+   render thread to make, and closing shuts down the thread pool that would otherwise keep the
+   process alive after the game exits. Closing destroys GL objects, so it runs only while the
+   window's context is current here *and* LWJGL has capabilities for this thread.
+2. answer the hand-over question with "no", so the game falls through to `glfwCreateWindow` and gets
+   this mod's `GLFW_NO_API` window - the window a development run has. The splash is hidden at that
+   moment rather than at step 1, so it stays on screen for the mod loading it exists to report on.
+
+Development runs still do not exercise any of this: `configureEarlyWindow` writes
+`earlyWindowControl = false` into `runs/client/config/fml.toml` before every `runClient`, which is why
+the abort first appeared in a player's instance instead of here. Deleting that key from
+`runs/client/config/fml.toml` is what makes a dev run take the same path as a player's.
 
 ### Getting past the constructor took three fixes
 

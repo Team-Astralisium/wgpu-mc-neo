@@ -1,19 +1,19 @@
 modLoader="javafml"
 loaderVersion="${loader_version_range}"
 license="${mod_license}"
-issueTrackerURL="https://github.com/wgpu-mc/wgpu-mc/issues"
+issueTrackerURL="https://github.com/Team-Astralisium/wgpu-mc-neo/issues"
 
 [[mods]]
 modId="${mod_id}"
 version="${mod_version}"
 displayName="${mod_name}"
-displayURL="https://github.com/wgpu-mc/wgpu-mc"
+displayURL="https://github.com/Team-Astralisium/wgpu-mc-neo"
 logoFile="assets/wgpu_mc/icon.png"
 credits="Original Fabric mod by Birb"
-authors="Birb, NeoForge port contributors"
+authors="Birb, NoTuring_Steve"
 description='''
 A renderer made to replace Blaze3D, written in Rust, using wgpu for cross-platform support.
-Supported backends: Vulkan, D3D12, and Metal.
+Supported backends: Vulkan, D3D12.
 '''
 
 [[mixins]]
