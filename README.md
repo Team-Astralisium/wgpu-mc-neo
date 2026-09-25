@@ -1,4 +1,4 @@
-# wgpu-mc — Minecraft Rendering Engine Built in Rust
+# "wgpu-mc" — Minecraft Rendering Engine Built in Rust
 <img align="right" src="media/logo.png" width="280" alt="">
 <p>
 <img alt="Static Badge" src="https://img.shields.io/badge/Discord_-5865F2?style=flat-square&logo=discord&logoColor=fff&link=https%3A%2F%2Fdiscord.gg%2FNTuK8bQ2hn">
@@ -6,21 +6,20 @@
 </p>
 
 > [!WARNING]  
-> wgpu-mc is in **Beta**. [Contributions appreciated](https://github.com/wgpu-mc/wgpu-mc/labels/engine).<br>
+> Original project wgpu-mc is in **Beta**. [Contributions appreciated](https://github.com/wgpu-mc/wgpu-mc/labels/engine).<br>
 
 **wgpu-mc** is a standalone [WebGPU](https://www.w3.org/TR/webgpu/) rendering engine written in Rust using the [`wgpu`](https://gpuweb.github.io/gpuweb/) crate. The project was started in late 2021 as a pet project to create a new rendering engine for Minecraft to replace the existing OpenGL renderer.
+## About this "wgpu-mc-neo" project
+#### This is the unofficial **neoforge** branch of wgpu-mc. 
+> [!WARNING]
+> Since the original project was far from meeting the goals, this project revamped and modified its Rust side. **So it will no longer be a simply migrating subproject of wgpu-mc**. For maintainability and the author's availability, this project has removed the Fabric mod part.
 
-## Electrum — Rust-based Rendering Engine Mod for Minecraft
+The author's original intention was to introduce ray tracing/path tracing and modern graphics technologies like DLSS, DLSSD, and DLSSR under DirectX in such an experimental project. However, due to the limitations of the crate WebGPU, currently they can only be implemented through pretty dirty methods like hooking in C++ libraries. So, this project will no longer consider adding those technologies and will instead focus on improving the practicality and stability of this cross-API graphics project.
+
+## Neolectrum — Rust-based Rendering Engine Mod for Minecraft
 > [!CAUTION]
 > Electrum is currently wip. [Feel free to contribute!](https://github.com/wgpu-mc/wgpu-mc/labels/electrum).
 
-**Electrum** is a fabric mod that integrates the wgpu-mc rendering engine, replacing the existing Blaze3D rendering engine.
+#### **Neolectrum** is a Neoforge mod that integrates the wgpu-mc rendering engine, replacing the existing Blaze3D rendering engine. 
 
-### Screenshots
-<p>
-  <img alt="" src="https://github.com/user-attachments/assets/031437b4-9001-404f-84a1-996660fa49b2" width="280">
-  <img alt="" src="https://github.com/user-attachments/assets/16686221-a49a-4761-b4e1-fe81865b0449" width="280">
-  <img alt="" src="https://github.com/user-attachments/assets/466264f5-3b05-4a5b-89b3-7cc379aacbae" width="280">
-</p>
-
-## Contribution Guide
+By hijacking the original GL renderer at the start of the game through a mixin, and using Rust's complete GLSL to WGSL translation process along with a WebGPU-based rendering pipeline, we can replace Minecraft's rendering backend with DirectX12, Vulkan, Metal, or even more backends. (Currently there are only Vulkan and DirectX12 available.)
