@@ -23,6 +23,7 @@
     "render.LightmapTextureManagerMixin",
     "render.RebuildTaskMixin",
     "render.RenderSystemMixin",
+    "render.SkyRendererMixin",
     "render.WindowMixin",
     "render.WorldRendererMixin",
     "world.BlockStateMixin"

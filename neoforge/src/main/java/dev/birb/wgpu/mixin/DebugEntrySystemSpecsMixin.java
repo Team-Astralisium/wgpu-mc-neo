@@ -45,7 +45,7 @@ public class DebugEntrySystemSpecsMixin {
         // requested: an unusable choice falls back to the other one.
         lines.add("Render backend: " + WgpuNative.getBackendSafe());
 
-        if (Diagnostics.isEnabled() && REPORTED.compareAndSet(false, true)) {
+        if (Diagnostics.loggingEnabled() && REPORTED.compareAndSet(false, true)) {
             // Diagnostics: the block's exact content, in the order the overlay draws it. A
             // screenshot cannot check this - the system block sits below the profiler section and
             // is usually off the bottom of the window.

@@ -1,5 +1,6 @@
 package dev.birb.wgpu.gui
 
+import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.gui.options.Option
 import dev.birb.wgpu.gui.widgets.CustomButtonWidget
 import dev.birb.wgpu.gui.widgets.IOptionWidget
@@ -13,16 +14,44 @@ import net.minecraft.client.gui.screens.Screen
 import net.minecraft.client.input.MouseButtonEvent
 import net.minecraft.network.chat.Component
 import net.minecraft.util.Mth
+import kotlin.math.floor
 
 class OptionPageScreen(private val parent: Screen) :
     Screen(Component.translatable("wgpu_mc.screen.video_options")) {
 
     companion object {
-        private const val MAX_WIDTH = 1000
+        /**
+         * The share of the monitor's width the list of settings may use.
+         *
+         * The page is laid out from the *display* rather than from the window, so that it is the
+         * same size in a maximised window, a half-screen one and one that was just resized - the
+         * rows stop being a different width every time the window's edge is dragged. A window on a
+         * smaller display gets a smaller page, which is what makes the widest rows fit there.
+         */
+        private const val WIDTH_SHARE_OF_MONITOR = 0.809
+
+        /**
+         * The limit when there is no monitor to measure: the width this page was fixed at before it
+         * followed the display.
+         */
+        private const val FALLBACK_MAX_WIDTH = 2071
 
         /** How far one wheel notch scrolls the list of settings, in GUI units. */
         private const val SCROLL_STEP = 12
     }
+
+    /**
+     * The widest the list may be, in *pixels* - the monitor's width times
+     * [WIDTH_SHARE_OF_MONITOR], rounded down. [getOptimalWidth] turns it into GUI units.
+     */
+    private var maxWidth = FALLBACK_MAX_WIDTH
+
+    /** Where the window was when [maxWidth] was resolved, so a move to another display is noticed. */
+    private var maxWidthAtX = Int.MIN_VALUE
+    private var maxWidthAtY = Int.MIN_VALUE
+
+    /** Whether the missing-monitor warning has been logged, which is once per screen. */
+    private var warnedAboutMissingMonitor = false
 
     private val pages = OptionPages()
     var currentPage: OptionPages.Page = pages.getDefault()
@@ -187,7 +216,61 @@ class OptionPageScreen(private val parent: Screen) :
     }
 
     private fun getOptimalWidth(): Int {
-        return (MAX_WIDTH / Minecraft.getInstance().window.guiScale).toInt().coerceAtMost(width)
+        return (monitorWidthLimit() / Minecraft.getInstance().window.guiScale).coerceAtMost(width)
+    }
+
+    /**
+     * The widest the list may be in pixels, from the monitor the window is on.
+     *
+     * The window's position is the cheap half of "which display is this on": `findBestMonitor` walks
+     * GLFW's monitor list and compares rectangles, and this is called from [alignX], which every
+     * widget of the page goes through. A window only changes monitor by moving - a fullscreen
+     * toggle moves it too - so the position is what says the answer has gone stale.
+     */
+    private fun monitorWidthLimit(): Int {
+        val window = Minecraft.getInstance().window
+        if (window.x == maxWidthAtX && window.y == maxWidthAtY) {
+            return maxWidth
+        }
+
+        maxWidthAtX = window.x
+        maxWidthAtY = window.y
+
+        val monitor = window.findBestMonitor()
+        if (monitor == null) {
+            // GLFW had no monitor to name. The page keeps the width it had rather than shrinking to
+            // something unusable, and says so once instead of once per widget.
+            if (!warnedAboutMissingMonitor) {
+                warnedAboutMissingMonitor = true
+                WgpuMcMod.LOGGER.warn(
+                    "wgpu: no monitor was found for the window; the video options page keeps its {} pixel width",
+                    FALLBACK_MAX_WIDTH,
+                )
+            }
+
+            return maxWidth
+        }
+
+        // The widest mode the monitor reports, not the one it is running at: a display driven below
+        // its own maximum can still show the page at full size, and the caller clamps the result to
+        // the window in GUI units anyway. GLFW lists a monitor's modes sorted, but by colour depth
+        // first, so the maximum is taken rather than assumed to be the first or the last.
+        var widest = monitor.currentMode.width
+        for (index in 0 until monitor.modeCount) {
+            widest = maxOf(widest, monitor.getMode(index).width)
+        }
+
+        val limit = floor(widest * WIDTH_SHARE_OF_MONITOR).toInt()
+        if (limit != maxWidth) {
+            WgpuMcMod.LOGGER.info(
+                "wgpu: the video options page is limited to {} pixels on a {} pixel wide monitor",
+                limit,
+                widest,
+            )
+        }
+
+        maxWidth = limit
+        return limit
     }
 
     private fun alignX(x: Int): Int {
@@ -219,6 +302,15 @@ class OptionPageScreen(private val parent: Screen) :
     // background twice - which is what turned the backdrop's contrast inside out - and with a
     // level loaded it threw "Can only blur once per frame" from extractBlurredBackground.
     override fun extractRenderState(context: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, delta: Float) {
+        // A window that was dragged to another display is laid out again for *that* display's width.
+        // The rows are built in `init`, so a new limit has to reach it rather than waiting for the
+        // next resize or page switch - and the check is two field reads until the window moves.
+        val widthBefore = maxWidth
+        monitorWidthLimit()
+        if (maxWidth != widthBefore) {
+            init()
+        }
+
         val optionWidget = getHoveredOptionWidget(mouseX, mouseY)
         if (optionWidget is IOptionWidget) {
             hoveredOption = optionWidget.getOption()

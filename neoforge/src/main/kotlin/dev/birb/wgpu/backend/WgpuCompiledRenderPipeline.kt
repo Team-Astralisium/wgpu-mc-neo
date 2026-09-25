@@ -142,7 +142,10 @@ class WgpuCompiledRenderPipeline private constructor(
      * created with the variant its first bind asked for.
      */
     val planBindings: PlanBindings? by lazy {
-        readPlanBindings(variants.withDepth ?: variants.withoutDepth ?: MemorySegment.NULL)
+        readPlanBindings(
+            variants.withDepth ?: variants.withoutDepth ?: MemorySegment.NULL,
+            pipeline.location.toString(),
+        )
     }
 
     /** [planBindings] for the Java side, which reads it once when a pass binds this pipeline. */
@@ -183,7 +186,7 @@ class WgpuCompiledRenderPipeline private constructor(
          * to tell which one is to print both sides. Diagnostics.
          */
         private fun describeOnce(pipeline: RenderPipeline) {
-            if (!Diagnostics.isEnabled()) return
+            if (!Diagnostics.loggingEnabled()) return
             if (!described.add(pipeline.location)) return
 
             val target = pipeline.colorTargetState
@@ -628,23 +631,145 @@ private class VariantsReleaser(private val variants: Variants) : Runnable {
  * name lookup per binding per draw.
  */
 class PlanBindings internal constructor(
+    /** The pipeline this plan belongs to, which every log line about this plan names. */
+    @JvmField val label: String,
     /** Slot `i`: the `WmNative.DRAW_BINDING_*` kind the plan expects there. */
     @JvmField val kinds: IntArray,
 ) {
     private val slots = HashMap<String, IntArray>()
 
+    /** Slot `i`: the name that slot is bound under, for the log lines that report an empty one. */
+    private val names = arrayOfNulls<String>(kinds.size)
+
+    /** Requests that only resolved through [shimSuffixFallback] and were reported, by request name. */
+    private val fallbacksReported = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     internal fun put(name: String, slots: IntArray) {
         this.slots[name] = slots
+
+        // A declared name wins the slot for the report: a shim-suffixed name is the same slot under
+        // a name the preprocessing invented, and it is only the fallback for a slot the shim named
+        // and nothing declared.
+        nameSlots(slots, name, overwrite = !isShimName(name))
     }
 
     internal fun putIfAbsentName(name: String, slots: IntArray) {
-        this.slots.putIfAbsent(name, slots)
+        if (this.slots.putIfAbsent(name, slots) == null) {
+            nameSlots(slots, name, overwrite = false)
+        }
     }
 
-    /** The slots a binding name goes in: one for a uniform, two for a combined sampler. */
-    fun of(name: String): IntArray? = slots[name]
+    /** Records the name a slot answers to, for [nameOf] and [bindableNames]. */
+    private fun nameSlots(slots: IntArray, name: String, overwrite: Boolean) {
+        for (slot in slots) {
+            if (slot !in names.indices) continue
+            if (overwrite || names[slot] == null) {
+                names[slot] = name
+            }
+        }
+    }
 
+    private fun isShimName(name: String): Boolean =
+        name.endsWith(TEXSHIM_SUFFIX) || name.endsWith(SAMPLER_SUFFIX)
+
+    /**
+     * The slots a binding name goes in: one for a uniform, two for a combined sampler.
+     *
+     * A name that is not in the table is tried once more with the suffixes this renderer's shader
+     * preprocessing puts on the two halves of a combined sampler (`Sampler0_wm_texshim` and
+     * `Sampler0_wm_sampler`), in both directions: a caller may hold either half, or the bare name
+     * the pipeline declared. The shim's names are in the table under both spellings, so a hit here
+     * means the two sides disagree about which one a caller uses - which is worth a log line, and
+     * is what the binding-resolution switch turns on.
+     */
+    fun of(name: String): IntArray? {
+        slots[name]?.let { return it }
+
+        val hits = ArrayList<Pair<String, IntArray>>(3)
+        for (candidate in shimSuffixCandidates(name)) {
+            slots[candidate]?.let { hits.add(candidate to it) }
+        }
+
+        if (hits.isEmpty()) {
+            return null
+        }
+
+        // Two hits are a pair rather than a choice: the shim splits a combined sampler into a
+        // texture slot and a sampler slot, and a caller binding under either spelling wants both -
+        // "the plan spells this differently" must not come out as "the texture is bound and the
+        // sampler is not". Failing that, the longest hit wins, because a single slot is what a
+        // uniform has and half of a sampler is worse than none of it.
+        val texture = hits.firstOrNull { kinds[it.second[0]] == WmNative.DRAW_BINDING_TEXTURE }
+        val sampler = hits.firstOrNull { kinds[it.second[0]] == WmNative.DRAW_BINDING_SAMPLER }
+
+        val resolved = if (texture != null && sampler != null) {
+            intArrayOf(texture.second[0], sampler.second[0])
+        } else {
+            hits.maxBy { it.second.size }.second
+        }
+
+        reportFallback(name, hits.joinToString(" + ") { it.first })
+        return resolved
+    }
+
+    /** The name a slot is bound under, or a placeholder when the plan has no name for it. */
+    fun nameOf(slot: Int): String = names.getOrNull(slot) ?: "<unnamed>"
+
+    /**
+     * Every name this plan can be bound under, in slot order.
+     *
+     * This is what a binding that is *not* in the plan is reported against: "the shader asked for
+     * `CloudFaces`" says nothing on its own, while the list of names the plan actually has says
+     * whether the shader, the pipeline or the caller is the one that is wrong.
+     */
+    fun bindableNames(): String {
+        val text = StringBuilder()
+        for (slot in 0 until count) {
+            if (slot > 0) text.append(", ")
+            text.append(slot).append(':').append(nameOf(slot))
+        }
+
+        return if (text.isEmpty()) "<none>" else text.toString()
+    }
+
+    /** The names a shim-suffixed lookup should try for [name], in both directions. */
+    private fun shimSuffixCandidates(name: String): List<String> {
+        val bare = when {
+            name.endsWith(TEXSHIM_SUFFIX) -> name.dropLast(TEXSHIM_SUFFIX.length)
+            name.endsWith(SAMPLER_SUFFIX) -> name.dropLast(SAMPLER_SUFFIX.length)
+            else -> name
+        }
+
+        val candidates = ArrayList<String>(3)
+        if (bare != name) {
+            candidates.add(bare)
+        }
+        candidates.add(bare + TEXSHIM_SUFFIX)
+        candidates.add(bare + SAMPLER_SUFFIX)
+        candidates.remove(name)
+
+        return candidates
+    }
+    /** Records a fallback hit once per request name, when the binding-resolution log is on. */
+    private fun reportFallback(requested: String, resolved: String) {
+        if (!Diagnostics.bindingsEnabled() || !fallbacksReported.add(requested)) {
+            return
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+            "wgpu: {} has no binding named {}; it resolved through the shader shim suffix to {}",
+            label,
+            requested,
+            resolved,
+        )
+    }
     val count: Int get() = kinds.size
+
+    private companion object {
+        /** The suffixes `preprocessing.rs` puts on the two halves of a combined sampler. */
+        const val TEXSHIM_SUFFIX = "_wm_texshim"
+        const val SAMPLER_SUFFIX = "_wm_sampler"
+    }
 }
 
 /**
@@ -653,8 +778,12 @@ class PlanBindings internal constructor(
  * `pipeline_bindings` fills the caller's array and returns how many entries it wrote, or 0
  * when the plan has more bindings than the array holds - which is a hard failure rather than
  * a truncated table, because a draw with bindings in the wrong slots renders nonsense.
+ *
+ * [label] is the pipeline's location, and travels with the table because every line the table logs
+ * has to name the pipeline it is about: "a binding is not in the plan" is not actionable without
+ * knowing whose plan.
  */
-internal fun readPlanBindings(pipeline: MemorySegment): PlanBindings? =
+internal fun readPlanBindings(pipeline: MemorySegment, label: String): PlanBindings? =
     Arena.ofConfined().use { arena ->
         val entries = arena.allocate(WmNative.PLAN_BINDING, WmNative.MAX_DRAW_BINDINGS.toLong())
         val array = arena.allocate(WmNative.RAW_ARRAY)
@@ -670,7 +799,7 @@ internal fun readPlanBindings(pipeline: MemorySegment): PlanBindings? =
         }
 
         val kinds = IntArray(count)
-        val table = PlanBindings(kinds)
+        val table = PlanBindings(label, kinds)
         val textures = HashMap<String, Int>()
         val samplers = HashMap<String, Int>()
 

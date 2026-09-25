@@ -11,8 +11,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * [GpuSampler] backed by a `wgpu::Sampler`.
  *
- * Rust currently builds one default sampler per device, so the requested address and filter modes
- * are remembered here purely so the accessors report what Blaze3D asked for rather than `null`.
+ * The address modes and filters are the *sampler's*: a texture that scrolls or tiles - rain and
+ * snow, the enchantment glint, flowing water - is sampled past its own edge and folds back only
+ * because the sampler says `REPEAT`. They used to be remembered here and dropped on the native
+ * side, which meant every texture in the game was clamped and unfiltered; see `create_sampler`.
  */
 class WgpuSampler(
     @get:JvmName("device") val device: WgpuDevice,
@@ -27,7 +29,15 @@ class WgpuSampler(
     /** Raw `wgpu::Sampler` pointer. */
     @get:JvmName("nativeSampler")
     val nativeSampler: MemorySegment =
-        WmNative.createSampler.invokeExact(device.renderer) as MemorySegment
+        WmNative.createSampler.invokeExact(
+            device.renderer,
+            addressModeU.ordinal,
+            addressModeV.ordinal,
+            minFilter.ordinal,
+            magFilter.ordinal,
+            maxAnisotropy,
+            if (maxLod.isPresent) maxLod.asDouble else NO_LOD_LIMIT,
+        ) as MemorySegment
 
     private val closed = AtomicBoolean(false)
 
@@ -42,5 +52,10 @@ class WgpuSampler(
         if (closed.compareAndSet(false, true)) {
             WmNative.dropSampler.invokeExact(nativeSampler) as Unit
         }
+    }
+
+    private companion object {
+        /** How "no LOD limit" travels across the ABI, which the native side reads as negative. */
+        const val NO_LOD_LIMIT = -1.0
     }
 }

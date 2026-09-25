@@ -149,6 +149,9 @@ public class WgpuRenderPass implements RenderPassBackend {
     private final String label;
     private final MemorySegment nativeColorTexture;
 
+    /** The label of the colour target, for the dumps that recognise a target by its name. */
+    private final String targetLabel;
+
     /**
      * Size of the render area, i.e. of the colour target's own mip level.
      *
@@ -177,6 +180,7 @@ public class WgpuRenderPass implements RenderPassBackend {
         this.encoder = encoder;
         this.label = label.get();
         this.nativeColorTexture = ((WgpuTextureView) colorTexture).texture().nativeTexture();
+        this.targetLabel = ((WgpuTextureView) colorTexture).texture().getLabel();
         this.targetWidth = colorTexture.getWidth(0);
         this.targetHeight = colorTexture.getHeight(0);
         this.wantsDepth = depthTexture != null;
@@ -194,7 +198,7 @@ public class WgpuRenderPass implements RenderPassBackend {
      * tells those apart.
      */
     private static void describeOnce(String label, GpuTextureView color, GpuTextureView depth) {
-        if (!Diagnostics.isEnabled()) {
+        if (!Diagnostics.loggingEnabled()) {
             return;
         }
         if (!DESCRIBED.add(label + " -> " + color.getWidth(0) + "x" + color.getHeight(0))) {
@@ -208,6 +212,20 @@ public class WgpuRenderPass implements RenderPassBackend {
                 color.getHeight(0),
                 ((WgpuTextureView) color).texture().getFormat(),
                 depth == null ? "none" : ((WgpuTextureView) depth).texture().getFormat());
+    }
+
+    /**
+     * Whether this pass draws into the GUI item atlas, which is dumped as a texture of its own.
+     *
+     * <p>That atlas is neither uploaded nor given a pass of its own to be recognised by: the items
+     * of a frame are rendered into it through the feature renderer, whose passes are named after the
+     * render type and shared with the world. "The icons are missing" is either "the atlas is empty"
+     * or "the GUI blits the wrong part of it", and this dump is the file that says which - after the
+     * pass has closed, because at creation the atlas holds the clear it was made with.
+     */
+    private boolean drawsIntoTheItemAtlas() {
+        return targetLabel != null
+                && targetLabel.toLowerCase(java.util.Locale.ROOT).contains("ui items atlas");
     }
 
     private static final java.util.Set<String> DESCRIBED = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -315,6 +333,79 @@ public class WgpuRenderPass implements RenderPassBackend {
         for (Map.Entry<String, Sampled> entry : boundSamplers.entrySet()) {
             writeSampled(entry.getKey(), entry.getValue());
         }
+        reportPlanOnce(slots);
+    }
+
+    /** Plans already described by [reportPlanOnce]. */
+    private static final java.util.Set<String> PLANS_REPORTED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Diagnostics: a pipeline's plan, slot by slot, once.
+     *
+     * The slot table is what turns a binding *name* into the number the shader's
+     * `layout(binding = N)` was written with, and the two are built from the same plan - which is
+     * exactly why they have to be checked together rather than trusted: a name that lands one slot
+     * away from its declaration samples the texture the neighbouring binding holds, and the symptom
+     * of that is a model wearing the wrong texture, deterministically, on every draw.
+     */
+    private static void reportPlanOnce(PlanBindings plan) {
+        if (!Diagnostics.loggingEnabled() || !PLANS_REPORTED.add(plan.label)) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: {} binds {} slot(s): {}", plan.label, plan.getCount(), plan.bindableNames());
+    }
+
+    /**
+     * Diagnostics: the slots the plan declares that this draw leaves empty, named by the binding they
+     * belong to.
+     *
+     * A pipeline change clears every slot and writes back what was bound so far, so a slot that is
+     * still `DRAW_BINDING_NONE` when the draw is recorded is a binding this pipeline has and the pass
+     * does not - the
+     * same name sitting in a different slot, a name the new plan spells differently, or one that was
+     * never bound at all. Which of those it is decides whether the draw that follows is fine, so
+     * none of them is left unsaid: with the binding-resolution switch on, every empty slot is
+     * reported with the pipeline it belongs to and the name that slot holds.
+     *
+     * Off by default because a pass binds *after* it sets its pipeline, so the slots of a pipeline
+     * that has just been bound are normally empty at this point - the interesting ones are the slots
+     * that are still empty by the time the pass draws, which is what the binding log is turned on to
+     * look at.
+     */
+    private void reportEmptySlots() {
+        if (bindings == null || !Diagnostics.bindingsEnabled()) {
+            return;
+        }
+
+        for (int slot = 0; slot < bindings.getCount(); slot++) {
+            if (readSlotKind(slot) != WmNative.DRAW_BINDING_NONE) {
+                continue;
+            }
+
+            if (!EMPTY_SLOTS.add(activePipelineName + "/" + slot + "/" + bindings.nameOf(slot))) {
+                continue;
+            }
+
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                    "wgpu: {} has nothing bound in slot {} ('{}') after re-binding what this pass "
+                            + "held; the plan's {} binding(s) are: {}",
+                    activePipelineName,
+                    slot,
+                    bindings.nameOf(slot),
+                    bindings.getCount(),
+                    bindings.bindableNames());
+        }
+    }
+
+    /** Slots already reported by [reportEmptySlots], by pipeline, slot and name. */
+    private static final java.util.Set<String> EMPTY_SLOTS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** The kind the draw call currently carries for [slot]. */
+    private int readSlotKind(int slot) {
+        long base = WmNative.DRAW_CALL_BINDINGS + WmNative.elementOffset(WmNative.DRAW_BINDING, slot);
+        return drawCall.get(WmNative.INT, base + WmNative.DRAW_BINDING_KIND);
     }
 
     @Override
@@ -323,11 +414,16 @@ public class WgpuRenderPass implements RenderPassBackend {
             return;
         }
 
-        if (Diagnostics.isEnabled() && BOUND.add(label + " " + name)) {
-            // Diagnostics: which texture a sampler actually got. A surface that is drawn in one
-            // flat colour is either "the shader sampled nothing" or "the shader sampled something
-            // else", and the label is what tells those apart - the block atlas and the lightmap are
-            // both bound to a terrain pass, and swapping them would look exactly like this.
+        if (Diagnostics.loggingEnabled() && BOUND.add(label + " " + name + " -> " + ((WgpuTextureView) textureView).texture().getLabel())) {
+            // Diagnostics: which texture a sampler actually got - and *every* texture it is given in
+            // the same pass. A model wearing another model's texture is either "the shader sampled
+            // nothing" or "the shader sampled something else", and the pass label plus the texture
+            // label is what tells those apart; the block atlas and the lightmap are both bound to a
+            // terrain pass, and swapping them would look exactly like it. Keyed by the texture as
+            // well as the name, because "one pass bound Sampler0 to two different skins" is the
+            // question that a mob in the wrong skin asks - and the answer says which side mixed them
+            // up: this line is the JVM handing the texture over, and a wrong picture after it is the
+            // native side's bind group.
             WgpuTexture texture = ((WgpuTextureView) textureView).texture();
             dev.birb.wgpu.WgpuMcMod.LOGGER.info(
                     "wgpu: pass {} binds {} to {} ({}x{}, {})",
@@ -347,12 +443,24 @@ public class WgpuRenderPass implements RenderPassBackend {
                 Bound.sampler(((WgpuSampler) sampler).nativeSampler()));
         boundSamplers.put(name, pair);
         writeSampled(name, pair);
+
+        if (Diagnostics.loggingEnabled()) {
+            // Diagnostics: the label of the view handed over, so the per-draw trace can name the
+            // pointer a draw call's texture slot holds.
+            Diagnostics.noteView(pair.texture().resource().address(), ((WgpuTextureView) textureView).texture().getLabel());
+        }
     }
 
     /** Writes a combined sampler into the two slots its name has in the current plan. */
     private void writeSampled(String name, Sampled pair) {
         int[] slots = bindings == null ? null : bindings.of(name);
-        if (slots == null || slots.length < 2) {
+        if (slots == null || slots.length == 0) {
+            reportUnplannedBinding("texture + sampler", name);
+            return;
+        }
+
+        if (slots.length < 2) {
+            reportUnpairedSampler(name, slots);
             return;
         }
 
@@ -363,6 +471,155 @@ public class WgpuRenderPass implements RenderPassBackend {
     /** Diagnostics: each `pass + sampler` pair is reported once. */
     private static final java.util.Set<String> BOUND = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /**
+     * Diagnostics: what every texture slot of one draw carries, in slot order.
+     *
+     * The `pass X binds Sampler0 to Y` line is deduplicated, so it says which textures a pass has
+     * *ever* bound - and "every mob wears some other mob's skin" is a question about one draw, not
+     * about a pass. This reads the slots the draw call is about to be recorded with, which is the
+     * same list the native side walks, in the same order: the native `trace &lt;pipeline&gt; slot '&lt;name&gt;'
+     * -&gt; '&lt;label&gt;'` line for the same draw is what says which side mixed the textures up, and the two
+     * only line up if both sides print every slot rather than the ones they happened to bind.
+     *
+     * The name comes from the plan and the label from the registry of views this side has handed
+     * over, because the slot holds a pointer and nothing else. Restricted to the pipeline family
+     * named by the `wgpu-trace-plan` file, because a line per draw per texture slot is a log that is
+     * unusable in a second, and capped for the same reason.
+     */
+    private void traceDraw(int first, int count, int baseVertex, int instanceCount, boolean indexed) {
+        String filter = Diagnostics.tracePlanFilter();
+        if (filter == null || activePipelineName == null || !activePipelineName.contains(filter)) {
+            return;
+        }
+
+        if (!Diagnostics.traceDrawDue()) {
+            return;
+        }
+
+        StringBuilder line = new StringBuilder();
+
+        for (int slot = 0; slot < bindings.getCount(); slot++) {
+            int kind = readSlotKind(slot);
+            if (kind != WmNative.DRAW_BINDING_TEXTURE && kind != WmNative.DRAW_BINDING_BUFFER) {
+                continue;
+            }
+
+            long base = WmNative.DRAW_CALL_BINDINGS + WmNative.elementOffset(WmNative.DRAW_BINDING, slot);
+            MemorySegment resource = drawCall.get(WmNative.ADDRESS, base + WmNative.DRAW_BINDING_RESOURCE);
+
+            if (!line.isEmpty()) {
+                line.append(", ");
+            }
+
+            line.append(bindings.nameOf(slot)).append(" -> ");
+
+            if (kind == WmNative.DRAW_BINDING_TEXTURE) {
+                line.append(Diagnostics.viewLabelOf(resource.address()));
+            } else {
+                // The slice a uniform is read from, which is the number a draw's *transform* comes
+                // from: every entity in a batch binds the same buffer and differs only here, so
+                // "all the models are in the same place" is answered by this number and nothing else.
+                line.append("buffer+")
+                        .append(drawCall.get(WmNative.LONG, base + WmNative.DRAW_BINDING_OFFSET))
+                        .append("+")
+                        .append(drawCall.get(WmNative.LONG, base + WmNative.DRAW_BINDING_LENGTH));
+            }
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: trace draw {} [{}] geometry: vertexBuffer0={} indexBuffer={} first={} count={} baseVertex={} instances={} indexed={}",
+                activePipelineName, line, vertexBufferDescription(), indexBufferDescription(),
+                first, count, baseVertex, instanceCount, indexed);
+    }
+
+    /** The vertex buffer slot 0 of this draw, as `address+offset+size`, for the trace. */
+    private String vertexBufferDescription() {
+        long base = WmNative.DRAW_CALL_VERTEX_BUFFERS;
+        MemorySegment buffer = drawCall.get(WmNative.ADDRESS, base);
+        long offset = drawCall.get(WmNative.LONG, base + 8L);
+        long size = drawCall.get(WmNative.LONG, base + 16L);
+
+        return String.format("0x%x+%d+%d", buffer.address(), offset, size);
+    }
+
+    /** The index buffer of this draw, as `address`, for the trace. */
+    private String indexBufferDescription() {
+        MemorySegment buffer = drawCall.get(WmNative.ADDRESS, WmNative.DRAW_CALL_INDEX_BUFFER);
+        return String.format("0x%x", buffer.address());
+    }
+
+    /** Diagnostics: every binding name that was not in its pipeline's plan, by pipeline and name. */
+    private static final java.util.Set<String> UNPLANNED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Diagnostics: a name that is not in the pipeline's plan, reported once per pipeline and name.
+     *
+     * This used to return in silence, and silence here is the worst possible answer: nothing is
+     * written into any slot, so a shader that *does* read this binding reads whatever was there -
+     * zeroes, most of the time - and the picture is wrong in a way that looks like a shader bug or a
+     * resource bug. The cloud layer was one square above the player's head for exactly this reason,
+     * and the log said nothing.
+     *
+     * A plan is built from what the pipeline's shader declares, so a name that is not in one is
+     * usually a name this shader does not use - `RenderSystem#bindDefaultUniforms` binds `Globals`,
+     * `Lighting` and `Fog` into every pass, including the ones whose pipeline declares none of them.
+     * The interesting case is the other one: the shader declares the binding under a *different
+     * spelling*, which is exactly what the shader shim's suffixes do, and then the binding is
+     * dropped for a shader that reads it. The plan's own names are printed with the warning because
+     * that is the comparison that tells the two cases apart; the binding-resolution switch
+     * (`binding_verbosity`) adds the near misses, the lookups that only resolved through a suffix.
+     */
+    private void reportUnplannedBinding(String kind, String name) {
+        if (bindings == null || activePipelineName == null) {
+            return;
+        }
+
+        if (!UNPLANNED.add(activePipelineName + "/" + name)) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                "wgpu: {} was bound a {} under the name '{}', which is not in its binding plan, so "
+                        + "nothing was written into a slot. A plan is built from what the shader "
+                        + "declares, so this is either a binding the shader does not use (the "
+                        + "default uniforms are bound into every pass) or one it declares under a "
+                        + "spelling this name is not. The plan's {} binding(s) are: {}",
+                activePipelineName,
+                kind,
+                name,
+                bindings.getCount(),
+                bindings.bindableNames());
+    }
+
+    /**
+     * Diagnostics: a combined sampler whose name has only one slot in the plan.
+     *
+     * The shim splits a sampler into a texture and a sampler slot, and the plan is built from the
+     * shader that resulted, so a name with one slot is a plan this side built from a shader that was
+     * not shimmed - one half of the pair would be bound and the other left empty, which samples
+     * nothing.
+     */
+    private void reportUnpairedSampler(String name, int[] slots) {
+        if (bindings == null || activePipelineName == null) {
+            return;
+        }
+
+        if (!UNPLANNED.add(activePipelineName + "/" + name + "/unpaired")) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                "wgpu: {} was bound a texture and a sampler under '{}', which has {} slot(s) in its "
+                        + "plan ({}) and needs two - one for the texture and one for the sampler. "
+                        + "The plan's {} binding(s) are: {}",
+                activePipelineName,
+                name,
+                slots.length,
+                java.util.Arrays.toString(slots),
+                bindings.getCount(),
+                bindings.bindableNames());
+    }
+
     @Override
     public void setUniform(String name, @NonNull GpuBuffer value) {
         setUniform(name, value.slice());
@@ -372,11 +629,11 @@ public class WgpuRenderPass implements RenderPassBackend {
     public void setUniform(String name, GpuBufferSlice value) {
         // Diagnostics: the offset Minecraft is binding this uniform at, which is the number the
         // dynamic-offset path has to carry through to `set_bind_group` unchanged.
-        if (Diagnostics.isEnabled()) {
+        if (Diagnostics.loggingEnabled()) {
             reportUniformOffset(name, value.offset());
         }
 
-        if (Diagnostics.isEnabled() && shouldDumpUniform(name)) {
+        if (Diagnostics.loggingEnabled() && shouldDumpUniform(name)) {
             dumpUniform(name, value);
         }
 
@@ -475,7 +732,7 @@ public class WgpuRenderPass implements RenderPassBackend {
      * slot and the buffer have to be checked together rather than guessed at.
      */
     private void reportCloudBinding(String name, WgpuBuffer buffer, long offset, Bound binding) {
-        if (!Diagnostics.isEnabled() || activePipelineName == null || !activePipelineName.contains("clouds")) {
+        if (!Diagnostics.loggingEnabled() || activePipelineName == null || !activePipelineName.contains("clouds")) {
             return;
         }
 
@@ -505,6 +762,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
         int[] slots = bindings == null ? null : bindings.of(name);
         if (slots == null || slots.length == 0) {
+            reportUnplannedBinding("buffer", name);
             return;
         }
 
@@ -695,7 +953,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     @Override
     public void setViewport(int x, int y, int width, int height) {
-        if (Diagnostics.isEnabled() && VIEWPORTS.add(x + "," + y + "," + width + "," + height)) {
+        if (Diagnostics.loggingEnabled() && VIEWPORTS.add(x + "," + y + "," + width + "," + height)) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.info("wgpu: viewport {} {} {} {}", x, y, width, height);
         }
     }
@@ -734,7 +992,7 @@ public class WgpuRenderPass implements RenderPassBackend {
                 Math.max(0, right - left),
                 Math.max(0, bottom - top));
 
-        if (Diagnostics.isEnabled() && SCISSORS.add(x + "," + y + "," + width + "," + height)) {
+        if (Diagnostics.loggingEnabled() && SCISSORS.add(x + "," + y + "," + width + "," + height)) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.info(
                     "wgpu: scissor {} {} {} {} -> {} {} {} {} of {}x{}",
                     x, y, width, height, left, top, Math.max(0, right - left), Math.max(0, bottom - top), targetWidth, targetHeight);
@@ -785,7 +1043,7 @@ public class WgpuRenderPass implements RenderPassBackend {
      * count it was given whether or not the buffer behind it has anything in it.
      */
     private void reportCloudIndexBuffer(WgpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
-        if (!Diagnostics.isEnabled()
+        if (!Diagnostics.loggingEnabled()
                 || activePipelineName == null
                 || !activePipelineName.contains("clouds")
                 || !CLOUD_BINDINGS.add(activePipelineName + "/index")) {
@@ -859,6 +1117,14 @@ public class WgpuRenderPass implements RenderPassBackend {
 
         reportCloudDraw(first, count, baseVertex, indexed);
         checkTexelReadRange(count, indexed);
+        traceDraw(first, count, baseVertex, instanceCount, indexed);
+
+        // Diagnostics: a slot the plan declares that this draw leaves empty. Reported here rather than
+        // when the pipeline was set, because a pass sets its pipeline and then binds - so every slot
+        // is empty at that moment and the report said nothing but "the pipeline was just set", ten
+        // lines per pass. A draw is where an empty slot is a real one: the native side refuses to
+        // build a bind group from it, and this names the culprit before that happens.
+        reportEmptySlots();
 
         invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
     }
@@ -875,7 +1141,7 @@ public class WgpuRenderPass implements RenderPassBackend {
      * report every frame, which is a line a frame and a megabyte a minute of the same sentence.
      */
     private void reportCloudDraw(int first, int count, int baseVertex, boolean indexed) {
-        if (!Diagnostics.isEnabled() || activePipelineName == null) {
+        if (!Diagnostics.loggingEnabled() || activePipelineName == null) {
             return;
         }
 
@@ -954,9 +1220,20 @@ public class WgpuRenderPass implements RenderPassBackend {
             // held before it ran - and submitted for, because this dump is a readback and the pass's
             // own commands are still waiting in the frame's encoder. Only for a pass that is dumped:
             // submitting for every pass of every frame is what this backend just stopped doing.
-            if (Diagnostics.isEnabled() && Diagnostics.dumpsPass(label)) {
+            // The dump switch, not the log switch: this writes files.
+            boolean dumpPass = Diagnostics.dumpsEnabled() && Diagnostics.dumpsPass(label);
+            boolean dumpItemAtlas = drawsIntoTheItemAtlas() && Diagnostics.itemAtlasDumpDue();
+
+            if (dumpPass || dumpItemAtlas) {
                 encoder.submitForReadback();
-                Diagnostics.dumpPassTarget(device.renderer(), label, nativeColorTexture);
+
+                if (dumpPass) {
+                    Diagnostics.dumpPassTarget(device.renderer(), label, nativeColorTexture);
+                }
+                if (dumpItemAtlas) {
+                    Diagnostics.dumpTexture(
+                            device.renderer(), nativeColorTexture, "pass-ui-items-atlas.raw", true);
+                }
             }
         }
     }

@@ -94,7 +94,9 @@ class WgpuSurface internal constructor(
      * here, and that is one more thing that can silently not happen.
      */
     private fun dumpIfRequested(surface: MemorySegment, source: WgpuTextureView) {
-        if (!Diagnostics.isEnabled()) return
+        // The dump switch, not the log switch: this writes files, and the marker it exists for is
+        // the `wgpu-dump-frames` one.
+        if (!Diagnostics.dumpsEnabled()) return
 
         val frame = presents + 1
         val onDemand = Diagnostics.consumeDumpRequest()
@@ -145,12 +147,18 @@ class WgpuSurface internal constructor(
             )
         }
 
-        if (Diagnostics.isEnabled() && presents % PRESENT_LOG_INTERVAL == 0L) {
+        if (Diagnostics.loggingEnabled() && presents % PRESENT_LOG_INTERVAL == 0L) {
             WgpuMcMod.LOGGER.info(
                 "wgpu: present #{} {}x{} acquired={} attached={}",
                 presents, width, height, acquired, attached,
             )
             WmNative.logRenderStats.invokeExact() as Unit
+        }
+
+        // Diagnostics: a late look at the sprite atlases, which are composed one pass per sprite and
+        // therefore have no single upload to dump them from.
+        if (Diagnostics.atlasSnapshotDue(presents)) {
+            Diagnostics.dumpAtlasSnapshots(device, presents)
         }
     }
 

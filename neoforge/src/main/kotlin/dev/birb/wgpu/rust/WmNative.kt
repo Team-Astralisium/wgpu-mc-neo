@@ -523,8 +523,19 @@ object WmNative {
     @JvmField val dropTexture: MethodHandle =
         handle("drop_texture", FunctionDescriptor.ofVoid(PTR))
 
+    /**
+     * Creates a sampler with the address modes and filters Blaze3D asked for.
+     *
+     * The modes travel as the numbers of `com.mojang.blaze3d.textures.AddressMode` (0 `REPEAT`,
+     * 1 `CLAMP_TO_EDGE`) and `FilterMode` (0 `NEAREST`, 1 `LINEAR`), and `maxLod` is the
+     * `OptionalDouble` as a plain double - negative when Blaze3D did not ask for a limit. They used
+     * to be dropped entirely, which clamped every texture and is what turned rain into lines.
+     */
     @JvmField val createSampler: MethodHandle =
-        handle("create_sampler", FunctionDescriptor.of(PTR, PTR))
+        handle(
+            "create_sampler",
+            FunctionDescriptor.of(PTR, PTR, INT, INT, INT, INT, INT, DOUBLE),
+        )
 
     @JvmField val dropSampler: MethodHandle =
         handle("drop_sampler", FunctionDescriptor.ofVoid(PTR))

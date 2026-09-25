@@ -93,7 +93,7 @@ class WgpuDevice(
         height: Int,
         depthOrLayers: Int,
         mipLevels: Int,
-    ): GpuTexture = WgpuTexture(this, usage, label?.get() ?: UNNAMED_TEXTURE, format, width, height, depthOrLayers, mipLevels)
+    ): GpuTexture = register(WgpuTexture(this, usage, label?.get() ?: UNNAMED_TEXTURE, format, width, height, depthOrLayers, mipLevels))
 
     override fun createTexture(
         label: String?,
@@ -103,7 +103,27 @@ class WgpuDevice(
         height: Int,
         depthOrLayers: Int,
         mipLevels: Int,
-    ): GpuTexture = WgpuTexture(this, usage, label ?: UNNAMED_TEXTURE, format, width, height, depthOrLayers, mipLevels)
+    ): GpuTexture = register(WgpuTexture(this, usage, label ?: UNNAMED_TEXTURE, format, width, height, depthOrLayers, mipLevels))
+
+    /**
+     * Textures by label, so a diagnostics dump can name one long after it was created.
+     *
+     * A texture that is *composed* rather than uploaded - every sprite atlas, and the GUI item atlas -
+     * has no single upload to hang a dump on: it is filled by hundreds of passes, one sprite at a
+     * time, and the interesting question ("does the atlas hold the sprites in the slots the game
+     * thinks they are in?") can only be asked once the composition is done. The label is the only
+     * handle the caller has, and the newest texture under a label is the live one.
+     */
+    private val texturesByLabel = java.util.concurrent.ConcurrentHashMap<String, WgpuTexture>()
+
+    private fun register(texture: WgpuTexture): WgpuTexture {
+        texturesByLabel[texture.label] = texture
+        return texture
+    }
+
+    /** Every live texture whose label contains [wanted]. */
+    fun texturesMatching(wanted: String): List<WgpuTexture> =
+        texturesByLabel.values.filter { it.label.contains(wanted, ignoreCase = true) && !it.isClosed }
 
     override fun createTextureView(texture: GpuTexture): GpuTextureView =
         createTextureView(texture, 0, texture.getMipLevels())

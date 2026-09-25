@@ -32,6 +32,18 @@ pub struct Settings {
     pub backend: EnumSetting,
     #[serde(default)]
     pub vsync: BoolSetting,
+    /// The two switches that change how the frame is rendered, under the `Optimization` heading.
+    ///
+    /// **Field order here is the row order on the options screen**, and the sections have to come out
+    /// contiguous: the page reads its rows from *this* struct - the config's own order, through
+    /// `getSettings` - and its headings from [`SettingsInfo`], so a setting whose two orders disagree
+    /// is drawn under the heading that happens to precede it. That is exactly what happened when
+    /// these two were declared after the debug switches but marked `Optimization`: the page drew
+    /// `Debug`, then `Optimization` over half of it, then `Debug` again for the rest.
+    #[serde(default)]
+    pub bind_group_cache: BoolSetting,
+    #[serde(default)]
+    pub dynamic_offsets: BoolSetting,
     /// Everything below is a debug switch, offered under the options screen's `Debug` heading.
     /// They are the marker files this renderer grew while it was being written, with a place in
     /// the UI: the marker still works (see [`crate::debug`]), and the setting is what a player can
@@ -41,14 +53,16 @@ pub struct Settings {
     /// `#[serde(default)]` alone would take `BoolSetting::default()`, which is `true`.
     #[serde(default = "off")]
     pub gpu_based_validation: BoolSetting,
+    /// Whether the renderer writes its diagnostic log lines. See [`SettingInfo::debug`] and
+    /// [`SettingInfo::optimization`] for how the switches are grouped on the options screen.
+    #[serde(default = "off")]
+    pub logging: BoolSetting,
     #[serde(default = "off")]
     pub diagnostics: BoolSetting,
-    #[serde(default)]
-    pub bind_group_cache: BoolSetting,
-    #[serde(default)]
-    pub dynamic_offsets: BoolSetting,
     #[serde(default = "off")]
     pub trace_dynamic_offsets: BoolSetting,
+    #[serde(default = "off")]
+    pub binding_verbosity: BoolSetting,
     #[serde(default = "off")]
     pub dump_shaders: BoolSetting,
     #[serde(default = "off")]
@@ -69,11 +83,17 @@ fn off() -> BoolSetting {
 pub struct SettingsInfo {
     backend: EnumSettingInfo<GraphicsBackend>,
     vsync: SettingInfo,
-    gpu_based_validation: SettingInfo,
-    diagnostics: SettingInfo,
+    /// The two switches that change *how* the frame is rendered rather than what is reported about
+    /// it. **This order has to match [`Settings`]'s**, because the two halves of a row come from the
+    /// two documents: the row itself and its order from the settings, and the heading it sits under
+    /// from this schema. See the note on [`Settings::bind_group_cache`].
     bind_group_cache: SettingInfo,
     dynamic_offsets: SettingInfo,
+    gpu_based_validation: SettingInfo,
+    logging: SettingInfo,
+    diagnostics: SettingInfo,
     trace_dynamic_offsets: SettingInfo,
+    binding_verbosity: SettingInfo,
     dump_shaders: SettingInfo,
     gpu_timestamps: SettingInfo,
     pix_capture: SettingInfo,
@@ -84,6 +104,14 @@ pub struct SettingsInfo {
 /// A name rather than an index, so the screen can decide how a section looks - it draws this one
 /// as a sub-heading after a blank row - without this side knowing anything about layout.
 const DEBUG_SECTION: &str = "Debug";
+
+/// The section for the switches that decide how the frame is rendered.
+///
+/// They were debug switches because they were written to bisect a rendering bug, and they are not:
+/// one caches bind groups between draws and the other stops baking offsets into them, both are on by
+/// default, and turning either off is a performance decision - the diagnostic is the *frame time*.
+/// Putting them under `Debug` made them look like something to turn on when something is wrong.
+const OPTIMIZATION_SECTION: &str = "Optimization";
 
 lazy_static! {
     pub static ref SETTINGS_INFO: SettingsInfo = SettingsInfo {
@@ -114,28 +142,44 @@ lazy_static! {
             launch.",
             true,
         ),
+        logging: SettingInfo::debug(
+            "Write the renderer's diagnostic log lines: each pipeline the first time it is used, \
+            the plan its bindings resolve against, each render pass with its draw count, the draw \
+            and submission counters once a second, the sprite-animation pass counter, and the \
+            reports for the uploads and uniforms the renderer verifies as it goes. Off by default, \
+            because it is a line per pipeline and a line per second rather than a line per frame - \
+            and it is a *log* switch: the dumps below are a separate one, so a run can write a frame \
+            out without filling the log with counters. This is the `wgpu-logging` marker as a \
+            switch, and the `wgpu_mc.diagnostics` system property or `WGPU_MC_DIAGNOSTICS` \
+            environment variable still turns it on from outside the game.",
+            false,
+        ),
         diagnostics: SettingInfo::debug(
-            "Report what the renderer is doing: each pipeline the first time it is used, each \
-            render pass, the draw counters once a second, and the processed shaders. Also the \
-            switch that frames and textures are dumped through - the dump itself is still asked \
-            for by a `wgpu-dump-now` file, because a dump is about one specific frame. This is \
-            what the `wgpu-dump-frames` marker used to turn on; the marker still works.",
+            "Write the renderer's dumps out as files: the frame the game is showing, the textures \
+            it is showing it with, and a sprite atlas after the frame or two it takes Minecraft to \
+            compose one. The dump itself is asked for by a `wgpu-dump-now` file in the run \
+            directory, because a dump is about one specific frame and the interesting one is rarely \
+            the one a switch was flipped on at; this is the switch that lets the ask through, and \
+            `wgpu-dump-frames` turns both on. What the renderer *says* while it does it is the \
+            logging switch above, so a diagnostic session is usually both.",
             false,
         ),
-        bind_group_cache: SettingInfo::debug(
+        bind_group_cache: SettingInfo::optimization(
             "Reuse a bind group between draws that bind the same resources at different dynamic \
-            offsets, instead of building one per draw. On by default: turning it off is how the \
-            cache is ruled in or out as the cause of a rendering difference, at the cost of a \
-            `wgpu::BindGroup` per draw. This is the `wgpu-no-bind-group-cache` marker as a \
-            switch, and the marker still turns the cache off.",
+            offsets, instead of building one per draw. On by default, and worth about a \
+            `wgpu::BindGroup` per draw when it is turned off - which is what the frame time in a \
+            scene with many small draws is made of. Turning it off is also how the cache is ruled \
+            in or out as the cause of a rendering difference. This is the `wgpu-no-bind-group-cache` \
+            marker as a switch, and the marker still turns the cache off.",
             false,
         ),
-        dynamic_offsets: SettingInfo::debug(
+        dynamic_offsets: SettingInfo::optimization(
             "Bind uniform buffers with an offset instead of baking the offset into the bind group. \
             On by default, and it is what makes the bind group cache worth having: Minecraft \
             re-binds a buffer at a new offset for almost every draw. Turning it off bakes the \
-            offset again, which is what the renderer did before dynamic offsets existed. This is \
-            the `wgpu-no-dynamic-offsets` marker as a switch.",
+            offset again, which is what the renderer did before dynamic offsets existed - more bind \
+            groups built, and more memory spent on them. This is the `wgpu-no-dynamic-offsets` \
+            marker as a switch.",
             false,
         ),
         trace_dynamic_offsets: SettingInfo::debug(
@@ -143,6 +187,16 @@ lazy_static! {
             travels with it - and the key the bind group cache was asked for. Very loud: it is a \
             line per draw, so it is meant to be turned on for a few frames and read back. This is \
             the `wgpu-trace-dynamic-offsets` marker as a switch.",
+            false,
+        ),
+        binding_verbosity: SettingInfo::debug(
+            "Log how every binding name was resolved against a pipeline's binding plan, and what \
+            the plan was left holding: a name that only matched through the shim's `_wm_texshim` / \
+            `_wm_sampler` suffix, the names a plan can be bound under when one of them is not in \
+            it, and the slots a pipeline change left empty. This is the detailed version of the \
+            warning the renderer always prints when a binding is not in the plan at all, and it is \
+            the switch to turn on when a shader reads nothing and the question is which name it \
+            was looking for. This is the `wgpu-binding-log` marker as a switch.",
             false,
         ),
         dump_shaders: SettingInfo::debug(
@@ -327,10 +381,12 @@ impl Default for Settings {
             // validation off - it used to be unconditional, which cost every player the driver's
             // slowest validation path.
             gpu_based_validation: BoolSetting::of(false),
+            logging: BoolSetting::of(false),
             diagnostics: BoolSetting::of(false),
             bind_group_cache: BoolSetting::of(true),
             dynamic_offsets: BoolSetting::of(true),
             trace_dynamic_offsets: BoolSetting::of(false),
+            binding_verbosity: BoolSetting::of(false),
             dump_shaders: BoolSetting::of(false),
             gpu_timestamps: BoolSetting::of(false),
             pix_capture: BoolSetting::of(false),
@@ -345,10 +401,15 @@ impl Default for Settings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DebugSettings {
     pub gpu_based_validation: bool,
+    /// Whether the renderer's diagnostic *log lines* are written.
+    pub logging: bool,
+    /// Whether its *dumps* are written. The two are separate switches, so a run can take a frame
+    /// without a line a second of counters, and the other way round.
     pub diagnostics: bool,
     pub bind_group_cache: bool,
     pub dynamic_offsets: bool,
     pub trace_dynamic_offsets: bool,
+    pub binding_verbosity: bool,
     pub dump_shaders: bool,
     pub gpu_timestamps: bool,
     pub pix_capture: bool,
@@ -358,10 +419,12 @@ impl Settings {
     pub fn debug(&self) -> DebugSettings {
         DebugSettings {
             gpu_based_validation: self.gpu_based_validation.value,
+            logging: self.logging.value,
             diagnostics: self.diagnostics.value,
             bind_group_cache: self.bind_group_cache.value,
             dynamic_offsets: self.dynamic_offsets.value,
             trace_dynamic_offsets: self.trace_dynamic_offsets.value,
+            binding_verbosity: self.binding_verbosity.value,
             dump_shaders: self.dump_shaders.value,
             gpu_timestamps: self.gpu_timestamps.value,
             pix_capture: self.pix_capture.value,
@@ -394,6 +457,15 @@ impl SettingInfo {
             desc,
             needs_restart,
             section: Some(DEBUG_SECTION),
+        }
+    }
+
+    /// A setting under the options screen's `Optimization` sub-heading.
+    pub const fn optimization(desc: &'static str, needs_restart: bool) -> SettingInfo {
+        SettingInfo {
+            desc,
+            needs_restart,
+            section: Some(OPTIMIZATION_SECTION),
         }
     }
 }
@@ -626,10 +698,10 @@ mod tests {
 
         for name in [
             "gpu_based_validation",
+            "logging",
             "diagnostics",
-            "bind_group_cache",
-            "dynamic_offsets",
             "trace_dynamic_offsets",
+            "binding_verbosity",
             "dump_shaders",
             "gpu_timestamps",
             "pix_capture",
@@ -641,11 +713,126 @@ mod tests {
             );
         }
 
+        // The two that decide how the frame is rendered rather than what is said about it have a
+        // heading of their own, above the debug ones - they are on by default and turning one off is
+        // a performance decision, not a diagnostic.
+        for name in ["bind_group_cache", "dynamic_offsets"] {
+            assert_eq!(
+                info[name]["section"],
+                serde_json::json!("Optimization"),
+                "{name} is an optimisation and belongs under its own heading"
+            );
+        }
+
         // The two that are not debug switches carry no section, or the options screen would draw
         // the heading over them.
         assert!(info["backend"].get("section").is_none());
         assert!(info["vsync"].get("section").is_none());
     }
+
+    /// The options screen draws a heading when a setting's section differs from the one before it,
+    /// so the order the schema lists them in is the order the page shows - and a section whose
+    /// settings are not contiguous would be drawn twice.
+    ///
+    /// The order is read out of the serialized text rather than out of a `serde_json::Value`, because
+    /// a `Value`'s object is a sorted map: the field order is a property of this file's struct and of
+    /// the JSON the JVM side parses with Gson, and the text is the only place a test can see it.
+    #[test]
+    fn the_sections_are_contiguous_and_optimizations_come_first() {
+        let position = |name: &str| {
+            SETTINGS_INFO_JSON
+                .find(&format!("\"{name}\""))
+                .unwrap_or_else(|| panic!("{name} is not in the schema at all"))
+        };
+
+        let plain = ["backend", "vsync"];
+        let optimization = ["bind_group_cache", "dynamic_offsets"];
+        let debug = [
+            "gpu_based_validation",
+            "logging",
+            "diagnostics",
+            "trace_dynamic_offsets",
+            "binding_verbosity",
+            "dump_shaders",
+            "gpu_timestamps",
+            "pix_capture",
+        ];
+
+        for earlier in plain {
+            for later in optimization.iter().chain(debug.iter()) {
+                assert!(
+                    position(earlier) < position(later),
+                    "{earlier} is listed after {later}, so the page draws a heading over it"
+                );
+            }
+        }
+
+        // Every optimisation before every debug switch: that is what makes the two sections
+        // contiguous and puts the optimisations above the diagnostics.
+        for earlier in optimization {
+            for later in debug {
+                assert!(
+                    position(earlier) < position(later),
+                    "{earlier} is listed after {later}: the sections are not in order, and one of \
+                     them is split in two"
+                );
+            }
+        }
+    }
+
+    /// The page's rows come from the *settings* document and their headings from the *schema*, so
+    /// the two field orders have to agree. They did not, once: `bind_group_cache` and
+    /// `dynamic_offsets` were declared after the debug switches and marked `Optimization`, and the
+    /// page drew `Debug`, then `Optimization` over half of it, then `Debug` again.
+    #[test]
+    fn the_config_and_the_schema_list_the_settings_in_the_same_order() {
+        let config = serde_json::to_string(&Settings::default()).expect("settings");
+        let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
+
+        // Both documents are read as *text*, because a `serde_json::Value` sorts its keys: which
+        // order the settings are in is exactly what this test is about.
+        let order_in = |document: &str| {
+            let mut positions: Vec<(&str, usize)> = NAME_LIST
+                .iter()
+                .map(|name| {
+                    let at = document.find(&format!("\"{name}\"")).unwrap_or_else(|| {
+                        panic!("{name} is in one document and not the other")
+                    });
+                    (*name, at)
+                })
+                .collect();
+            positions.sort_by_key(|(_, at)| *at);
+            positions.into_iter().map(|(name, _)| name).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            order_in(&config),
+            order_in(&SETTINGS_INFO_JSON),
+            "the settings document and the schema list the settings in different orders, so a row \
+             is drawn under the heading of whichever section came before it"
+        );
+
+        // And the names really are the schema's own, so a setting added to one document and not the
+        // other is caught here rather than by a missing row.
+        assert_eq!(NAME_LIST.len(), info.as_object().expect("an object").len());
+    }
+
+    /// Every setting's name, which is the same in both documents. Kept as a list because the two
+    /// documents' own key order is not readable through `serde_json::Value` - see the test above.
+    const NAME_LIST: [&str; 12] = [
+        "backend",
+        "vsync",
+        "bind_group_cache",
+        "dynamic_offsets",
+        "gpu_based_validation",
+        "logging",
+        "diagnostics",
+        "trace_dynamic_offsets",
+        "binding_verbosity",
+        "dump_shaders",
+        "gpu_timestamps",
+        "pix_capture",
+    ];
 
     /// The options screen, pulled in for the one part of it that is a contract with this side: how
     /// it decides that a page holds the renderer's settings.
@@ -798,10 +985,12 @@ mod tests {
         }
 
         for name in [
+            "logging",
             "diagnostics",
             "bind_group_cache",
             "dynamic_offsets",
             "trace_dynamic_offsets",
+            "binding_verbosity",
             "dump_shaders",
             "gpu_timestamps",
         ] {
@@ -818,7 +1007,9 @@ mod tests {
         let debug = Settings::default().debug();
 
         assert!(!debug.diagnostics, "logging was off");
+        assert!(!debug.logging, "the diagnostic log was off");
         assert!(!debug.trace_dynamic_offsets, "tracing was off");
+        assert!(!debug.binding_verbosity, "the binding log was off");
         assert!(!debug.dump_shaders, "shader dumps were off");
         assert!(!debug.gpu_timestamps, "nothing measured the GPU");
         assert!(!debug.pix_capture, "no capture was being taken");

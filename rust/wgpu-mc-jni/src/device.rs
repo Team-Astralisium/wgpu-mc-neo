@@ -851,8 +851,188 @@ fn flush_shared_encoder(wm: &WmRenderer) {
     // frame has already been presented, its start timestamp goes here - see `timing`.
     crate::timing::frame_begin(wm, unsafe { &mut *pointer });
 
-    SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+    let submission = SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
     wm.gpu.queue.submit([finished.finish()]);
+
+    // Everything that was staged is in the stream that just went out, so the ring can hand those
+    // buffers out again - once that submission has completed, which is what the callback says.
+    finish_staging(wm, submission);
+}
+
+/// A ring of staging buffers that uploads travel through instead of the queue.
+///
+/// `Queue::write_buffer` is applied *at* a submission, ahead of every command in it, which is why
+/// re-writing bytes an already recorded draw reads has to force a submission of its own - see
+/// `WRITE_HIGH_WATER`, and the entities that were invisible until it did. Putting the bytes in the
+/// *stream* instead costs one `copy_buffer_to_buffer` per upload and no submission at all: a copy is
+/// a command, so when it happens is where it was recorded.
+///
+/// The bytes reach the staging buffer the same way they used to reach their destination - a
+/// `Queue::write_buffer` - but that is now safe for free: the staging region is one nothing has ever
+/// read, so "applied first, before the frame's commands" is exactly where it belongs, and the copy
+/// that consumes it is a command that comes after it. The buffers are *not* mapped: wgpu refuses a
+/// still-mapped buffer as the source of a copy ("Buffer with 'wgpu-mc staging' label is still
+/// mapped"), and it does not need to be, because the write goes through the queue either way.
+///
+/// The price is that a staging region may only be reused once the submission reading it has
+/// finished, so there is a ring of them and a buffer is handed out again only after every submission
+/// that could still be reading it has completed. `Queue::on_submitted_work_done` is what says so. A
+/// ring with no room left falls back to the queue-write path, which is still correct - it just costs
+/// the submission this exists to avoid - so the frame keeps rendering if the GPU ever falls behind.
+///
+/// This is where ~3,200 submissions a second went. Minecraft keeps one immediate vertex buffer per
+/// pipeline and rewrites it at offset zero for every draw of a batch, so every one of those writes
+/// was a rewrite below the mark.
+struct Stage {
+    buffer: wgpu::Buffer,
+    /// The next free byte, always aligned to `COPY_BUFFER_ALIGNMENT`.
+    cursor: u64,
+    /// Whether copies recorded since the last submission read this buffer.
+    dirty: bool,
+    /// The submission index after which no command reads this buffer.
+    busy_until: u64,
+}
+
+/// How large each staging buffer is, and how many of them the ring holds.
+///
+/// Four megabytes is a compromise between "a frame's uploads fit" and "the ring is not a texture
+/// atlas of its own"; four buffers is enough for the GPU to be three submissions behind without the
+/// ring running dry, which no frame is.
+const STAGING_BYTES: u64 = 4 * 1024 * 1024;
+const STAGING_BUFFERS: usize = 4;
+
+static STAGING: Mutex<Option<Vec<Stage>>> = Mutex::new(None);
+
+/// How many uploads went through the staging ring, and how much went with them.
+static STAGED_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static STAGED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// How many uploads could not be staged and went through `Queue::write_buffer` instead.
+static STAGING_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many of the submissions have completed, which is what frees a staging buffer.
+static SUBMISSIONS_DONE: AtomicU64 = AtomicU64::new(0);
+
+fn new_stage(device: &wgpu::Device) -> Stage {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc staging"),
+        size: STAGING_BYTES,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    Stage {
+        buffer,
+        cursor: 0,
+        dirty: false,
+        busy_until: 0,
+    }
+}
+
+/// Copies `bytes` into the staging ring and records the copy into [buffer] at `start`.
+///
+/// Returns false when the upload cannot be staged - no room in the ring, a buffer that cannot take a
+/// copy, or a buffer so large it does not fit a staging buffer at all - and the caller falls back to
+/// `Queue::write_buffer`. Never returns false for a *failed* upload: a refusal here is a decision
+/// about how to upload, not about whether to.
+fn stage_copy(wm: &WmRenderer, buffer: &wgpu::Buffer, start: u64, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+
+    // A destination without `COPY_DST` cannot be the target of a copy, and asking wgpu anyway would
+    // be a validation error - which ends the process here. Minecraft's buffers all ask for it (every
+    // mapped buffer does, and the immediate ones are `COPY_DST | VERTEX`), so this is the backstop.
+    if !buffer.usage().contains(wgpu::BufferUsages::COPY_DST) {
+        STAGING_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    // The copy covers whole four-byte units, because `copy_buffer_to_buffer` has to. The destination
+    // gets the whole range, so the padding is written as zeroes rather than left as whatever the
+    // staging buffer held - which would make two runs of the same upload differ in those bytes.
+    let wanted = (bytes.len() as u64 + 3) & !3;
+    if wanted > STAGING_BYTES {
+        STAGING_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+
+    let done = SUBMISSIONS_DONE.load(Ordering::Relaxed);
+    let mut guard = STAGING.lock();
+    let stages = guard.get_or_insert_with(|| {
+        (0..STAGING_BUFFERS)
+            .map(|_| new_stage(&wm.gpu.device))
+            .collect()
+    });
+
+    let Some(index) = stages
+        .iter()
+        .position(|stage| stage.busy_until <= done && stage.cursor + wanted <= STAGING_BYTES)
+    else {
+        STAGING_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+
+    let stage = &mut stages[index];
+    let offset = stage.cursor;
+    stage.cursor += wanted;
+    stage.dirty = true;
+
+    let source = stage.buffer.clone();
+    drop(guard);
+
+    // The queue write lands at the next submission, ahead of its commands; the copy is one of those
+    // commands and comes after it. Nothing has ever read this region, so there is no draw to order
+    // against, and the write needs no submission of its own.
+    wm.gpu.queue.write_buffer(&source, offset, bytes);
+
+    let padding = (wanted - bytes.len() as u64) as usize;
+    if padding > 0 {
+        wm.gpu
+            .queue
+            .write_buffer(&source, offset + bytes.len() as u64, &[0u8; 3][..padding]);
+    }
+
+    with_shared_encoder(|encoder| {
+        encoder.copy_buffer_to_buffer(&source, offset, buffer, start, wanted);
+    });
+
+    STAGED_UPLOADS.fetch_add(1, Ordering::Relaxed);
+    STAGED_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    true
+}
+
+/// Hands the staging buffers back once the submission that read them has completed.
+///
+/// Called right after a successful submit, with that submission's index. Only a buffer with copies
+/// waiting goes back: one that was filled after the submit keeps its cursor, because its copies are
+/// in the *next* submission and handing it out again would overwrite what they read.
+fn finish_staging(wm: &WmRenderer, submission: u64) {
+    let mut guard = STAGING.lock();
+    let Some(stages) = guard.as_mut() else {
+        return;
+    };
+
+    let mut waiting = false;
+
+    for stage in stages.iter_mut() {
+        if stage.dirty {
+            stage.dirty = false;
+            stage.cursor = 0;
+            stage.busy_until = submission;
+            waiting = true;
+        }
+    }
+
+    if !waiting {
+        return;
+    }
+
+    // One callback per submission that carried staged bytes, and it only ever moves the counter
+    // forwards: `on_submitted_work_done` fires when everything submitted so far has finished, so two
+    // of these can arrive out of order.
+    wm.gpu.queue.on_submitted_work_done(move || {
+        SUBMISSIONS_DONE.fetch_max(submission, Ordering::Relaxed);
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -895,7 +1075,12 @@ pub extern "C" fn create_texture_view(
         // Every field comes from the tombstone: the texture itself must not be read.
         let (width, height, format) = dead_texture_description(texture)
             .unwrap_or((1, 1, wgpu::TextureFormat::Rgba8Unorm));
-        return Box::new(placeholder_view(wm, format, width, height));
+        let view = Box::new(placeholder_view(wm, format, width, height));
+        // Counted like any other view: `drop_texture_view` decrements for every view the JVM
+        // closes, and a view that was never counted makes the live count drift downwards.
+        LIVE_VIEW_COUNT.fetch_add(1, Ordering::Relaxed);
+        note_view_alive(&view, "<placeholder for a closed texture>".to_string());
+        return view;
     }
 
     let available = texture.mip_level_count();
@@ -905,6 +1090,18 @@ pub extern "C" fn create_texture_view(
     } else {
         Some(mip_levels.min(available - base).max(1))
     };
+
+    // Read before the view exists, so that the view can be named after the texture it was made
+    // from: this label is the whole point of the registry when a draw later binds the address.
+    let label = format!(
+        "{} (mip {}{})",
+        texture_label(texture),
+        base,
+        match count {
+            Some(count) if count > 1 => format!("..{}", base + count - 1),
+            _ => String::new(),
+        }
+    );
 
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: None,
@@ -924,7 +1121,9 @@ pub extern "C" fn create_texture_view(
 
     LIVE_VIEW_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    Box::new(texture_view)
+    let view = Box::new(texture_view);
+    note_view_alive(&view, label);
+    view
 }
 
 #[unsafe(no_mangle)]
@@ -945,7 +1144,7 @@ pub extern "C" fn create_render_pass(
 
     // Diagnostics, and gated: a pass trace costs a `format!` of the target's address plus two lock
     // acquisitions per pass, for a list that only `log_render_stats` reads.
-    if crate::debug::diagnostics() {
+    if crate::debug::logging() {
         let mut current = CURRENT_TRACE.lock();
         if let Some(trace) = current.take() {
             let mut traces = TRACES.lock();
@@ -1121,6 +1320,60 @@ pub extern "C" fn create_buffer(
     Box::new(buffer)
 }
 
+/// The highest byte written into each buffer since it was created, by buffer address.
+///
+/// A submission carries the frame's recorded commands, and a `Queue::write_buffer` is applied *at*
+/// that submission - ahead of every command in it. So a write that lands on bytes an already recorded
+/// draw reads changes what that draw sees, and the frame has to be submitted before the write. That
+/// is what this tracks: a write *above* the mark is into bytes nothing has read yet - Minecraft
+/// writes every dynamic uniform, vertex block and face mesh into a fresh slice of a ring buffer - and
+/// can travel with the frame, while a write at or below it may be rewriting something in flight.
+///
+/// The case this exists for is `RenderSystem#setShaderLights`: the `Lighting` block is a small,
+/// *fixed-offset* uniform that is re-written between draws, and with the whole frame in one
+/// submission every draw in it saw the last value - the item and entity renderers read zeroed lights
+/// and drew black models, which is what the GUI item atlas came out full of.
+///
+/// The marks survive a submission, and that is the whole point: after a submission, the writes that
+/// were applied with it are still what the *next* draw of the same range would otherwise share a
+/// submission with. `VertexFormat#uploadToBuffer` is the case that proved it - one vertex buffer per
+/// pipeline, rewritten at offset zero for every draw in a batch - and with the marks cleared by each
+/// forced submission only the *first* rewrite of a frame was ordered: the second and every later one
+/// travelled with the frame, so every draw of the batch read the last one's geometry. Entities drawn
+/// with each other's geometry are models on top of each other, and the item atlas drew every slot
+/// with the last item's, which is what "the icons are scrambled" looked like.
+static WRITE_HIGH_WATER: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether writing `[start, start + length)` into the buffer at `address` can change what an already
+/// recorded command reads, and records the write.
+///
+/// Reads and writes are taken to be ordered by offset: every write into a buffer raises the mark, and
+/// a write below it is one that the recorded frame may already be reading from. That is conservative
+/// in exactly one direction - a *different* byte range below the mark forces a submission it did not
+/// have to - and Minecraft's uploads share one offset space with their readers, so the conservative
+/// answer is the safe one.
+fn write_needs_a_submission(address: usize, start: u64, length: u64) -> bool {
+    let mut marks = WRITE_HIGH_WATER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let marks = marks.get_or_insert_with(Default::default);
+
+    let previous = marks.insert(address, start + length);
+    matches!(previous, Some(mark) if start < mark)
+}
+
+/// Forgets a buffer's write mark, which its drop does: the address can be handed to a new buffer, and
+/// a mark that outlives its buffer would make that one submit a frame for every upload.
+fn forget_write_marks(address: usize) {
+    if let Some(marks) = WRITE_HIGH_WATER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+    {
+        marks.remove(&address);
+    }
+}
+
+
 /// Copies `length` bytes from `data` into `buffer` at `start`.
 ///
 /// # Safety
@@ -1167,6 +1420,21 @@ pub unsafe extern "C" fn write_to_buffer(
 
     // SAFETY: the caller guarantees `data` covers `length` bytes, per the contract above.
     let bytes = unsafe { std::slice::from_raw_parts(data, length as _) };
+
+    // The bytes go into the staging ring and travel as a copy inside the frame's own encoder, which
+    // is ordered by the command stream and needs no submission at all. Only a staging ring with no
+    // room left falls through to the queue-write path below, which does need one.
+    if stage_copy(wm, buffer, start, bytes) {
+        return;
+    }
+
+    // A write that lands on bytes an already recorded draw reads has to be submitted *before* it:
+    // `Queue::write_buffer` is applied at the next submission, ahead of every command in it, so
+    // without this the frame's draws would all read this write's value. See `WRITE_HIGH_WATER`.
+    if write_needs_a_submission(buffer as *const wgpu::Buffer as usize, start, length) {
+        flush_shared_encoder(wm);
+    }
+
     wm.gpu.queue.write_buffer(buffer, start, bytes);
 }
 
@@ -1198,6 +1466,26 @@ fn argb_to_wgpu_color(argb: u32) -> wgpu::Color {
 /// placeholder then failed wgpu's scissor check ("Scissor Rect { x: 0, y: 0, w: 878, h: 504 } is not
 /// contained in the render target (1, 1, 1)") and took the process down.
 static LIVE_TEXTURES: Mutex<Option<std::collections::HashMap<usize, String>>> = Mutex::new(None);
+
+/// The views this side has created and not yet dropped, by the address the JVM holds.
+///
+/// A view is what a draw binds, and a bind group is built from the raw pointer the JVM kept - so a
+/// view that Minecraft closed while a pass still named it is a use-after-free whose bytes are
+/// whatever the allocator put there next, which is usually *another view*. That is the shape of
+/// "every mob wears some other mob's skin, and sometimes an item icon": the picture is not wrong
+/// because the wrong texture was chosen by name, but because the pointer that named the right
+/// texture now names a different one.
+///
+/// The label behind each address is what makes that readable: it is recorded while the view is
+/// alive, so a report after the drop never touches the freed memory.
+static LIVE_VIEWS: Mutex<Option<std::collections::HashMap<usize, String>>> = Mutex::new(None);
+
+/// The addresses of views that have been dropped, so a later use of one is caught rather than read.
+static DEAD_VIEWS: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// The order view tombstones were added in, so the oldest can be forgotten.
+static DEAD_VIEW_ORDER: Mutex<Option<std::collections::VecDeque<usize>>> = Mutex::new(None);
+const DEAD_VIEW_LIMIT: usize = 2048;
 
 /// What a dropped texture was, kept so a use-after-free can be described without reading it.
 struct DeadTexture {
@@ -1302,7 +1590,93 @@ fn note_texture_dead(texture: &wgpu::Texture) {
     }
 }
 
-/// An estimate of what a texture costs, good enough to watch for growth: four bytes a texel.
+/// The label of a live texture, which is what names a view in a use-after-close report.
+fn texture_label(texture: &wgpu::Texture) -> String {
+    LIVE_TEXTURES
+        .lock()
+        .as_ref()
+        .and_then(|live| live.get(&texture_address(texture)).cloned())
+        .unwrap_or_else(|| "<unlabelled>".to_string())
+}
+
+/// Registers a view under the address the JVM is about to be handed.
+///
+/// Called with the `Box`, like [`note_texture_alive`]: the allocator reuses a freed box's address
+/// immediately, and a view registered under the address of the local it was built from is a view
+/// that will never be found again.
+fn note_view_alive(view: &wgpu::TextureView, label: String) {
+    let address = view as *const wgpu::TextureView as usize;
+    LIVE_VIEWS
+        .lock()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(address, label);
+    if let Some(dead) = DEAD_VIEWS.lock().as_mut() {
+        dead.remove(&address);
+    }
+}
+
+/// Remembers a view that is being dropped, while it is still there to be named.
+fn note_view_dead(view: &wgpu::TextureView) {
+    let address = view as *const wgpu::TextureView as usize;
+    LIVE_VIEWS
+        .lock()
+        .as_mut()
+        .and_then(|live| live.remove(&address));
+
+    DEAD_VIEWS
+        .lock()
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(address);
+
+    let mut order = DEAD_VIEW_ORDER.lock();
+    let order = order.get_or_insert_with(std::collections::VecDeque::new);
+    order.push_back(address);
+
+    while order.len() > DEAD_VIEW_LIMIT {
+        if let Some(oldest) = order.pop_front()
+            && let Some(dead) = DEAD_VIEWS.lock().as_mut()
+        {
+            dead.remove(&oldest);
+        }
+    }
+}
+
+/// Whether a view address names a live view, a dropped one, or one this side never made.
+///
+/// A report is what this is for: a draw that binds a dropped view is the bug that mixes textures
+/// between models, and it has to be found without dereferencing the address to ask.
+pub fn view_is_alive(address: usize) -> bool {
+    LIVE_VIEWS
+        .lock()
+        .as_ref()
+        .is_some_and(|live| live.contains_key(&address))
+}
+
+/// Whether a view address names one this side has dropped.
+pub fn view_is_dead(address: usize) -> bool {
+    DEAD_VIEWS
+        .lock()
+        .as_ref()
+        .is_some_and(|dead| dead.contains(&address))
+}
+
+/// How many dropped view addresses are still remembered, for the report that names one.
+pub fn dead_view_count() -> usize {
+    DEAD_VIEWS.lock().as_ref().map(|dead| dead.len()).unwrap_or(0)
+}
+
+/// The label a view address was registered under, if any.
+pub fn view_label(address: usize) -> Option<String> {
+    LIVE_VIEWS
+        .lock()
+        .as_ref()
+        .and_then(|live| live.get(&address).cloned())
+}
+
+/// How many views are live, for the render-stats line.
+pub fn live_view_labels() -> usize {
+    LIVE_VIEWS.lock().as_ref().map(|live| live.len()).unwrap_or(0)
+}/// An estimate of what a texture costs, good enough to watch for growth: four bytes a texel.
 fn texture_bytes(width: u32, height: u32, depth_or_layers: u32) -> u64 {
     (width as u64) * (height as u64) * (depth_or_layers.max(1) as u64) * 4
 }
@@ -1497,13 +1871,24 @@ pub extern "C" fn clear_color_and_depth_textures(
     });
 }
 
-/// The region variant, which clears the whole attachment.
+/// The region variant: the colour is cleared *in place*, the depth whole.
 ///
 /// `GlCommandEncoder` restricts `glClear` with the scissor box, and a wgpu load op has no such
-/// thing - it always covers the attachment. Minecraft only reaches for this when re-drawing one
-/// stale slot of the GUI item atlas, so the approximation costs the other cached slots of that
-/// atlas until they are allocated again. Doing better needs a scissored clear draw, which is a
-/// pipeline of its own; it is listed under *Known gaps*.
+/// thing - it always covers the attachment. So this used to clear the whole texture, and the caller
+/// is `GuiItemAtlas#drawToSlot`: it re-draws one stale 32x32 slot of the GUI item atlas and clears
+/// that slot first, which wiped *every other item icon in the atlas*. The icons came back only for
+/// the items drawn after the last clear of the frame, and re-drawing an item is what a stale slot is
+/// - hovering an item, or an item changing - so hovering refilled one icon and emptied the rest.
+///
+/// The colour half is now a rect-limited write of the clear colour, which is what a scissored clear
+/// is: `Queue::write_texture` copies into a rectangle of a texture, and the bytes are the clear
+/// colour rather than zeroes, so a caller that clears to something other than transparent black gets
+/// what it asked for. The depth half is still the whole texture, and that is deliberate rather than
+/// a shortcut: the only caller is the item atlas, whose depth attachment is never sampled and never
+/// read back - it exists so an item's own faces depth-test against each other while it is drawn into
+/// its slot - so clearing all of it before drawing into one slot changes nothing that anything can
+/// observe. A caller that needed a *region* of depth kept would need a scissored depth draw, which
+/// is a pipeline of its own and is listed under *Known gaps*.
 #[unsafe(no_mangle)]
 pub extern "C" fn clear_color_and_depth_textures_region(
     _encoder: &mut CommandEncoderHandle,
@@ -1516,24 +1901,125 @@ pub extern "C" fn clear_color_and_depth_textures_region(
     region_width: u32,
     region_height: u32,
 ) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
+    let color_bytes = clear_color_bytes(clear_color, color_texture.format());
 
-    WARNED.call_once(|| {
-        warn!(
-            "wgpu-mc: a region clear ({region_width}x{region_height} at {region_x},{region_y}) was \
-             widened to the whole texture; the load op that implements a clear cannot be scissored"
-        );
-    });
+    match color_bytes {
+        Some(bytes) => write_color_region(
+            color_texture,
+            bytes,
+            region_x,
+            region_y,
+            region_width,
+            region_height,
+        ),
+        None => {
+            // A format whose texels are not four bytes, which nothing in 26.1 clears by region.
+            // Widening is wrong in the way that cost the item icons, so it says so rather than
+            // doing it quietly.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                warn!(
+                    "wgpu-mc: a region clear of a {:?} texture cannot be written in place; it \
+                     clears the whole texture instead",
+                    color_texture.format()
+                );
+            });
 
-    with_shared_encoder(|encoder| {
-        clear_attachments(
-            encoder,
-            Some(color_texture),
-            clear_color,
-            Some(depth_texture),
-            clear_depth,
-        );
-    });
+            with_shared_encoder(|encoder| {
+                clear_attachments(
+                    encoder,
+                    Some(color_texture),
+                    clear_color,
+                    None,
+                    1.0,
+                );
+            });
+        }
+    }
+
+    with_shared_encoder(|encoder| clear_attachments(encoder, None, 0, Some(depth_texture), clear_depth));
+}
+
+/// The clear colour as the bytes a texture of [format] holds, or `None` for a format this does not
+/// know how to write.
+///
+/// Minecraft's clear colour is packed `ARGB`, and the two eight-bit formats in play differ in the
+/// order of the first two channels - which is the difference between a texture written as `RGBA8`
+/// and one written as `BGRA8`.
+fn clear_color_bytes(clear_color: u32, format: wgpu::TextureFormat) -> Option<[u8; 4]> {
+    let a = ((clear_color >> 24) & 0xFF) as u8;
+    let r = ((clear_color >> 16) & 0xFF) as u8;
+    let g = ((clear_color >> 8) & 0xFF) as u8;
+    let b = (clear_color & 0xFF) as u8;
+
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Some([r, g, b, a]),
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => Some([b, g, r, a]),
+        _ => None,
+    }
+}
+
+/// Writes [bytes] over a rectangle of [texture], which is a scissored clear.
+///
+/// `bytes_per_row` is the rectangle's width in bytes, which `Queue::write_texture` takes as it comes:
+/// it stages the data internally, unlike a buffer-to-texture copy, whose rows have to be padded to
+/// the 256 byte copy alignment.
+fn write_color_region(
+    texture: &wgpu::Texture,
+    bytes: [u8; 4],
+    region_x: u32,
+    region_y: u32,
+    region_width: u32,
+    region_height: u32,
+) {
+    let Some(wm) = RENDERER.get() else {
+        return;
+    };
+
+    if !texture_is_alive(texture) || region_width == 0 || region_height == 0 {
+        return;
+    }
+
+    let row_bytes = region_width * bytes.len() as u32;
+    let data = bytes.repeat((region_width * region_height) as usize);
+
+    // Once per run, because this is the line that says the item atlas' slot clears are in place
+    // rather than wiping the atlas, and a run that shows blank icons wants to know which of the two
+    // it is. A log line, so it is the logging switch that turns it on.
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    if crate::debug::logging() {
+        REPORTED.call_once(|| {
+            info!(
+                "wgpu-mc: cleared a {region_width}x{region_height} region at {region_x},{region_y} \
+                 of a {:?} texture in place",
+                texture.format()
+            );
+        });
+    }
+
+    wm.gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Origin3d {
+                x: region_x,
+                y: region_y,
+                z: 0,
+            },
+            aspect: Default::default(),
+        },
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(row_bytes),
+            rows_per_image: Some(region_height),
+        },
+        Extent3d {
+            width: region_width,
+            height: region_height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// Values this large are not a texture; they are what a mis-read descriptor looks like. Refusing
@@ -2236,11 +2722,11 @@ static TRACES: Mutex<Vec<PassTrace>> = Mutex::new(Vec::new());
 
 /// Records a draw against the pass that is open.
 ///
-/// Behind the diagnostics switch, and that is the point of the switch here: this takes a lock that
+/// Behind the logging switch, and that is the point of the switch here: this takes a lock that
 /// every draw in the frame would otherwise queue on, to add one to a number that is only read for
 /// a log line.
 pub(crate) fn trace_draw() {
-    if !crate::debug::diagnostics() {
+    if !crate::debug::logging() {
         return;
     }
 
@@ -2251,7 +2737,7 @@ pub(crate) fn trace_draw() {
 
 /// Records a pipeline bind against the pass that is open, keeping the first few distinct names.
 pub(crate) fn trace_pipeline(name: &str) {
-    if !crate::debug::diagnostics() {
+    if !crate::debug::logging() {
         return;
     }
 
@@ -2265,7 +2751,7 @@ pub(crate) fn trace_pipeline(name: &str) {
 /// Records something that is not a render pass - the blit that presents a frame - in the same
 /// history, so the pass order and the present can be read off together.
 fn trace_marker(name: &str) {
-    if !crate::debug::diagnostics() {
+    if !crate::debug::logging() {
         return;
     }
     let mut traces = TRACES.lock();
@@ -2333,7 +2819,11 @@ pub extern "C" fn log_render_stats() {
     info!(
         "wgpu-mc: render stats: {passes} render passes ({empty} of them empty, last had {last} \
          draws), {pipelines} pipeline binds, {draws} draws ({bind_groups} bind groups built, \
-         {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions"
+         {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions; \
+         uploads: {} staged ({} MB), {} fell back to queue writes",
+        STAGED_UPLOADS.swap(0, Ordering::Relaxed),
+        STAGED_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024),
+        STAGING_FALLBACKS.swap(0, Ordering::Relaxed),
     );
 
     // Read in one lock rather than two: a guard taken inside the `info!` argument list lives until
@@ -2351,12 +2841,13 @@ pub extern "C" fn log_render_stats() {
     };
 
     info!(
-        "wgpu-mc: live resources: {} textures ({} MB), {} views, {} buffers ({} MB, {} quarantined \
-         in {} MB), {} encoders, {} passes, {} bind groups, {} pipelines, {} tombstones, \
-         {} fan + {} quad index buffers",
+        "wgpu-mc: live resources: {} textures ({} MB), {} views ({} with a label), {} buffers ({} \
+         MB, {} quarantined in {} MB), {} encoders, {} passes, {} bind groups, {} pipelines, {} \
+         tombstones, {} fan + {} quad index buffers",
         LIVE_TEXTURE_COUNT.load(Ordering::Relaxed),
         LIVE_TEXTURE_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
         LIVE_VIEW_COUNT.load(Ordering::Relaxed),
+        live_view_labels(),
         LIVE_BUFFER_COUNT.load(Ordering::Relaxed),
         LIVE_BUFFER_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
         quarantined_count,
@@ -2984,22 +3475,85 @@ fn save_pipeline_cache(wm: &WmRenderer) {
     );
 }
 
+/// Creates a sampler with the modes Blaze3D asked for.
+///
+/// This used to build one default sampler and ignore every argument, which is `ClampToEdge` on all
+/// three axes, `Nearest` filtering and `lod_max_clamp` of zero - one sampler for the whole game, and
+/// the wrong one for most of it. What it breaks is anything whose texture is *meant* to repeat:
+///
+/// - `WeatherEffectRenderer` draws one quad per rain column whose texture *v* runs from
+///   `bottomY / 4` to `topY / 4` and relies on the wrap to cut it into streaks. Clamped, the last
+///   texel row is stretched over the whole column, so rain and snow render as blue and white lines
+///   falling out of the sky - the report was "rain is thin lines that stretch down forever";
+/// - the enchantment glint scrolls its texture the same way, so it stops being a moving pattern;
+/// - flowing water and lava scroll their atlas sprite by whole texture coordinates in the same way;
+/// - `lod_max_clamp` of zero pins every sample to mip 0, which is why nothing was mip-filtered - and
+///   that part is deliberately *kept*: see the `lod_max_clamp` comment inside.
+///
+/// The last argument is the `OptionalDouble` LOD limit Blaze3D passes, negative when it did not ask
+/// for one, and `max_anisotropy` of zero means "no anisotropy" - wgpu wants at least one.
 #[unsafe(no_mangle)]
-pub extern "C" fn create_sampler(wm: &WmRenderer) -> Box<wgpu::Sampler> {
+pub extern "C" fn create_sampler(
+    wm: &WmRenderer,
+    address_mode_u: u32,
+    address_mode_v: u32,
+    min_filter: u32,
+    mag_filter: u32,
+    max_anisotropy: u32,
+    _max_lod: f64,
+) -> Box<wgpu::Sampler> {
+    let min = filter_mode(min_filter);
+    let mag = filter_mode(mag_filter);
+
+    // Anisotropy above one is only legal with linear filtering on both ends - wgpu answers anything
+    // else with a validation error, and a validation error ends the process here. Nothing in 26.1
+    // asks for it today, but the sampler cache would hand it straight through if something did.
+    let anisotropy = if min == wgpu::FilterMode::Linear && mag == wgpu::FilterMode::Linear {
+        max_anisotropy.clamp(1, 16) as u16
+    } else {
+        1
+    };
+
     Box::new(wm.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-        label: None,
-        address_mode_u: Default::default(),
-        address_mode_v: Default::default(),
-        address_mode_w: Default::default(),
-        mag_filter: Default::default(),
-        min_filter: Default::default(),
-        mipmap_filter: Default::default(),
+        label: Some("<wm/mc sampler>"),
+        address_mode_u: address_mode(address_mode_u),
+        address_mode_v: address_mode(address_mode_v),
+        // No 3D texture is sampled by this renderer, so `w` follows `u` rather than being clamped
+        // while the others wrap.
+        address_mode_w: address_mode(address_mode_u),
+        mag_filter: mag,
+        min_filter: min,
+        // Mips are deliberately not sampled yet, whatever the request says. Minecraft's atlases are
+        // stitched with the padding mipmapping needs, but this side builds every mip level by
+        // *rendering* the atlas into it - one `Animate <atlas>` pass per level - and a level that is
+        // empty or half filled does not blur: it samples the neighbouring sprite, which is what
+        // "the stair's side is missing and the pressure plate has the bed's texture on one face"
+        // looks like. `lod_max_clamp` of zero keeps every sample on mip 0, which is the level the
+        // sprite uploads write directly; the icons were correct with exactly this, and turning mips
+        // on is a separate change that has to come with a check that each level is filled.
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         lod_min_clamp: 0.0,
         lod_max_clamp: 0.0,
         compare: None,
-        anisotropy_clamp: 1,
+        anisotropy_clamp: anisotropy,
         border_color: None,
     }))
+}
+
+/// `com.mojang.blaze3d.textures.AddressMode`: 0 is `REPEAT`, 1 is `CLAMP_TO_EDGE`.
+fn address_mode(mode: u32) -> wgpu::AddressMode {
+    match mode {
+        1 => wgpu::AddressMode::ClampToEdge,
+        _ => wgpu::AddressMode::Repeat,
+    }
+}
+
+/// `com.mojang.blaze3d.textures.FilterMode`: 0 is `NEAREST`, 1 is `LINEAR`.
+fn filter_mode(mode: u32) -> wgpu::FilterMode {
+    match mode {
+        1 => wgpu::FilterMode::Linear,
+        _ => wgpu::FilterMode::Nearest,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3417,6 +3971,13 @@ pub extern "C" fn write_to_texture(
         return;
     }
 
+    // A texture write is the buffer case with no way to be clever about it: `Queue::write_texture`
+    // is applied at the next submission, ahead of the frame's commands, so a re-upload of a texture
+    // an already recorded draw samples would change what that draw sees. There is no offset to
+    // compare against - the write names a mip, a layer and a rectangle - so this submits first, and
+    // uploads are rare enough (a resource load, a skin, a font) for that to cost nothing.
+    flush_shared_encoder(wm);
+
     wm.gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &destination,
@@ -3605,6 +4166,8 @@ pub extern "C" fn drop_texture_view(view: Box<wgpu::TextureView>) {
 
     // A cached bind group may name this view, and the allocator hands the address out again.
     crate::blaze::invalidate_bind_group_cache(&*view as *const wgpu::TextureView as usize);
+
+    note_view_dead(&view);
 }
 
 /// Buffers Minecraft has closed, kept alive for a short while.
@@ -3665,6 +4228,10 @@ pub extern "C" fn drop_buffer(buffer: Box<wgpu::Buffer>) {
     // quarantine keeps the box itself alive, but a set built for the buffer that used to be there
     // has to go.
     crate::blaze::invalidate_bind_group_cache(&*buffer as *const wgpu::Buffer as usize);
+
+    // The write mark goes with it: the address will belong to a new buffer eventually, and a mark
+    // that outlived this one would make every upload into its successor submit a frame.
+    forget_write_marks(&*buffer as *const wgpu::Buffer as usize);
 
     quarantine_buffer(buffer);
 }

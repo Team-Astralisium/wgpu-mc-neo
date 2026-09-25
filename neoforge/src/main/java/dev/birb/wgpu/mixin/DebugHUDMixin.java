@@ -77,7 +77,7 @@ public class DebugHUDMixin {
      * and a screenshot only ever shows the top of the column that happens to be on screen.
      */
     private static void report(String column, List<String> lines) {
-        if (!Diagnostics.isEnabled() || !REPORTED.add(column)) {
+        if (!Diagnostics.loggingEnabled() || !REPORTED.add(column)) {
             return;
         }
 

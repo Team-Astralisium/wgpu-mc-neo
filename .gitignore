@@ -53,3 +53,4 @@ result
 # throwaway 26.1 bytecode-inspection helpers
 neoforge/.analysis/
 neoforge/tools/
+/.kotlin

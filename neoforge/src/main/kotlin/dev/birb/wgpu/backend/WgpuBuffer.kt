@@ -138,7 +138,7 @@ class WgpuBuffer private constructor(
          * Once a second, because the failure this reports is a buffer created 60 times a second.
          */
         private fun reportCloudBuffer(label: String, size: Long, nativeSize: Long) {
-            if (!label.startsWith("Cloud") || !Diagnostics.isEnabled()) {
+            if (!label.startsWith("Cloud") || !Diagnostics.loggingEnabled()) {
                 return
             }
 

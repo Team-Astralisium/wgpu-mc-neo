@@ -338,12 +338,7 @@ class OptionPages : Iterable<OptionPages.Page> {
         /**
          * Commits the page's edits, and hands the renderer the ones that are its own.
          *
-         * Which of the two this is does *not* depend on [name]. It used to - the test was
-         * `name.string == "Electrum"` - and that broke the moment the page's label became a
-         * translation key: the label is `Neolectrum` in every language, so the comparison stopped
-         * matching, no settings were ever sent, and an edit to this page was kept on this side
-         * only. The Apply button then turned back into Close and the next launch read the old
-         * value out of the config, which is exactly what "the change did not apply" looks like.
+         * Which of the two this is does *not* depend on [name].
          *
          * A page holds the renderer's settings exactly when one of its rows carries a setting name,
          * and the renderer is the side that named them, so this cannot go stale when a label does.

@@ -21,6 +21,14 @@ use crate::settings::{DebugSettings, Settings};
 /// Whether to report what the renderer is doing: pipeline binds, passes, counters, shader dumps.
 static DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
 
+/// Whether to write the renderer's diagnostic *log lines*.
+///
+/// Separate from [`DIAGNOSTICS`], which is the *dump* switch: a run that wants a frame written out
+/// should be able to get it without a line a second of counters, and a run that wants the counters
+/// should be able to get them without writing frames to disk. Most of the lines this side writes are
+/// the native half of one the JVM side writes too, so the two flags are read in pairs.
+static LOGGING: AtomicBool = AtomicBool::new(false);
+
 /// Whether a draw may reuse a bind group built for another draw at a different dynamic offset.
 static BIND_GROUP_CACHE: AtomicBool = AtomicBool::new(true);
 
@@ -29,6 +37,13 @@ static DYNAMIC_OFFSETS: AtomicBool = AtomicBool::new(true);
 
 /// Whether every draw's bindings are logged, which is a line per draw.
 static TRACE_DYNAMIC_OFFSETS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the verbose log of how binding names were resolved is on.
+///
+/// The resolution itself happens on the JVM side, which reads this setting through `getSettings`
+/// like the options screen does; the flag is kept here so that every debug switch is in one place,
+/// and so a future reader of this file sees that the switch exists.
+static BINDING_VERBOSITY: AtomicBool = AtomicBool::new(false);
 
 /// Whether the GLSL that reaches the shader compiler is written out.
 static DUMP_SHADERS: AtomicBool = AtomicBool::new(false);
@@ -50,6 +65,12 @@ pub fn diagnostics() -> bool {
     DIAGNOSTICS.load(Ordering::Relaxed)
 }
 
+/// Whether this side's diagnostic log lines are turned on. See [`LOGGING`].
+#[inline]
+pub fn logging() -> bool {
+    LOGGING.load(Ordering::Relaxed)
+}
+
 #[inline]
 pub fn bind_group_cache() -> bool {
     BIND_GROUP_CACHE.load(Ordering::Relaxed)
@@ -63,6 +84,11 @@ pub fn dynamic_offsets() -> bool {
 #[inline]
 pub fn trace_dynamic_offsets() -> bool {
     TRACE_DYNAMIC_OFFSETS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub fn binding_verbosity() -> bool {
+    BINDING_VERBOSITY.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -93,11 +119,14 @@ pub fn apply(settings: &Settings) {
         bind_group_cache,
         dynamic_offsets,
         trace_dynamic_offsets,
+        binding_verbosity,
         dump_shaders,
         gpu_timestamps,
         pix_capture,
+        logging,
     } = settings.debug();
 
+    set(&LOGGING, logging || marker("wgpu-logging"));
     set(&DIAGNOSTICS, diagnostics || marker("wgpu-dump-frames"));
     // These two markers are spelled as the *off* switch, so the file wins over the setting.
     set(
@@ -111,6 +140,10 @@ pub fn apply(settings: &Settings) {
     set(
         &TRACE_DYNAMIC_OFFSETS,
         trace_dynamic_offsets || marker("wgpu-trace-dynamic-offsets"),
+    );
+    set(
+        &BINDING_VERBOSITY,
+        binding_verbosity || marker("wgpu-binding-log"),
     );
     set(&DUMP_SHADERS, dump_shaders || marker("wgpu-dump-shaders"));
     set(&GPU_BASED_VALIDATION, gpu_based_validation);
@@ -138,6 +171,7 @@ fn set(flag: &AtomicBool, value: bool) {
 /// A flag's name for the log, which is the one its setting has.
 fn name(flag: &AtomicBool) -> &'static str {
     match flag {
+        f if std::ptr::eq(f, &LOGGING) => "logging",
         f if std::ptr::eq(f, &DIAGNOSTICS) => "diagnostics",
         f if std::ptr::eq(f, &BIND_GROUP_CACHE) => "bind group cache",
         f if std::ptr::eq(f, &DYNAMIC_OFFSETS) => "dynamic offsets",
@@ -160,12 +194,14 @@ fn marker(file_name: &'static str) -> bool {
 
     MARKERS
         .get_or_init(|| {
-            const NAMES: [&str; 5] = [
+            const NAMES: [&str; 7] = [
                 "wgpu-dump-frames",
                 "wgpu-no-bind-group-cache",
                 "wgpu-no-dynamic-offsets",
                 "wgpu-trace-dynamic-offsets",
                 "wgpu-dump-shaders",
+                "wgpu-binding-log",
+                "wgpu-logging",
             ];
 
             let mut present = std::collections::HashSet::new();

@@ -69,7 +69,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         // Diagnostics: Minecraft's `CommandEncoder` is not `AutoCloseable` and has no `close`, so
         // the object is dropped to the GC - which costs nothing in the GL backend, whose encoder
         // owns nothing, and leaks a native encoder here. This says who makes them.
-        if (Diagnostics.isEnabled()) {
+        if (Diagnostics.loggingEnabled()) {
             val site = Throwable().stackTrace
                 .drop(1)
                 .takeWhile { !it.className.startsWith("dev.birb.wgpu") || it.methodName == "createCommandEncoder" }
@@ -149,6 +149,12 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
      * exactly like an atlas whose sprites are simply not animated.
      */
     private fun reportAnimationPass() {
+        // The logging switch, and checked before the counter rather than after it: this is the one
+        // report that had no switch at all, so it printed a line a second in every run.
+        if (!Diagnostics.loggingEnabled()) {
+            return
+        }
+
         val now = System.nanoTime()
         val count = ANIMATION_PASSES.incrementAndGet()
         if (now - ANIMATION_REPORTED_AT < 1_000_000_000L) {
@@ -306,7 +312,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         // Diagnostics: a staging buffer that is allocated and never freed is native memory the
         // garbage collector cannot see, which is exactly the shape of "the game asks for memory and
         // never gives it back". The totals say whether every allocation comes back.
-        if (Diagnostics.isEnabled()) {
+        if (Diagnostics.loggingEnabled()) {
             STAGING_ALLOCATED.addAndGet(upload)
             STAGING_OPEN.incrementAndGet()
             if (STAGING_OPEN.get() > STAGING_HIGH_WATER.get()) {
@@ -337,7 +343,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             override fun close() {
                 try {
                     if (write) {
-                        if (Diagnostics.isEnabled()) {
+                        if (Diagnostics.loggingEnabled()) {
                             reportMappedWrite(wgpuBuffer, staging, length)
                         }
                         WmNative.writeToBuffer.invokeExact(
@@ -355,13 +361,13 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
                         val written = staging.position().toLong()
                         wgpuBuffer.lastMappedWrite = written
 
-                        if (Diagnostics.isEnabled()) {
+                        if (Diagnostics.loggingEnabled()) {
                             verifyMappedWrite(wgpuBuffer, buffer.offset(), staging, length, written)
                         }
                     }
                 } finally {
                     MemoryUtil.memAlignedFree(staging)
-                    if (Diagnostics.isEnabled()) {
+                    if (Diagnostics.loggingEnabled()) {
                         STAGING_FREED.addAndGet(upload)
                         STAGING_OPEN.decrementAndGet()
                         reportStaging("free")
@@ -382,6 +388,10 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
      * own cell" is a question about these bytes.
      */
     private fun reportMappedWrite(buffer: WgpuBuffer, staging: ByteBuffer, length: Long) {
+        // The logging switch: these are the reports that verify an upload arrived and decode a face buffer, and they had none of their own.
+        if (!Diagnostics.loggingEnabled()) {
+            return
+        }
         if (!buffer.label.startsWith("Cloud")) {
             return
         }
@@ -429,6 +439,10 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         length: Long,
         written: Long,
     ) {
+        // The logging switch, as above: this is the verification half of a mapped write.
+        if (!Diagnostics.loggingEnabled()) {
+            return
+        }
         if (!buffer.label.startsWith("Cloud") || !throttle("${buffer.label} (read back)")) {
             return
         }
@@ -497,6 +511,10 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
      * player.
      */
     private fun reportCloudMesh(buffer: WgpuBuffer, bytes: MemorySegment, length: Int) {
+        // The logging switch, as above: this decodes the cloud face buffer for the log.
+        if (!Diagnostics.loggingEnabled()) {
+            return
+        }
         val faces = length / 3
         if (faces <= 0) {
             return
@@ -675,6 +693,10 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
 
         /** Reports the staging totals at most once a second, when they changed. */
         fun reportStaging(what: String) {
+        // The logging switch: this is a counter report.
+        if (!Diagnostics.loggingEnabled()) {
+            return
+        }
             val now = System.nanoTime()
             if (now - STAGING_REPORTED_AT < 1_000_000_000L) {
                 return
@@ -716,14 +738,14 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
 
     /**
      * Dumps a texture right after it was uploaded, when its label matches
-     * [Diagnostics.DUMP_TEXTURE_LABEL] and the diagnostics are on.
+     * [Diagnostics.DUMP_TEXTURE_LABEL] and the dumps are on.
      *
      * Diagnostics. A texture that arrives in the GPU with the wrong channels looks exactly like a
      * shader that samples the right texture the wrong way, and the uploaded bytes are the only
      * thing that tells the two apart.
      */
     private fun dumpUploadIfRequested(texture: WgpuTexture, depthOrLayer: Int) {
-        if (!Diagnostics.isEnabled()) return
+        if (!Diagnostics.dumpsEnabled()) return
         if (!texture.label.contains(Diagnostics.DUMP_TEXTURE_LABEL, ignoreCase = true)) return
 
         val name = "tex-" + texture.label.replace(Regex("[^A-Za-z0-9]+"), "-").trim('-') +
@@ -772,7 +794,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         width: Int,
         height: Int,
     ) {
-        if (Diagnostics.isEnabled() && uploadsFromByteBuffers.add("${destination.label} as $format")) {
+        if (Diagnostics.loggingEnabled() && uploadsFromByteBuffers.add("${destination.label} as $format")) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.info(
                 "wgpu: byte-buffer upload to {} as {}", destination.label, format
             )
@@ -882,7 +904,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         // one submission - the clears, the passes, the writes and this blit all travel in it.
         val view = texture as WgpuTextureView
         val described = "${view.texture.getWidth(0)}x${view.texture.getHeight(0)}"
-        if (Diagnostics.isEnabled() && presented.add(described)) {
+        if (Diagnostics.loggingEnabled() && presented.add(described)) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.info("wgpu: presents a {} texture", described)
         }
         device.surface.blitAndPresent(view, view.texture.getWidth(0), view.texture.getHeight(0))

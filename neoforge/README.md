@@ -361,6 +361,35 @@ when the world is loaded, not while it is running. The integrated server reads t
 it is constructed (`IntegratedServer`), and vanilla has no live path for it either - the value is
 what the *next* load of that world uses.
 
+### The page is as wide as the display, not as the window
+
+The page's width limit was the constant `2000` in pixels, which is one particular monitor's width
+written down: on a smaller display the rows ran past the edge of the window, and on a wider one they
+stopped short of the space there was. It is now the monitor's own width times `0.809`, rounded down
+(`OptionPageScreen.WIDTH_SHARE_OF_MONITOR`), which is the same page relative to any display.
+
+Three details are deliberate:
+
+- **The monitor, not the window.** Laying the page out from the window makes every row a different
+  width while the window's edge is dragged, and a window that is half the screen gets a page that is
+  half the size on a display with room for all of it. The caller still clamps the result to the
+  window in GUI units, so a window smaller than its display is the bound that applies.
+- **The monitor's widest video mode, not the one it is running at.** A display driven below its own
+  maximum can still show the page at full size, and GLFW lists a monitor's modes sorted by colour
+  depth first - so the maximum is taken rather than assumed to be the first or the last entry.
+- **It follows the window.** `findBestMonitor` walks GLFW's monitor list and compares rectangles, and
+  the limit is read from `alignX`, once per widget - so the monitor is only re-resolved when the
+  window's position says it moved, and a page that is open when the window is dragged to another
+  display is laid out again for that display. A window with no monitor to name keeps the fallback
+  width and says so once.
+
+The resolved limit is logged when it changes, which is also how the layout can be checked without a
+screenshot:
+
+```
+wgpu: the video options page is limited to 2071 pixels on a 2560 pixel wide monitor
+```
+
 ### Falling back
 
 If the configured backend cannot be created, the other one is tried before giving up, and the log
@@ -522,19 +551,46 @@ the one that works whatever the launcher does with JVM arguments.
 ### The debug switches are settings, and the diagnostics cost nothing when they are off
 Every diagnostic in this renderer grew as a marker file, which is the right shape for a switch that
 has to work without a launcher and the wrong one for a player who wants a single frame dumped. They
-are options under **Electrum → Debug** now, separated from the backend and vsync by a blank row,
-with `GPU-based validation` at the top:
+are options on the **Neolectrum** page now, under two headings the schema names - **Optimization**
+first, then **Debug** - separated from the backend and vsync by a blank row:
 
-| Setting | Default | Applies |
-| --- | --- | --- |
-| GPU-based validation | off | next launch - it is an `wgpu::InstanceFlags` bit, and the instance is created once |
-| Diagnostics | off | next frame |
-| Bind group cache | on | next frame |
-| Dynamic offsets | on | next frame |
-| Trace dynamic offsets | off | next frame |
-| Dump shaders | off | next frame |
-| GPU timestamps | off | next frame |
-| PIX capture | off | next frame - see "The GPU's own clock, and a PIX capture" |
+| Setting | Section | Default | Applies |
+| --- | --- | --- | --- |
+| Bind group cache | Optimization | on | next frame |
+| Dynamic offsets | Optimization | on | next frame |
+| GPU-based validation | Debug | off | next launch - it is a `wgpu::InstanceFlags` bit, and the instance is created once |
+| Logging | Debug | off | next frame |
+| Diagnostics | Debug | off | next frame |
+| Trace dynamic offsets | Debug | off | next frame |
+| Dump shaders | Debug | off | next frame |
+| Binding resolution log | Debug | off | next frame |
+| GPU timestamps | Debug | off | next frame |
+| PIX capture | Debug | off | next frame - see "The GPU's own clock, and a PIX capture" |
+
+**Logging and Diagnostics are two switches, not one.** They were one, which meant a run that wanted a
+frame written to disk also got a line per pipeline, a line per pass and a line a second of counters -
+and, worse, several of those lines had no switch at all and were printed in every run: the sprite
+animation counter ("`N` sprite animation passes in the last second") and the reports that verify a
+mapped write arrived. `Logging` is what writes lines, `Diagnostics` is what writes files, and the
+schema says which is which. Measured with both off, none of it runs: no counters, no per-pipeline
+lines, no pass dump, no frame or atlas dump. `Diagnostics` is not a leftover name - it is the switch
+the frame and texture dumps have always hung on, and it still does.
+
+**Bind group cache and dynamic offsets moved under `Optimization`** because they are not diagnostics.
+Both are on by default, turning either off costs a `wgpu::BindGroup` per draw, and the diagnostic that
+comes out of them is the *frame time* - they were written to bisect a rendering bug, which is why they
+lived under `Debug`, and that is exactly the wrong shelf for a switch a player is meant to leave alone.
+
+**A row's order comes from the settings document and its heading from the schema, so the two field
+orders have to agree.** They did not at first: the two optimisations were declared after the debug
+switches in `Settings` and marked `Optimization` in `SettingsInfo`, and the page drew `Debug`, then
+`Optimization` over the last two rows of it, then `Debug` again - one section, two headings, and an
+"Optimization" that looked like it belonged to the debug switches below it. The fix is the field order
+in `Settings` (which is the config file's order, and what `getSettings` serialises for the page),
+`the_config_and_the_schema_list_the_settings_in_the_same_order` is what keeps the two in step, and
+`the_sections_are_contiguous_and_optimizations_come_first` is what keeps `Optimization` above `Debug`
+rather than in the middle of it. Both read the serialised *text*: a `serde_json::Value` sorts its
+keys, which is the one thing about these documents the tests are asking about.
 
 The section is what made the settings list taller than the window at the GUI scales a small window
 allows, so the list scrolls with the wheel now instead of running under the Apply button - which is
@@ -570,13 +626,14 @@ created with it unconditionally, so every launch paid for a driver validation la
 renderer being debugged wants. Host-side `VALIDATION` and `DEBUG` stay on always - they are what
 makes a wgpu error name the call that caused it.
 
-Each of them is also still a marker file (`wgpu-dump-frames`, `wgpu-no-bind-group-cache`,
-`wgpu-no-dynamic-offsets`, `wgpu-trace-dynamic-offsets`, `wgpu-dump-shaders`), and a marker wins
-where the two disagree - including the two that are spelled as the *off* switch, where the file
-turns the feature off regardless of the setting. The schema says which settings are debug switches
-(`"section": "Debug"`), so the options screen draws the heading without knowing what any of them do,
-and the Rust side resolves them into atomics when the settings are loaded or applied: the draw path
-reads a flag, never a config file or a lock.
+Each of them is also still a marker file (`wgpu-dump-frames`, `wgpu-logging`,
+`wgpu-no-bind-group-cache`, `wgpu-no-dynamic-offsets`, `wgpu-trace-dynamic-offsets`,
+`wgpu-dump-shaders`, `wgpu-binding-log`), and a marker wins where the two disagree - including the
+two that are spelled as the *off* switch, where the file turns the feature off regardless of the
+setting. The schema says which settings belong to which heading (`"section": "Optimization"` or
+`"Debug"`), so the options screen draws both headings without knowing what any of them do, and the
+Rust side resolves them into atomics when the settings are loaded or applied: the draw path reads a
+flag, never a config file or a lock.
 
 That is what made the gating worth doing at all. Three of these were *unconditional* work on the hot
 path before:
@@ -588,7 +645,7 @@ path before:
 - `trace_pipeline` did the same on every pipeline bind, and the per-pass trace formatted the target
   address on every pass.
 
-All three are behind the diagnostics flag, so a normal run pays one relaxed load per draw for them
+All three are behind the logging flag, so a normal run pays one relaxed load per draw for them
 - and the counters behind `log_render_stats` are thread-local `Cell<u64>`s rather than process-wide
 atomics, aggregated when the stat line is written. `LIVE_*` stays atomic, because those are
 decremented by the cleaner thread, and a second recording thread would be a real bug: the counter
@@ -1092,6 +1149,45 @@ only clamped: OpenGL clips a scissor box that reaches outside the framebuffer an
 one, and the rectangle a scaled GUI hands over can reach past the edge (`2562` wide in an `854` wide
 window).
 
+### A scissored clear is not a load op, and the item atlas is why that matters
+
+`glClear` is restricted by the scissor box. A wgpu load op is not: it always covers the attachment.
+`clear_color_and_depth_textures_region` was therefore implemented by clearing the whole texture and
+warning about it once, on the reasoning that the only caller redraws one stale slot of the GUI item
+atlas and the cost is the other cached slots "until they are allocated again".
+
+They are not allocated again. `GuiItemAtlas#drawToSlot` clears the 32x32 slot it is about to redraw,
+so every redraw wiped every *other* item icon in the atlas, and the icons came back only for the
+items drawn after the last clear of that frame. What makes a slot stale is an item whose render state
+changed or whose slot was reassigned - opening the inventory, hovering a different item, an item
+being used - so the report was "almost every item icon in the inventory is gone, hovering one brings
+that one back and takes others with it, and the hotbar and the held item do the same". Player heads
+are items, which is why some of the player textures went with them.
+
+The colour half is now a rect-limited write of the clear colour, which is what a scissored clear is:
+
+- `Queue::write_texture` copies into a rectangle of a texture, and the bytes written are the clear
+  colour, so a caller that clears to something other than transparent black gets what it asked for
+  (`clear_color_bytes` maps Minecraft's packed `ARGB` onto the texture's own channel order, and a
+  format it does not know how to write is refused loudly rather than widened quietly);
+- `bytes_per_row` is the rectangle's width in bytes, which `Queue::write_texture` accepts - unlike a
+  buffer-to-texture copy, whose rows have to be padded to the 256 byte copy alignment;
+- the item atlas' texture is created with `USAGE_COPY_DST` (26.1 asks for usage `13`), which is what
+  makes the write legal at all.
+
+The depth half is *still* the whole texture, deliberately: the item atlas' depth attachment is never
+sampled and never read back - it exists so an item's own faces depth-test against each other while it
+is drawn into its slot - so clearing all of it before drawing into one slot changes nothing anything
+can observe. A caller that needed a region of depth *kept* would need a scissored depth draw, which
+is a pipeline of its own, and that part stays under *Known gaps*.
+
+The first region clear of a run is logged, because "the icons are blank" has two explanations and the
+line says which one is in play:
+
+```
+wgpu-mc: cleared a 32x32 region at 224,160 of a Rgba8Unorm texture in place
+```
+
 ### Reading the settings before they are needed
 
 `sendRunDirectory` loads `config/wgpu-mc-renderer.json` and was called from
@@ -1263,35 +1359,88 @@ pass close, every upload, every copy and the blit, which is ten submissions a fr
 frames a second - ten command buffers, ten sets of GPU-side allocations and ten chances for the
 driver to serialise.
 
-There are now two submission points, and both exist because something is about to *look* at the
-result:
+Clears, passes, copies, blits and texture uploads are now recorded and left in the encoder; the
+submission points that remain are the ones where something is about to *look* at the result:
 
 - **before a present**, inside the native blit - which is also where the frame's GPU timestamp ends,
   so the frame boundary and the submission boundary are the same thing. That is what makes the
   measurement mean "this frame" rather than "the last segment of this frame", which is what it
   measured while a frame was split into ten submissions;
 - **before a readback**: `copyTextureToBuffer`'s callback (26.1's screenshots go through it) and a
-  pass-target dump. A readback is the one case where batching cannot be left implicit, because
-  `Queue::write_buffer` data is applied *at* a submission and a copy whose result is read on the CPU
-  has to have been submitted at all.
+  pass-target dump. A copy whose result is read on the CPU has to have been submitted at all;
+- **before a write that lands on bytes an already recorded draw reads** - see below.
 
-Everything else - clears, passes, texture uploads, buffer copies - is recorded and left in the
-encoder. That is safe for the same reason the ring buffers exist: Minecraft writes every uniform,
-vertex block and face mesh into a *fresh* slice of a ring and never re-writes a region an already
-recorded draw reads, so "all of this frame's uploads, then all of this frame's commands" is the order
-it is written for, and recording order inside one encoder is execution order either way.
+**A queue write is not a command.** `Queue::write_buffer` and `Queue::write_texture` are applied *at*
+a submission, ahead of every command in it, so with the whole frame in one submission every draw in
+that frame reads the *last* value written - and that is not a theoretical hazard, it is what being
+clever about this cost:
 
-The result is one submission for 120 presented frames, which the render stats line now says out loud:
+- `RenderSystem#setShaderLights` writes the `Lighting` block between draws. It is a small,
+  *fixed-offset* uniform - not a ring slice like `DynamicTransforms` - so every item and entity in
+  the frame was lit by whatever the last lighting setup of the frame was, which is usually all zeroes.
+  Items and mobs drew **black**;
+- the GUI item atlas is the tell: `GuiItemAtlas` renders every item icon of a frame into it, and the
+  dump came out full of black cubes. Its icons are what the inventory shows, so the report was "the
+  item icons are gone, and the hand and the player look wrong" - and none of *that* was the item
+  atlas' own fault.
+
+So writes are ordered against the recording now, by offset. Every write into a buffer raises a
+per-buffer mark, and a submission forgets every mark; a write *above* the mark goes into bytes nothing
+has read yet - Minecraft's ring buffers, one fresh slice per write - and travels with the frame, while
+a write *at or below* it may be rewriting something in flight and submits what has been recorded
+first. Texture writes submit first every time: they name a mip, a layer and a rectangle rather than an
+offset, so there is nothing to compare against, and a re-upload mid-frame is rare enough (a resource
+load, a skin, a font) for that to cost nothing.
+
+The result is one submission a frame plus one for each in-place uniform rewrite, which the render
+stats line says out loud:
 
 ```
-wgpu-mc: render stats: 1476 render passes (0 of them empty, last had 1 draws), 2726 pipeline binds,
-27545 draws (...), 43925112 vertices, 120 submissions
+wgpu-mc: render stats: 3255 render passes (0 of them empty, last had 1 draws), 6195 pipeline binds,
+227125 draws (...), 486992493 vertices, 963 submissions
 ```
+
+963 submissions for 120 frames is eight a frame rather than one, and it is eight *because the frame
+wants eight*: the lighting, fog, projection and globals blocks are each re-written in place as the
+frame moves between passes. Getting rid of those means recording them into the command stream as a
+copy from a staging ring instead of a queue write - an in-stream copy can sit between two draws,
+which a queue write cannot - and that is the work left here rather than a switch.
 
 A pass borrows the encoder while it is open, so `flush_shared_encoder` refuses to submit while
 `LIVE_PASS_COUNT` is non-zero and says so at error level: finishing an encoder out from under an open
 pass is not a thing to do quietly, and the count being non-zero there would be a bug in the caller
 rather than a timing accident.
+
+### Every sampler was the same sampler
+
+`create_sampler` took no arguments and built one default `wgpu::Sampler` for the whole game: all
+three axes `ClampToEdge`, `Nearest` filtering, and `lod_max_clamp` of zero - which is "mip 0 only".
+Blaze3D asks for the address modes and filters it wants, the JVM side remembered them so its accessors
+could report them, and the native side dropped them on the floor.
+
+Everything whose texture is *meant* to repeat was wrong:
+
+- `WeatherEffectRenderer` draws one quad per rain column and lets the texture's `v` run from
+  `bottomY / 4` to `topY / 4`, relying on the wrap to cut that into falling streaks. Clamped, the last
+  texel row is stretched down the whole column: **rain and snow rendered as blue and white lines
+  falling out of the sky**, which is exactly the shape of the report;
+- the enchantment glint scrolls its texture the same way, so it stopped being a moving pattern;
+- flowing water and lava scroll a sprite by whole texture coordinates in the same way;
+- `lod_max_clamp` of zero pinned every sample to mip 0, which is why nothing was ever mip-filtered.
+
+The modes now travel across the ABI as the numbers Blaze3D uses for them - `AddressMode` 0 is
+`REPEAT`, `FilterMode` 1 is `LINEAR` - and so do the filters, with one deliberate exception: **mips
+are still not sampled**, whatever the request says. `lod_max_clamp` stays at zero and the mipmap
+filter stays `Nearest`, because this side builds every atlas mip level by *rendering* the atlas into
+it - one `Animate <atlas>` pass per level - and a level that is empty or half filled does not blur, it
+samples the *neighbouring sprite*. That is the difference between a correct icon and one wearing the
+sprite packed next to it: the report was "the stair's side is missing and one face of the pressure
+plate has the bed's texture", and it went away when mips went back off. Turning them on is a change
+of its own and has to come with a check that every level is filled.
+
+Anisotropy above one is only applied when both filters are linear, which is what wgpu requires rather
+than something this side may decide: it answers anything else with a validation error, and a
+validation error ends the process.
 
 ### One plan for a pipeline's bindings
 
@@ -1342,6 +1491,42 @@ texture; see "The cache was keyed on the wrong address". With that fixed, a worl
 with 327560 of 327680 draws served from the cache. `wgpu-no-dynamic-offsets` turns the feature off,
 and `wgpu-dynamic-offset-names` (a comma-separated list) restricts it to some uniforms, which is how
 one binding at a time can be ruled in or out.
+
+### A binding that is not in the plan now says so
+
+`writeBinding` and `writeSampled` used to `return` when a name was not in the pipeline's plan, and
+that silence cost a week: the sound the log made was the sound of everything working. The native side
+does not let it pass - `blaze.rs` panics with `nothing bound in slot 'DynamicTransforms', which the
+plan declares as a buffer`, which is a hard failure and a dead process - but a process that ends with
+a slot name and no explanation is not a diagnosis either. Three things changed:
+
+- **A name that is not in the plan is a warning, once per (pipeline, name)**, with the names the plan
+  *can* be bound under printed alongside: `minecraft:pipeline/gui was bound a buffer under the name
+  'Globals', which is not in its binding plan ... The plan's 2 binding(s) are: 0:DynamicTransforms,
+  1:Projection`. A plan is built from what the shader declares, so the expected hits are the default
+  uniforms `RenderSystem#bindDefaultUniforms` binds into every pass - `Globals`, `Lighting`, `Fog` -
+  and the ones that matter are a shader that declares the binding under a *different spelling*.
+- **`PlanBindings.of` has a suffix-aware fallback.** The shader preprocessing splits a combined
+  sampler into `Sampler0_wm_texshim` and `Sampler0_wm_sampler`, and a lookup that misses is retried
+  in both directions: a shim-spelled request falls back to the declared name, and a declared name to
+  either half. Two hits are combined into a *pair* when one of them is a texture slot and the other a
+  sampler slot, because half a sampler is worse than none of it. Every hit is logged once per name,
+  under the binding-resolution switch.
+- **After a pipeline change re-emits what the pass held, the slots left empty are named** - pipeline,
+  slot, and the binding that slot holds - which is what turns "this draw is missing an uniform" into
+  "this draw is missing `DynamicTransforms`, and the plan's names are these".
+
+All three are the `binding_verbosity` switch on the options screen (`Debug`), default off, and they
+also follow `diagnostics`: the fallback hits and the empty-slot listing are the verbose output, while
+the warning is always printed because it is a binding that went nowhere. The switch is also the
+`wgpu-binding-log` marker.
+
+It was verified by making every binding in the game take the fallback path for one run - the direct
+lookup commented out - which resolved 26 bindings through their suffixes, reconstructed both halves
+of every sampler pair, printed `has no binding named Sampler0_wm_texshim; it resolved through the
+shader shim suffix to Sampler0 + Sampler0_wm_sampler`, and rendered the title screen correctly. With
+the direct lookup in place the fallback has no hits at all, which is what a safety net should look
+like: the run that needs it is the run where a plan and a caller disagree about a name.
 
 ### The sky came out as one forty-five degree wedge
 
@@ -1863,6 +2048,123 @@ the block outline still drawn around nothing, and the held item in the corner. T
 (`pipeline/wireframe`, the chunk-section debug view) still draws filled, because wgpu needs
 `Features::POLYGON_MODE_LINE` for it and this device does not ask for that feature.
 
+### The write marks were forgotten by the submission that needed them
+
+Entities rendered as nothing but their own hitboxes - ten mobs standing in a row on screen, ten white
+wireframes and empty grass behind them - while the terrain, the HUD and the held item were all
+correct. Every layer underneath said the draws were fine: the per-draw trace showed `entity_cutout`
+binding `creeper.png` for the creeper and `zombie.png` for the zombie, the native side saw the same
+views in the same slots in the same order for 500,000 draws, the skins were uploaded (a dump of each
+one holds a picture), and the shadow pass bound `shadow.png` in all 7,776 of its draws.
+
+What was wrong was *when* the vertex data arrived. `VertexFormat#uploadToBuffer` keeps **one** vertex
+buffer per pipeline and reuses it for every immediate draw of that pipeline, rewriting it at offset
+zero with `CommandEncoder#writeToBuffer`. This backend answers that call with `Queue::write_buffer` -
+which wgpu applies *at* a submission, ahead of every command in it. So a rewrite has to be ordered
+against the draws already recorded that read the old bytes, and that is what the write high-water
+marks are for: a write at or below a buffer's mark submits the frame first, so the old content is
+consumed before the new content lands.
+
+The bug was one line: `forget_write_marks()` ran inside `flush_shared_encoder`, on the reasoning that
+"nothing is left in flight" after a submission. That holds for the writes *in* that submission and
+forgets the one thing that still matters - the rewrite that forced it, which is sitting in the queue
+waiting for the *next* submission. With the marks cleared, only the **first** rewrite of a frame was
+ordered: the second rewrite saw a mark of zero, decided its bytes were untouched, and travelled with
+the frame, where wgpu applied it before every command in it. Every draw of the batch then read the
+**last** write's geometry. Entities were drawn with each other's vertices - models on top of each
+other, or a model with another model's shape - and the GUI item atlas drew all of its slots with the
+last item's geometry, which is what "the icons are scrambled, a pressure plate has a bed's face"
+looked like. It also explains the shadow complaint: a shadow quad carrying an item's geometry is a
+shadow *shaped* like an item.
+
+The marks now survive a submission and are dropped with the buffer they describe (`drop_buffer`),
+which is what makes the queue-write path correct - and it is now the *fallback* path, because the
+cost of it was a submission per rewrite: ~3,200 a second in a scene with 150,000 draws, since
+Minecraft keeps one immediate vertex buffer per pipeline and rewrites it at offset zero for every
+draw of a batch.
+
+### The uploads travel in the command stream now
+
+A queue write is applied *at* a submission, so it has to be ordered by when the submission happens. A
+copy is a *command*, so it is ordered by where it was recorded - which is the property the uploads
+wanted all along. `write_to_buffer` now stages its bytes in a ring of four 4 MiB buffers and records a
+`copy_buffer_to_buffer` into the frame's own encoder:
+
+- the bytes reach the staging buffer through the same `Queue::write_buffer`, which is free here: the
+  staging region is one nothing has ever read, so "applied first, before the frame's commands" is
+  exactly where it belongs, and the copy that consumes it is a command that comes after it;
+- the copy lands in the command stream in recording order, so a draw recorded *after* it sees the new
+  bytes and a draw recorded *before* it sees the old ones - the same guarantee the forced submissions
+  bought, at no submission at all;
+- a staging region may only be reused once the submission reading it has finished, which is what the
+  ring is for: a buffer is handed out again only after every submission that could still be reading it
+  has completed, and `Queue::on_submitted_work_done` is what says so. Four buffers is three
+  submissions of slack.
+- the buffers are **not** mapped. The first version created them with `mapped_at_creation`, and wgpu
+  ended the process with "Buffer with 'wgpu-mc staging' label is still mapped" - a mapped buffer may
+  not be the source of a copy. It does not need to be, because the write goes through the queue.
+
+Measured in the same scene: **3,201 submissions a second became 120** (two a frame, the frame's own
+and the readbacks), 13,000 uploads and 17 MB a second, and no fallback to the queue-write path. The
+ring running dry is the one case that still falls back, and the counters in the render-stats line say
+so - `uploads: N staged (M MB), K fell back to queue writes` - which is what a scene with a larger
+upload rate than four buffers can absorb would show.
+
+`Queue::write_texture` still submits before it writes, for the reason the buffer path used to: a
+texture write names a mip, a layer and a rectangle rather than a byte range, so there is no offset to
+compare against a mark. Texture uploads are rare (a resource load, a skin, a font) and cost two
+submissions a frame between them, so the same treatment is a `Known gaps` item rather than a fix that
+has to land with this one.
+
+### A marker file that puts a scene in front of the renderer
+
+The corruption above could not be reproduced in a run that had nothing in it, so a marker-gated hook
+put the missing thing into the world: `wgpu-reload-resources` calls `Minecraft#reloadResourcePacks`
+twenty seconds into the run, because "after I refreshed" is F3+T, and every atlas and skin a reload
+rebuilds is a texture that was closed and re-created while the renderer held pointers to it.
+
+Two more hooks were written for the same run and have been **removed again**, because they changed the
+game rather than merely observing it: one filled the hotbar with nine items on join (26.1 draws every
+item icon through `GuiItemAtlas`, so an empty hotbar means that atlas is never used at all - "the icons
+are wrong" was unreproducible without items to draw) and one spawned ten species with ten distinct
+skins in front of the player and put the ring back whenever `/kill @e` cleared it. They are worth
+writing down as a technique, not as code to keep: a run that starts with an empty inventory and no
+mobs nearby cannot show a bug in either, and the fix that matters was found with them. What is left of
+them in the world is nine items in the hotbar of the run directory's copy of the world, and the marker
+files are gone, so nothing puts them back.
+
+The two per-draw traces stay, and they are what closed the binding layer as a suspect: `wgpu-trace-plan`
+names a pipeline family (with the `binding_verbosity` setting or the `wgpu-binding-log` marker turning
+them on), and they print the texture every slot of every draw carries on both sides of the ABI, in draw
+order, from the JVM's label registry and from the native side's view registry.
+
+### The sun and the moon were both up
+
+Fly high enough and the sky shows the sun and the moon at once. 26.1 draws both bodies
+unconditionally - `SkyRenderer#renderSunMoonAndStars` rotates one to the sun's angle and the other to
+the moon's - and leaves the one that has set to be hidden by the world: the sky pass paints the
+hemisphere *above* the horizon and the ground covers the rest. Above the ground there is nothing left
+to do the hiding, so the body that should have set is simply still there. Vanilla has the same hole;
+nothing in the sky pass closes it.
+
+`SkyRendererMixin` skips the two draws when the body they would place is under the horizon. The angle
+is not a parameter of `renderSun`/`renderMoon` - the caller has already applied it to the pose stack -
+so the test is on the rotation itself: a body is a quad at `(0, 100, 0)` in model space and the matrix
+is a rotation about X by that body's angle, whose `m11` is the angle's cosine. Positive is above the
+horizon, negative is below it, and the sky's transform carries no camera pitch to confuse the two. The
+threshold is `-0.1` rather than zero because the sun's quad is thirty units across at a distance of a
+hundred: cutting a body off when its *centre* crosses the horizon would make it vanish with a third of
+its disc still up, which is a snap the sunset does not have.
+
+The sunrise and sunset glow is a separate pass (`renderSunriseAndSunset`) and stays: it is what the
+horizon looks like at dawn, not a body in the sky. The stars were already conditional on
+`starBrightness`, and the dark disc below the horizon is still vanilla's - it is drawn when the eye is
+under the world's horizon height, which this does not touch.
+
+`wgpu: the moon is below the horizon, so it is not drawn` - and the same for the sun - is logged on
+each transition, so a run says which body is being skipped rather than leaving it to a screenshot. It
+alternates sun, moon, sun over a day, which is the whole of the test.
+
 ### Known gaps
 
 - **The Fabric module's C header is a snapshot from before the 26.1 work.** `fabric/src/main/wgpu-mc.h`
@@ -1906,11 +2208,12 @@ the block outline still drawn around nothing, and the held item in the corner. T
   mip level, which is what makes the per-level atlas passes render at 1/2, 1/4, 1/8 of the atlas
   rather than all at full size. A pass that does set a viewport would still be ignored, and would
   need the same clamping that the scissor rectangle gets.
-- **A region clear widens to the whole attachment.** `glClear` is restricted by the scissor box and
-  a wgpu load-op is not, so `clear_color_and_depth_textures_region` clears everything and warns
-  once. Minecraft only reaches for it when redrawing one stale slot of the GUI item atlas, so the
-  cost is the other cached slots of that atlas until they are allocated again. Doing it properly
-  needs a scissored clear draw, i.e. a pipeline of its own.
+- **A region clear keeps the colour and loses the depth.** `clear_color_and_depth_textures_region`
+  now writes the clear colour into the rectangle the caller asked for, but clears the *whole* depth
+  attachment, because a load op cannot be scissored. That is exact for the one caller there is - the
+  GUI item atlas' depth is never sampled - and wrong for a caller that needs the depth around its
+  region kept. Doing it properly needs a scissored depth draw, i.e. a pipeline of its own. See "A
+  scissored clear is not a load op".
 - **`drawMultipleIndexed` replays its draws** instead of batching them, because there is no
   indirect-draw entry point in the ABI. Correct, just less batched.
 - **Every draw builds its own bind groups.** This was true, and is no longer: dynamic offsets are on

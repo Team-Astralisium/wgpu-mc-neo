@@ -793,6 +793,73 @@ pub extern "C" fn pipeline_bindings(
     slot as u32
 }
 
+/// Whether a pipeline is one the `wgpu-trace-plan` file asks for.
+///
+/// Both per-draw traces read the same file, so the JVM's line and this side's line describe the same
+/// draws - and a trace that names one family is what keeps a line per draw from being a log that is
+/// unusable within a second.
+fn trace_filter_matches(pipeline_name: &str) -> bool {
+    static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+    let filter = FILTER.get_or_init(|| {
+        std::fs::read_to_string("wgpu-trace-plan")
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    });
+
+    filter
+        .as_ref()
+        .is_none_or(|filter| pipeline_name.contains(filter.as_str()))
+}
+
+/// Diagnostics: what every texture slot of one draw carries, in slot order.
+///
+/// The slot table is walked exactly as `bind_groups_for_call` walks it, so the line says what the
+/// bind group built from this draw holds - and the view labels come from the registry rather than
+/// from the view, which is the only way to name one that has already been dropped.
+fn trace_draw_textures(pipeline: &BlazePipeline, call: &DrawCall) {
+    // A run traces one pipeline family at a time: the line is per draw per texture slot, and a frame
+    // has hundreds of draws, so "everything" is a log that is unusable within a second. The file
+    // holds a substring of the pipeline name to trace, and it is read once.
+    static TRACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    if !trace_filter_matches(&pipeline.name) {
+        return;
+    }
+
+    // A hard cap, because a trace left on is a log that fills the disk rather than a diagnostic.
+    if TRACED.fetch_add(1, Ordering::Relaxed) > 200_000 {
+        return;
+    }
+
+    let mut slot = 0usize;
+
+    for bindings_in_set in &pipeline.plan.sets {
+        for binding in bindings_in_set {
+            let index = slot;
+            slot += 1;
+
+            if !matches!(binding.resource, PlannedResource::Texture { .. }) {
+                continue;
+            }
+
+            let entry = call.bindings.get(index).copied().unwrap_or(NO_BINDING);
+            let label = if entry.resource.is_null() {
+                "<nothing bound>".to_string()
+            } else {
+                crate::device::view_label(entry.resource as usize)
+                    .unwrap_or_else(|| format!("<unregistered view {:#x}>", entry.resource as usize))
+            };
+
+            info!(
+                "wgpu-mc: trace {} slot '{}' -> '{}'",
+                pipeline.name, binding.name, label
+            );
+        }
+    }
+}
+
 /// The buffer a draw bound in [slot], as the plan expects it there.
 ///
 /// The pointers a `DrawCall` carries are the ones Rust handed the JVM, so they name live buffers -
@@ -828,9 +895,69 @@ fn call_texture<'a>(
         );
     }
 
+    let address = entry.resource as usize;
+    report_bound_texture(plan, binding, address);
+
     // Safety: as above, for a `wgpu::TextureView`.
     let view = unsafe { &*(entry.resource as *const wgpu::TextureView) };
-    (view, entry.resource as usize)
+    (view, address)
+}
+
+/// Diagnostics: which view a texture slot actually got, and whether it was still there.
+///
+/// The JVM side already logs the texture it *hands* a name, and this is the other end of that
+/// journey: the address the bind group is built from. A model wearing another model's texture is
+/// answered by the two lines together - the same name going into the same slot on both sides means
+/// the picture is wrong for some other reason, and a view whose label is not the texture the JVM
+/// bound means the address stopped naming what it named when it was handed over.
+///
+/// Both halves are behind `diagnostics`, including the liveness check: it is two registry lookups and
+/// two lock acquisitions per texture binding per bind group built, which is a cost on the draw path
+/// that a run without the switch should not pay. (It found nothing when it was left on: no draw ever
+/// bound a view this side had dropped.) The report never reads the view, only the label recorded
+/// while it was alive.
+fn report_bound_texture(plan: &str, binding: &PlannedBinding, address: usize) {
+    static BOUND_VIEWS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    static DEAD_VIEWS_REPORTED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+    if !crate::debug::logging() {
+        return;
+    }
+
+    // An address this side has dropped, which is the use-after-free: the draw paints with whatever
+    // the allocator put there next - usually the next view it handed out, which is another model's
+    // skin. Never reported by reading the view: the label came from the registry while it was alive.
+    if crate::device::view_is_dead(address) {
+        let mut reported = DEAD_VIEWS_REPORTED.lock();
+        if reported
+            .get_or_insert_with(std::collections::HashSet::new)
+            .insert(format!("{plan}/{}/{address:#x}", binding.name))
+        {
+            log::warn!(
+                "wgpu-mc: {plan} bound a texture view in slot '{}' that this side has already \
+                 dropped (address {address:#x}, {} dropped view(s) remembered); a view at a reused \
+                 address is how one model ends up wearing another's texture",
+                binding.name,
+                crate::device::dead_view_count()
+            );
+        }
+        return;
+    }
+
+    // A live view: the label says which texture, at which mip range, this slot is actually reading.
+    // An address that is neither live nor dead is one wgpu made (the swapchain), so it has no label.
+    let label = crate::device::view_label(address)
+        .unwrap_or_else(|| format!("<unregistered view {address:#x}>"));
+    let mut bound = BOUND_VIEWS.lock();
+    if bound
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(format!("{plan}/{}/{label}", binding.name))
+    {
+        info!(
+            "wgpu-mc: {plan} sampled '{label}' in slot '{}'",
+            binding.name
+        );
+    }
 }
 
 fn call_sampler<'a>(
@@ -940,7 +1067,7 @@ fn bind_groups_for_call(
 
     let key = hasher.finish();
 
-    if crate::debug::trace_dynamic_offsets() {
+    if crate::debug::trace_dynamic_offsets() && trace_filter_matches(&plan.name) {
         trace_call(plan, call, alignment, key);
     }
 
@@ -1097,6 +1224,15 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
     // compiled pipeline alive for as long as any pass can draw with it.
     let pipeline = unsafe { &*call.pipeline };
 
+    // Diagnostics: one line per draw naming the texture every texture slot of this draw carries, in
+    // draw order. The deduplicated "sampled X in slot Y" report says which textures a pipeline *has*
+    // used; this says which one the draw that painted a given model used, which is the question a
+    // model wearing another model's skin asks. Gated on the binding-resolution switch, because it is
+    // a line per draw per texture slot.
+    if crate::debug::binding_verbosity() {
+        trace_draw_textures(pipeline, call);
+    }
+
     // Field borrows rather than methods: `set_bind_group` wants the pass mutably while the groups
     // are read from the same struct.
     let BlazeRenderPass {
@@ -1117,7 +1253,7 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
         // Diagnostics, and the only place a pipeline's name is touched on the draw path: the first
         // bind reports it and flips a flag on the pipeline, so every bind after that costs one
         // relaxed load. The pass trace is gated inside `trace_pipeline`.
-        if crate::debug::diagnostics() {
+        if crate::debug::logging() {
             log_pipeline_once(pipeline);
         }
 
@@ -1264,7 +1400,9 @@ fn binding_size(buffer: &wgpu::Buffer, range: &Range<BufferAddress>, min_size: O
 fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
     static LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    if LINES.fetch_add(1, Ordering::Relaxed) >= 300 {
+    // The cap is per run and generous, because the filter above is what keeps this readable: three
+    // hundred lines is not enough to reach the world when the trace covers a whole run.
+    if LINES.fetch_add(1, Ordering::Relaxed) >= 20_000 {
         return;
     }
 
