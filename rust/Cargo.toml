@@ -11,3 +11,13 @@ members = [
 # The vendored GLSL preprocessor is a workspace of its own with its own lock file, reached only
 # through the path dependency in `wgpu-mc-jni`, so it stays out of this one.
 exclude = ["cyntax"]
+
+[profile.release]
+# Line tables, and only line tables, in the PDB beside the library.
+#
+# A PIX timing capture resolves the functions in its CPU samples and callstacks through PDBs, and a
+# release build without this ships a PDB with no source files in it at all - so every frame from this
+# crate showed up as an address, and the capture's `FunctionInformation`, `SymbolStrings` and
+# `ModuleSymbols` tables came back empty. This costs nothing at runtime (the debug info lives in the
+# PDB, not in the code), adds no locals or types, and is what makes a capture readable.
+debug = "line-tables-only"

@@ -48,7 +48,19 @@ cyntax = { path = "../cyntax" }
 cbindgen = "0.29"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["windef", "libloaderapi", "winuser"] }
+# `processthreadsapi`, `securitybaseapi`, `winnt` and `handleapi` are for the one thing PIX's
+# timing capture needs that this side cannot check any other way: whether the process is elevated.
+# `GetTokenInformation(TokenElevation)` is the only honest answer, and the difference between "not
+# elevated" and "elevated and still refused" is the difference between a `gradlew --stop` and a bug.
+winapi = { version = "0.3.9", features = [
+    "windef",
+    "libloaderapi",
+    "winuser",
+    "processthreadsapi",
+    "securitybaseapi",
+    "winnt",
+    "handleapi",
+] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

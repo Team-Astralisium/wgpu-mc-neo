@@ -24,6 +24,15 @@ import java.util.function.Supplier
 private const val MAPPING_ALIGNMENT = 16
 
 /**
+ * Rounds [length] up to [MAPPING_ALIGNMENT].
+ *
+ * A buffer's size is what Minecraft asked for, which is not necessarily a multiple of the alignment
+ * a staging copy needs - see `mapBuffer`.
+ */
+private fun roundUpToAlignment(length: Long): Long =
+    (length + MAPPING_ALIGNMENT - 1) / MAPPING_ALIGNMENT * MAPPING_ALIGNMENT
+
+/**
  * Blaze3D's command encoder, forwarding to a `wgpu::CommandEncoder`.
  *
  * The three Blaze3D overloads of `createRenderPass` collapse onto one private helper, and the
@@ -214,16 +223,27 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
      */
     override fun mapBuffer(buffer: GpuBufferSlice, read: Boolean, write: Boolean): GpuBuffer.MappedView {
         val length = buffer.length()
-        val staging = MemoryUtil.memAlignedAlloc(MAPPING_ALIGNMENT, length.toInt())
-        val nativeBuffer = (buffer.buffer() as WgpuBuffer).nativeBuffer
-        val label = (buffer.buffer() as WgpuBuffer).label
+
+        // The staging buffer is rounded up, and the upload is the rounded size, because a buffer's
+        // size is whatever Minecraft asked for - which is not necessarily a multiple of wgpu's
+        // `COPY_BUFFER_ALIGNMENT`, and `Queue::write_buffer` refuses a size that is not. The cloud
+        // face buffer is 181,818 bytes, i.e. 181,816 in the middle and two bytes over the end of an
+        // alignment, so writing exactly what Blaze3D filled is a validation error - and a validation
+        // error ends the process here. The tail is this side's own memory and is zeroed, so the
+        // padding is zeroes rather than whatever the allocator handed back.
+        val upload = roundUpToAlignment(length)
+        val staging = MemoryUtil.memAlignedAlloc(MAPPING_ALIGNMENT, upload.toInt())
+        MemoryUtil.memSet(staging, 0)
+        val wgpuBuffer = buffer.buffer() as WgpuBuffer
+        val nativeBuffer = wgpuBuffer.nativeBuffer
+        val label = wgpuBuffer.label
         val renderer = device.renderer
 
         // Diagnostics: a staging buffer that is allocated and never freed is native memory the
         // garbage collector cannot see, which is exactly the shape of "the game asks for memory and
         // never gives it back". The totals say whether every allocation comes back.
         if (Diagnostics.isEnabled()) {
-            STAGING_ALLOCATED.addAndGet(length)
+            STAGING_ALLOCATED.addAndGet(upload)
             STAGING_OPEN.incrementAndGet()
             if (STAGING_OPEN.get() > STAGING_HIGH_WATER.get()) {
                 STAGING_HIGH_WATER.set(STAGING_OPEN.get())
@@ -254,20 +274,31 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
                 try {
                     if (write) {
                         if (Diagnostics.isEnabled()) {
-                            reportMappedWrite(label, staging, length)
+                            reportMappedWrite(wgpuBuffer, staging, length)
                         }
                         WmNative.writeToBuffer.invokeExact(
                             renderer,
                             nativeBuffer,
                             buffer.offset(),
-                            length,
+                            upload,
                             MemorySegment.ofAddress(MemoryUtil.memAddress0(staging)),
                         ) as Unit
+
+                        // How much of the staging buffer Blaze3D actually filled. It stays at 0 when
+                        // the writer used absolute puts, which is why it is only ever used to
+                        // *shrink* what the checks below look at - never to decide that nothing was
+                        // written.
+                        val written = staging.position().toLong()
+                        wgpuBuffer.lastMappedWrite = written
+
+                        if (Diagnostics.isEnabled()) {
+                            verifyMappedWrite(wgpuBuffer, buffer.offset(), staging, length, written)
+                        }
                     }
                 } finally {
                     MemoryUtil.memAlignedFree(staging)
                     if (Diagnostics.isEnabled()) {
-                        STAGING_FREED.addAndGet(length)
+                        STAGING_FREED.addAndGet(upload)
                         STAGING_OPEN.decrementAndGet()
                         reportStaging("free")
                     }
@@ -286,17 +317,14 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
      * way, and "the clouds are drawn with the sun's worth of faces but all of them in the player's
      * own cell" is a question about these bytes.
      */
-    private fun reportMappedWrite(label: String, staging: ByteBuffer, length: Long) {
-        if (!label.startsWith("Cloud")) {
+    private fun reportMappedWrite(buffer: WgpuBuffer, staging: ByteBuffer, length: Long) {
+        if (!buffer.label.startsWith("Cloud")) {
             return
         }
 
-        val now = System.nanoTime()
-        val last = MAPPED_WRITES[label] ?: 0L
-        if (now - last < 1_000_000_000L) {
+        if (!throttle(buffer.label)) {
             return
         }
-        MAPPED_WRITES[label] = now
 
         val segment = MemorySegment.ofAddress(MemoryUtil.memAddress0(staging)).reinterpret(length)
         val ints = StringBuilder()
@@ -307,14 +335,272 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         }
 
         dev.birb.wgpu.WgpuMcMod.LOGGER.info(
-            "wgpu: mapped write to {} ({} bytes), first {} ints: {}",
-            label, length, offset / 4, ints.toString().trim(),
+            "wgpu: mapped write to {} ({} bytes, {} of them written) via {}, blaze usage {}, wgpu usage {}; first {} ints: {}",
+            buffer.label, length, staging.position(), buffer.origin,
+            describeBlazeUsage(buffer.usage()), describeWgpuUsage(buffer),
+            offset / 4, ints.toString().trim(),
         )
     }
 
+    /**
+     * Diagnostics: whether the bytes a mapped write handed to the GPU are actually in the buffer.
+     *
+     * This is a self-check rather than a curiosity. A mapped write is `write_to_buffer`, which wgpu
+     * only allows on a buffer created with `COPY_DST` - and Minecraft creates the buffers it maps
+     * itself *without* it (`GpuBuffer.USAGE_MAP_WRITE` alone), so the upload was rejected and the
+     * face buffer stayed as it was created. Nothing said so: the vertices were drawn, from zeroed
+     * data, and the whole cloud layer was one square above the player. Reading the bytes back and
+     * comparing them with what was sent turns that into a log line.
+     *
+     * The whole written range is compared, not a prefix of it: a mesh that arrives with its second
+     * half missing is still "the first bytes arrived", and the second half is what draws the rest of
+     * the layer. The non-zero counts on both sides are what tell a short mesh apart from a mesh of
+     * zeroes, and the usage flags are what tell a buffer that cannot receive the write at all from
+     * one that received it wrong.
+     */
+    private fun verifyMappedWrite(
+        buffer: WgpuBuffer,
+        offset: Long,
+        staging: ByteBuffer,
+        length: Long,
+        written: Long,
+    ) {
+        if (!buffer.label.startsWith("Cloud") || !throttle("${buffer.label} (read back)")) {
+            return
+        }
+
+        // The range Blaze3D filled, when it says how much it filled; the whole slice otherwise.
+        // Bounded so that a buffer that is mapped whole and filled with a mesh stays a readback and
+        // not a hitch.
+        val probe = (if (written in 1..length) written else length).coerceAtMost(MAX_VERIFY_BYTES).toInt()
+        if (probe <= 0) {
+            return
+        }
+
+        val readBack = ByteBuffer.allocateDirect(probe)
+        val read = WmNative.readBuffer.invokeExact(
+            device.renderer,
+            buffer.nativeBuffer,
+            offset,
+            probe.toLong(),
+            MemorySegment.ofBuffer(readBack),
+        ) as Boolean
+
+        if (!read) {
+            dev.birb.wgpu.WgpuMcMod.LOGGER.warn("wgpu: could not read {} back after a mapped write", buffer.label)
+            return
+        }
+
+        val sent = MemorySegment.ofAddress(MemoryUtil.memAddress0(staging)).reinterpret(probe.toLong())
+        val got = MemorySegment.ofBuffer(readBack)
+        val mismatch = sent.asSlice(0, probe.toLong()).mismatch(got.asSlice(0, probe.toLong()))
+
+        if (mismatch < 0) {
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: all {} written bytes arrived in {} ({} of them non-zero); created via {}, blaze usage {}, wgpu usage {}",
+                probe, buffer.label, countNonZero(sent, probe), buffer.origin,
+                describeBlazeUsage(buffer.usage()), describeWgpuUsage(buffer),
+            )
+        } else {
+            dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                "wgpu: the bytes written to {} did not arrive: first difference at byte {} of {}; sent [{}] ({} non-zero), read back [{}] ({} non-zero); created via {}, blaze usage {}, wgpu usage {}",
+                buffer.label, mismatch, probe,
+                describe(sent, probe), countNonZero(sent, probe),
+                describe(got, probe), countNonZero(got, probe),
+                buffer.origin, describeBlazeUsage(buffer.usage()), describeWgpuUsage(buffer),
+            )
+        }
+
+        // A texel buffer holds faces rather than floats, so the bytes can be read as what the shader
+        // will make of them. This is the line that says whether the mesh the draws are about to read
+        // is a cloud layer or ten thousand copies of the same cell - the two look identical in a
+        // screenshot, and "one square of cloud above the player's head" is what the second one
+        // looks like.
+        if (buffer.usage() and GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER != 0) {
+            reportCloudMesh(buffer, got, if (written in 1..length) written.toInt() else probe)
+        }
+    }
+
+    /**
+     * Diagnostics: the faces a texel buffer holds, decoded the way `rendertype_clouds.vsh` decodes
+     * them.
+     *
+     * `CloudRenderer#encodeFace` writes three bytes per face - the cell's x and z halved, then the
+     * direction with the halved bit of each coordinate and two flags packed above it - and the
+     * shader rebuilds a cell coordinate by shifting the byte up and or-ing the packed bit back in.
+     * Reading the buffer back through that same decode is what tells a mesh of real cells apart from
+     * one whose faces all decode to cell (0, 0), which is a layer drawn as a single square above the
+     * player.
+     */
+    private fun reportCloudMesh(buffer: WgpuBuffer, bytes: MemorySegment, length: Int) {
+        val faces = length / 3
+        if (faces <= 0) {
+            return
+        }
+
+        var minX = Int.MAX_VALUE
+        var maxX = Int.MIN_VALUE
+        var minZ = Int.MAX_VALUE
+        var maxZ = Int.MIN_VALUE
+        var outOfRange = 0
+        var inside = 0
+        val directions = IntArray(6)
+        val first = StringBuilder()
+
+        for (face in 0 until faces) {
+            val cellXByte = bytes.get(java.lang.foreign.ValueLayout.JAVA_BYTE, (face * 3).toLong()).toInt()
+            val cellZByte = bytes.get(java.lang.foreign.ValueLayout.JAVA_BYTE, (face * 3 + 1).toLong()).toInt()
+            val flags = bytes.get(java.lang.foreign.ValueLayout.JAVA_BYTE, (face * 3 + 2).toLong()).toInt()
+
+            val cellX = (cellXByte shl 1) or ((flags and 0x80) shr 7)
+            val cellZ = (cellZByte shl 1) or ((flags and 0x40) shr 6)
+            val direction = flags and 7
+
+            minX = minOf(minX, cellX)
+            maxX = maxOf(maxX, cellX)
+            minZ = minOf(minZ, cellZ)
+            maxZ = maxOf(maxZ, cellZ)
+            if (direction in 0..5) {
+                directions[direction]++
+            }
+            if (kotlin.math.abs(cellX) > MAX_CLOUD_CELL || kotlin.math.abs(cellZ) > MAX_CLOUD_CELL) {
+                outOfRange++
+            }
+            if (flags and 16 != 0) {
+                inside++
+            }
+
+            if (face < 4) {
+                first.append('[').append(cellX).append(',').append(cellZ).append(' ')
+                    .append(CLOUD_DIRECTIONS.getOrElse(direction) { "dir$direction" })
+                    .append(if (flags and 16 != 0) " inside" else "")
+                    .append(if (flags and 32 != 0) " top" else "")
+                    .append("] ")
+            }
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+            "wgpu: {} holds {} faces: x {}..{}, z {}..{}, {} beyond {} cells, {} marked inside; directions {}; first {}",
+            buffer.label, faces, minX, maxX, minZ, maxZ, outOfRange, MAX_CLOUD_CELL, inside,
+            CLOUD_DIRECTIONS.mapIndexed { index, name -> "$name=${directions[index]}" }.joinToString(" "),
+            first.toString().trim(),
+        )
+    }
+
+    /** The first few bytes of a segment, for a log line. */
+    private fun describe(segment: MemorySegment, length: Int): String {
+        val text = StringBuilder()
+        var offset = 0L
+        while (offset + 4 <= length) {
+            text.append(segment.get(java.lang.foreign.ValueLayout.JAVA_INT, offset)).append(' ')
+            offset += 4
+        }
+        return text.toString().trim()
+    }
+
+    /** How many bytes of [segment] are not zero, which is what a mesh of zeroes fails. */
+    private fun countNonZero(segment: MemorySegment, length: Int): Int {
+        var count = 0
+        for (i in 0 until length) {
+            if (segment.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i.toLong()) != 0.toByte()) {
+                count++
+            }
+        }
+        return count
+    }
+
+    /**
+     * Diagnostics: the wgpu usage flags a buffer carries, named.
+     *
+     * The JVM side asks the native side because the mask is not the one it passed: a mapped buffer
+     * gains `COPY_DST` and a texel buffer becomes `STORAGE`. A bind group that wants `STORAGE` on a
+     * buffer without it is a wgpu validation error, and a validation error ends the process - so
+     * this is the line that says which of the three creation paths built what.
+     */
+    private fun describeWgpuUsage(buffer: WgpuBuffer): String {
+        val bits = try {
+            buffer.wgpuUsages()
+        } catch (error: Throwable) {
+            return "unavailable ($error)"
+        }
+
+        val names = ArrayList<String>()
+        for ((bit, name) in WGPU_USAGE_NAMES) {
+            if (bits and bit != 0L) {
+                names.add(name)
+            }
+        }
+
+        return if (names.isEmpty()) "0x${bits.toString(16)}" else names.joinToString("|")
+    }
+
+    /** Diagnostics: Blaze3D's own usage mask, named. */
+    private fun describeBlazeUsage(usage: Int): String {
+        val names = ArrayList<String>()
+        for ((bit, name) in BLAZE_USAGE_NAMES) {
+            if (usage and bit != 0) {
+                names.add(name)
+            }
+        }
+        return if (names.isEmpty()) usage.toString() else names.joinToString("|")
+    }
+
+    /** Whether a diagnostic line about [label] is due, so the log stays readable. */
+    private fun throttle(label: String): Boolean {
+        val now = System.nanoTime()
+        val last = MAPPED_WRITES[label] ?: 0L
+        if (now - last < 1_000_000_000L) {
+            return false
+        }
+        MAPPED_WRITES[label] = now
+        return true
+    }
+
     private companion object {
+        /** The most bytes a diagnostic readback will compare, so a big buffer stays a log line. */
+        const val MAX_VERIFY_BYTES = 1L shl 20
+
+        /**
+         * The furthest cell a cloud face can name.
+         *
+         * `CloudRenderer` builds its mesh out to the cloud range, 1024 blocks or 86 cells by default,
+         * so a face naming a cell beyond that is a face the shader will place outside the layer - the
+         * shape a decode that drops the sign takes.
+         */
+        const val MAX_CLOUD_CELL = 120
+
+        /** `Direction#get3DDataValue` order, which is the order the shader's face arrays use. */
+        val CLOUD_DIRECTIONS = listOf("down", "up", "north", "south", "west", "east")
+
         /** When each mapped write was last reported, so the log stays readable. */
         val MAPPED_WRITES = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+        /** wgpu's `BufferUsages` bits, see `wgpu_buffer_usages` on the native side. */
+        val WGPU_USAGE_NAMES = listOf(
+            1L to "MAP_READ",
+            2L to "MAP_WRITE",
+            4L to "COPY_SRC",
+            8L to "COPY_DST",
+            16L to "INDEX",
+            32L to "VERTEX",
+            64L to "UNIFORM",
+            128L to "STORAGE",
+            256L to "INDIRECT",
+            512L to "QUERY_RESOLVE",
+        )
+
+        /** Blaze3D's `GpuBuffer` usage bits. */
+        val BLAZE_USAGE_NAMES = listOf(
+            GpuBuffer.USAGE_MAP_READ to "MAP_READ",
+            GpuBuffer.USAGE_MAP_WRITE to "MAP_WRITE",
+            GpuBuffer.USAGE_HINT_CLIENT_STORAGE to "HINT_CLIENT_STORAGE",
+            GpuBuffer.USAGE_COPY_DST to "COPY_DST",
+            GpuBuffer.USAGE_COPY_SRC to "COPY_SRC",
+            GpuBuffer.USAGE_VERTEX to "VERTEX",
+            GpuBuffer.USAGE_INDEX to "INDEX",
+            GpuBuffer.USAGE_UNIFORM to "UNIFORM",
+            GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER to "UNIFORM_TEXEL_BUFFER",
+        )
 
         /** Mapped-write staging: how much was allocated, freed, and is open right now. */
         private val STAGING_ALLOCATED = java.util.concurrent.atomic.AtomicLong()

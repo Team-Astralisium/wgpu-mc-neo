@@ -35,6 +35,21 @@ class WidgetRenderer(private val context: GuiGraphicsExtractor) {
         context.fill(x1, y1, x2, y2, applyAlpha(color))
     }
 
+    /**
+     * Clips everything drawn until [disableScissor] to the given rectangle.
+     *
+     * 26.1 records the rectangle with each element it extracts and the GUI renderer sorts by it, so
+     * this is a real clip rather than a promise: it is what lets a box that is too tall for the space
+     * it is allowed to fill be cut off instead of drawn over what is below it.
+     */
+    fun enableScissor(x1: Int, y1: Int, x2: Int, y2: Int) {
+        context.enableScissor(x1, y1, x2, y2)
+    }
+
+    fun disableScissor() {
+        context.disableScissor()
+    }
+
     fun text(text: String, x: Int, y: Int, color: Int) {
         context.text(font(), text, x, y, applyAlpha(color), false)
     }

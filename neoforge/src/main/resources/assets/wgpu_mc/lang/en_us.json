@@ -22,5 +22,5 @@
   "wgpu_mc.option.trace_dynamic_offsets": "Trace dynamic offsets",
   "wgpu_mc.option.dump_shaders": "Dump shaders",
   "wgpu_mc.option.gpu_timestamps": "GPU timestamps",
-  "wgpu_mc.option.pix_capture": "PIX capture"
+  "wgpu_mc.option.pix_capture": "PIX capture support"
 }

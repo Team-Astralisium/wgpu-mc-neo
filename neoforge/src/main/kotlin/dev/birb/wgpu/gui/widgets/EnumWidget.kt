@@ -21,10 +21,6 @@ class EnumWidget<T : Enum<T>>(x: Int, y: Int, width: Int, private val option: En
             val direction = if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) 1 else -1
             option.set(option.cycle(direction))
 
-            previousValueName = valueName
-            valueName = option.formatter.apply(option.get())
-            animation = 0.0
-
             playClickSound()
             return true
         }
@@ -32,6 +28,16 @@ class EnumWidget<T : Enum<T>>(x: Int, y: Int, width: Int, private val option: En
     }
 
     override fun render(renderer: WidgetRenderer, mouseX: Int, mouseY: Int, delta: Float) {
+        // The label follows the value rather than the click, because the value can change without
+        // one: applying another row can move this one (a graphics preset sets a dozen options), and
+        // a cached label would then keep showing the setting the game no longer has.
+        val currentName = option.formatter.apply(option.get())
+        if (currentName != valueName) {
+            previousValueName = valueName
+            valueName = currentName
+            animation = 0.0
+        }
+
         animation = Mth.clamp(animation + delta * 6.0, 0.0, 1.0)
 
         // Background

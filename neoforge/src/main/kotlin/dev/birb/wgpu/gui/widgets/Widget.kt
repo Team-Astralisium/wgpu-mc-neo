@@ -60,7 +60,6 @@ abstract class Widget(x: Int, y: Int, var width: Int, var height: Int) {
     }
 
     companion object {
-        const val OPTION_WIDTH = 200
         const val DEFAULT_HEIGHT = 21
 
         @JvmField

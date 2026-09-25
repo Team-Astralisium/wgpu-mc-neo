@@ -44,16 +44,25 @@ class IntWidget(x: Int, y: Int, width: Int, private val option: IntOption) :
     }
 
     private fun calculateValue(mouseX: Int) {
-        var w = width / 2
-        var mouseX = mouseX - x - w
-        w -= 6
+        val fraction = fractionAt(mouseX)
 
-        if (mouseX < 0) option.set(option.min)
-        else if (mouseX > w) option.set(option.max)
-        else {
-            val value = mouseX.toDouble() / w * (option.max - option.min) + option.min
-            option.set((Math.round(value / option.step) * option.step).toInt())
+        // A setting that knows its own slider is asked through it, because only it knows the values
+        // it accepts: asking for one it rejects is not a value that gets clamped, it is a value that
+        // gets logged and thrown away - see `IntSlider`.
+        val slider = option.slider
+        if (slider != null) {
+            option.set(slider.at(fraction))
+            return
         }
+
+        val value = fraction * (option.max - option.min) + option.min
+        option.set((Math.round(value / option.step) * option.step).toInt())
+    }
+
+    /** Where in the track a mouse position is, as 0..1. The track is the value half of the row. */
+    private fun fractionAt(mouseX: Int): Double {
+        val track = (width / 2 - 6).coerceAtLeast(1)
+        return ((mouseX - x - width / 2).toDouble() / track).coerceIn(0.0, 1.0)
     }
 
     override fun render(renderer: WidgetRenderer, mouseX: Int, mouseY: Int, delta: Float) {
@@ -88,7 +97,13 @@ class IntWidget(x: Int, y: Int, width: Int, private val option: IntOption) :
     }
 
     private fun getHandleX(): Int {
-        val delta = (option.get() - option.min).toDouble() / (option.max - option.min)
+        val slider = option.slider
+        val delta = if (slider != null) {
+            slider.fraction(option.get())
+        } else {
+            (option.get() - option.min).toDouble() / (option.max - option.min)
+        }
+
         return (delta * (width / 2 - 6)).toInt() - 1
     }
 }

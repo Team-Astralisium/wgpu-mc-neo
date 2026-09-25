@@ -16,7 +16,13 @@ class IntOption(
     val min: Int,
     val max: Int,
     val step: Int = 1,
-    formatter: Function<Int, Component> = STANDARD_FORMATTER
+    formatter: Function<Int, Component> = STANDARD_FORMATTER,
+    /**
+     * The values the setting accepts, when something else owns them - a vanilla option does, and its
+     * range and step are not the ones this side would guess. `null` leaves the slider on [min],
+     * [max] and [step], which is all a setting this mod owns needs.
+     */
+    val slider: IntSlider? = null
 ) : Option<Int>(name, tooltip, requiresRestart, getter, setter) {
 
     val formatter: Function<Int, Component> = formatter
@@ -57,7 +63,8 @@ class IntOption(
                 min,
                 max,
                 step,
-                formatter
+                formatter,
+                slider
             )
         }
     }

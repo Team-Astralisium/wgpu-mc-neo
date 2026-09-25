@@ -77,6 +77,10 @@ class OptionPageScreen(private val parent: Screen) :
         val bottom = buttonRowY - 4
         val contentHeight = layoutHeight(top)
 
+        // The tooltip is confined to the same band the rows live in: it explains a row, so it must
+        // not be the thing that covers the Apply button or runs off the bottom of the window.
+        tooltipWidget.confineTo(alignX(x), top, alignX(optimalWidth - 8), bottom)
+
         maxScroll = maxOf(0, contentHeight - bottom)
         scroll = scroll.coerceIn(0, maxScroll)
 
@@ -148,7 +152,7 @@ class OptionPageScreen(private val parent: Screen) :
             y += add(TabWidget(alignX(x), y, page) { page == currentPage }).height
         }
 
-        tooltipWidget = add(TooltipWidget(0, 0) { hoveredOption })
+        tooltipWidget = add(TooltipWidget { hoveredOption })
 
         x = optimalWidth - 8
         y = height - 8 - Widget.DEFAULT_HEIGHT
@@ -165,6 +169,7 @@ class OptionPageScreen(private val parent: Screen) :
             {
                 if (pages.isChanged()) {
                     pages.apply()
+                    saveVanillaOptions()
                 } else {
                     onClose()
                 }
@@ -217,8 +222,11 @@ class OptionPageScreen(private val parent: Screen) :
         val optionWidget = getHoveredOptionWidget(mouseX, mouseY)
         if (optionWidget is IOptionWidget) {
             hoveredOption = optionWidget.getOption()
-            tooltipWidget.setPosition(optionWidget.x, optionWidget.y + optionWidget.height)
-            tooltipWidget.width = optionWidget.width
+
+            // The tooltip sizes and places itself from the row's rectangle and the region it was
+            // confined to: it is drawn under the row where there is room for it and over it where
+            // there is not, so a row near the bottom of the list still shows a whole description.
+            tooltipWidget.anchorTo(optionWidget)
         } else {
             hoveredOption = null
         }
@@ -341,6 +349,27 @@ class OptionPageScreen(private val parent: Screen) :
 
     override fun onClose() {
         Minecraft.getInstance().setScreen(parent)
+    }
+
+    /**
+     * Writes the vanilla options to `options.txt`, which is what the screen they replace does.
+     *
+     * `OptionsSubScreen#removed` calls `Options#save`, and this screen is reached through a mixin
+     * instead of by replacing that class - so nothing saved them. A value changed here lived only in
+     * memory until the game exited cleanly, and a launch that ended any other way (a crash, a killed
+     * process, which is how this renderer is usually restarted) came back with the old value, as if
+     * the change had never been made.
+     *
+     * Called on apply and on close, because those are the two moments the player believes the change
+     * has been committed.
+     */
+    private fun saveVanillaOptions() {
+        Minecraft.getInstance().options.save()
+    }
+
+    override fun removed() {
+        saveVanillaOptions()
+        super.removed()
     }
 }
 

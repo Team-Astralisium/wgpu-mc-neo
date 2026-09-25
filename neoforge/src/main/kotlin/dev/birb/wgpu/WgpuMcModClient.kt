@@ -23,6 +23,19 @@ class WgpuMcModClient(modEventBus: IEventBus) {
 				WgpuNative.getClassLoader()
 				WgpuNative.sendRunDirectory(FMLPaths.GAMEDIR.get().toAbsolutePath().normalize().toString())
 				WgpuNative.setPanicHook()
+
+				// The renderer reads its config during mod construction, which is before
+				// `setPanicHook` installs `env_logger` - so everything it says while loading it is
+				// dropped, and that is both the settings themselves and the warning that a
+				// malformed file was replaced by the defaults. Reading the same document back here
+				// is what makes "my setting did not survive the restart" answerable from the log
+				// instead of from the config file by hand. They live in
+				// `config/wgpu-mc-renderer.json`, next to the game directory.
+				WgpuMcMod.LOGGER.info(
+					"wgpu-mc renderer settings as loaded: {}",
+					WgpuNative.getSettings(),
+				)
+
 				WgpuMcMod.LOGGER.info("wgpu-mc native bridge initialized")
 			} catch (throwable: Throwable) {
 				WgpuMcMod.LOGGER.error("Failed to initialize wgpu-mc native bridge", throwable)

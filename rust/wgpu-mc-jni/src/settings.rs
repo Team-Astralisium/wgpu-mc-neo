@@ -163,14 +163,41 @@ lazy_static! {
             false,
         ),
         pix_capture: SettingInfo::debug(
-            "Ask PIX for a timing capture, written next to the game as `wgpu-mc-capture-N.wpix` and \
-            stopped when this is switched off again. It is the documented `PIXBeginCapture` timing \
-            capture, so it needs the PIX tooling on the machine: the WinPixEventRuntime beside the \
-            game (or on `PATH`), and PIX itself to open the result. Without it the switch logs what \
-            is missing and nothing else happens. This is a programmatic capture, so it records from \
-            the moment it is switched on - a few frames of a world are usually enough, and the file \
-            is finished when the switch goes back off.",
-            false,
+            "Load PIX's capture libraries into the game and let PIX inspect it: \
+            `WinPixGpuCapturer.dll`, so PIX can attach for a GPU capture at all, and \
+            `WinPixTimingCapturer.dll`, which programmatic timing captures run through. Both are \
+            loaded from the newest PIX installation on the machine, before the D3D12 device is \
+            created - which is why this needs a restart: a process that loads the GPU capturer \
+            after its device exists is one PIX refuses to attach to. With it on, the game can be \
+            attached to from PIX (or launched through it), and switching this off and on again \
+            while it runs takes a `wgpu-mc-capture-N.wpix` timing capture of 600 frames. That \
+            capture records through ETW providers, and only an elevated process may create sessions \
+            for them, so the game itself has to run as an administrator - starting `gradlew` from an \
+            administrator terminal is not enough, because Gradle reuses a daemon started without \
+            elevation and the game, forked by that daemon, inherits its token: run `gradlew --stop` \
+            first, or pass `--no-daemon`. Without it the capture is refused with E_ACCESSDENIED, and \
+            the log says whether the process was elevated. A capture holds everything the capture \
+            API can be asked for: GPU timing, CPU samples with call stacks at 4 kHz, and the memory \
+            events - file IO, VirtualAlloc, HeapAlloc, custom allocator and page faults - whose \
+            tables (`MemoryEventRanges`, `MemoryPairing`, `PageFaults`, `FileIORange`) are empty \
+            without them. That is also what makes a capture big and slow: 1.7 to 2.7 GB for 600 \
+            frames rather than a few hundred megabytes, and the frame rate during a capture drops to \
+            a few frames per second while those events are recorded. Function names come from a PDB \
+            the build writes beside the library (`rust/Cargo.toml` asks for line tables), which PIX \
+            reads when it opens the capture - without it every native frame in the capture is an \
+            address and its function information stays empty. `GPU resources`/API objects, memory \
+            access sampling and kernel image information are options only PIX's own timing-capture \
+            dialog has: they are not fields of the API's parameter struct, so a capture with them is \
+            one taken from PIX's UI, which is what the loaded GPU capturer makes possible. \
+            RivaTuner Statistics Server - MSI Afterburner's on-screen display - hooks D3D12 as well, \
+            and with its `RTSSHooks64.dll` in the process the game crashes inside RTSS's own present \
+            hook once these libraries are loaded, capture or no capture: the log says so, PIX's \
+            libraries are left unloaded in that case, and a `wgpu-pix-with-rtss` file next to the \
+            game overrules that. An RTSS profile for the `java.exe` the game runs as, with \
+            Application detection level `None`, is what makes the switch work with RTSS installed. \
+            Nothing happens at all on a machine without PIX: the log says which library was \
+            missing.",
+            true,
         ),
     };
     pub static ref SETTINGS_INFO_JSON: String = serde_json::to_string(&*SETTINGS_INFO).unwrap();
@@ -620,6 +647,62 @@ mod tests {
         assert!(info["vsync"].get("section").is_none());
     }
 
+    /// The options screen, pulled in for the one part of it that is a contract with this side: how
+    /// it decides that a page holds the renderer's settings.
+    ///
+    /// No compiler checks that. `Page.name` is a `Component`, so comparing it to a literal is legal
+    /// Kotlin and stays legal when the label moves into a language file - which is what happened:
+    ///
+    /// ```kotlin
+    /// if (name.string == "Electrum") { … sendSettings(…) … }
+    /// ```
+    ///
+    /// The page is called `Neolectrum` in every language, so the comparison stopped matching, the
+    /// page applied itself to variables only the screen could see, and no setting on it was sent to
+    /// the renderer or written to the config - a restart then put every one of them back. A page is
+    /// found by what its rows hold now, and the checks below are the text of that: this is a review
+    /// that cannot be forgotten rather than a test of behaviour.
+    const OPTION_PAGES: &str =
+        include_str!("../../../neoforge/src/main/kotlin/dev/birb/wgpu/gui/OptionPages.kt");
+
+    #[test]
+    fn the_renderer_settings_page_is_not_found_by_its_label() {
+        // Comments are dropped, because both this file and `OptionPages.kt` quote the mistake on
+        // purpose - the quote is what says what not to do again.
+        let source = code_of(OPTION_PAGES);
+
+        // The mistake was a *comparison*: `name.string == "Electrum"` decided which page owned the
+        // renderer's settings. Reading a label to print it is fine - the apply log names the rows it
+        // applied that way - so this looks for a comparison rather than for the field.
+        assert!(
+            !source.contains("name.string ==") && !source.contains("name.string !="),
+            "a page must be identified by the settings its rows carry, not by its translated label"
+        );
+
+        assert!(
+            source.contains("it.setting != null"),
+            "the page holding the renderer's settings is the one whose rows carry a setting name"
+        );
+
+        assert!(
+            source.contains("WgpuNative.sendSettings("),
+            "and it is the page that hands them to the renderer, which is what persists them"
+        );
+    }
+
+    /// Kotlin source with its comment lines removed, one per line so that a quoted mistake in a
+    /// comment is not read as the mistake itself.
+    fn code_of(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                !(line.starts_with("//") || line.starts_with('*') || line.starts_with("/*"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The language files, pulled in so that editing one of them re-runs these tests.
     ///
     /// The options screen builds every key it asks for out of a setting's name - `wgpu_mc.option.`
@@ -702,12 +785,17 @@ mod tests {
     #[test]
     fn only_gpu_based_validation_needs_a_restart() {        let info: serde_json::Value = serde_json::from_str(&SETTINGS_INFO_JSON).expect("schema");
 
-        // It is an instance flag, and the instance is created once. The rest are read on the draw
-        // path, so applying them takes effect on the next frame.
-        assert_eq!(
-            info["gpu_based_validation"]["needs_restart"],
-            serde_json::Value::Bool(true)
-        );
+        // Two of them are decided while the device is being created and cannot be revisited: the
+        // instance flag, and PIX's capturers, which have to be in the process before the first
+        // D3D12 call. The rest are read on the draw path, so applying them takes effect on the next
+        // frame.
+        for name in ["gpu_based_validation", "pix_capture"] {
+            assert_eq!(
+                info[name]["needs_restart"],
+                serde_json::Value::Bool(true),
+                "{name} is decided while the device is created"
+            );
+        }
 
         for name in [
             "diagnostics",
@@ -716,7 +804,6 @@ mod tests {
             "trace_dynamic_offsets",
             "dump_shaders",
             "gpu_timestamps",
-            "pix_capture",
         ] {
             assert_eq!(
                 info[name]["needs_restart"],

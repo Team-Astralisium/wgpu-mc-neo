@@ -454,6 +454,16 @@ object WmNative {
     @JvmField val allocateGpuBufferMapped: MethodHandle =
         handle("allocate_gpu_buffer_mapped", FunctionDescriptor.of(PTR, PTR, LONG, LONG))
 
+    /**
+     * The wgpu usage flags a buffer was created with, as raw bits.
+     *
+     * Blaze3D's usage mask is not the mask wgpu sees - `USAGE_UNIFORM_TEXEL_BUFFER` becomes
+     * `STORAGE` and a mapped buffer gains `COPY_DST` - so a log line that says which flags a buffer
+     * actually carries is the only way to answer "why does this draw read nothing" from the JVM.
+     */
+    @JvmField val bufferUsages: MethodHandle =
+        handle("buffer_usages", FunctionDescriptor.of(LONG, PTR))
+
     @JvmField val writeToBuffer: MethodHandle =
         handle("write_to_buffer", FunctionDescriptor.ofVoid(PTR, PTR, LONG, LONG, PTR))
 

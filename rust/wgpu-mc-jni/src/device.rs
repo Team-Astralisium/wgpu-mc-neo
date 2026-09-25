@@ -547,6 +547,11 @@ fn try_create_renderer(
     display: u64,
     window: u64,
 ) -> Option<WmRenderer> {
+    // Before the instance, and therefore before any D3D12 object exists: PIX's GPU capturer hooks
+    // D3D12 as it is loaded, and a process that loads it after the device exists is one PIX refuses
+    // to attach to. The switch is read here rather than on the draw path because this is a one-off.
+    crate::pix::load_capturers(crate::debug::pix_capture());
+
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu_backends(backend),
         flags: instance_flags(),
@@ -1013,6 +1018,61 @@ pub extern "C" fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &
     crate::blaze::draw_call(wm, pass, call);
 }
 
+/// The wgpu usage flags a Blaze3D usage mask asks for.
+///
+/// Every buffer this side creates goes through here, because a usage that only one entry point
+/// derives is a usage that only one entry point has. `create_buffer_init` was missing the texel
+/// buffer translation and `allocate_gpu_buffer_mapped` ignored the mask it was handed entirely, so
+/// the same Minecraft usage mask produced three different wgpu buffers depending on which call
+/// vanilla happened to make - and a bind group built for one of them is a validation error, which
+/// ends the process here.
+///
+/// Two of the bits are not a straight translation:
+///
+/// - `COPY_DST` is set for everything Minecraft uploads into *and* for everything it maps itself,
+///   because both arrive at [`write_to_buffer`] - which is `Queue::write_buffer`, a copy from the
+///   CPU, and wgpu refuses that on a buffer without this usage. Vanilla asks for `USAGE_COPY_DST` on
+///   the buffers it uploads into, but a mapped buffer only asks for `USAGE_MAP_WRITE`:
+///   `CloudRenderer`'s face buffer is `USAGE_MAP_WRITE | USAGE_UNIFORM_TEXEL_BUFFER`, so the faces
+///   were written on the CPU, never copied to the GPU, and the shader read the zeroes the buffer was
+///   created with. Every face decoded to cell (0, 0) facing down - which is one square of cloud
+///   above the player's head that drifts with the cloud offset and snaps back, with no cloud layer
+///   anywhere else.
+/// - `USAGE_UNIFORM_TEXEL_BUFFER` becomes `STORAGE`: the shaders that read a texel buffer go through
+///   the SSBO shim in `preprocessing.rs`, so that is the usage the bind group asks for.
+pub fn wgpu_buffer_usages(usage: u32) -> wgpu::BufferUsages {
+    let mut flags = wgpu::BufferUsages::empty();
+    flags.set(wgpu::BufferUsages::MAP_READ, usage & 1 != 0);
+    flags.set(wgpu::BufferUsages::MAP_WRITE, usage & 2 != 0);
+    flags.set(
+        wgpu::BufferUsages::COPY_DST,
+        usage & 8 != 0 || usage & 2 != 0,
+    );
+    flags.set(wgpu::BufferUsages::COPY_SRC, usage & 16 != 0);
+    flags.set(wgpu::BufferUsages::VERTEX, usage & 32 != 0);
+    flags.set(wgpu::BufferUsages::INDEX, usage & 64 != 0);
+    flags.set(wgpu::BufferUsages::UNIFORM, usage & 128 != 0);
+    flags.set(wgpu::BufferUsages::STORAGE, usage & 256 != 0);
+
+    // Readable back for diagnostics, the same way `create_texture` always is. Only for buffers that
+    // cannot be mapped: wgpu rejects `MAP_READ | COPY_SRC` outright, and a mappable buffer needs no
+    // help being read.
+    if usage & 1 == 0 {
+        flags.insert(wgpu::BufferUsages::COPY_SRC);
+    }
+
+    flags
+}
+
+/// The wgpu usage flags a buffer was created with, as raw bits, for diagnostics.
+///
+/// A log line saying a bind group wanted `STORAGE` and the buffer only has `MAP_WRITE` is the whole
+/// answer to "why does this draw read nothing", and the JVM side cannot see the flags it derived.
+#[unsafe(no_mangle)]
+pub extern "C" fn buffer_usages(buffer: &wgpu::Buffer) -> u64 {
+    buffer.usage().bits() as u64
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn create_buffer(
     wm: &WmRenderer,
@@ -1022,22 +1082,7 @@ pub extern "C" fn create_buffer(
 ) -> Box<wgpu::Buffer> {
     let label = unsafe { CStr::from_ptr(label) };
 
-    let mut wgpu_usage_flags = wgpu::BufferUsages::empty();
-    wgpu_usage_flags.set(wgpu::BufferUsages::MAP_READ, usage & 1 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::MAP_WRITE, usage & 2 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::COPY_DST, usage & 8 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::COPY_SRC, usage & 16 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::VERTEX, usage & 32 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::INDEX, usage & 64 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::UNIFORM, usage & 128 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::STORAGE, usage & 256 != 0);
-
-    // Readable back for diagnostics, the same way `create_texture` always is. Only for buffers
-    // that cannot be mapped: wgpu rejects `MAP_READ | COPY_SRC` outright, and a mappable buffer
-    // needs no help being read.
-    if usage & 1 == 0 {
-        wgpu_usage_flags.insert(wgpu::BufferUsages::COPY_SRC);
-    }
+    let wgpu_usage_flags = wgpu_buffer_usages(usage);
 
     let buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label.to_str().unwrap()),
@@ -1067,6 +1112,35 @@ pub unsafe extern "C" fn write_to_buffer(
     length: u64,
     data: *const u8,
 ) {
+    // A missing usage would be a wgpu validation error, and a validation error ends the process
+    // here - so a buffer that cannot take the write is called out instead of being handed to wgpu.
+    // Silently dropping the write is what made the clouds invisible for as long as they were: the
+    // bytes were written on the CPU and never arrived.
+    if !buffer.usage().contains(wgpu::BufferUsages::COPY_DST) {
+        log::error!(
+            "wgpu-mc: refusing to write {} bytes at {} into a {} byte buffer created without \
+             COPY_DST",
+            length,
+            start,
+            buffer.size()
+        );
+        return;
+    }
+
+    // `Queue::write_buffer` needs both ends of the range to be a multiple of
+    // `COPY_BUFFER_ALIGNMENT`, and wgpu answers an unaligned one with a validation error, which ends
+    // the process. The JVM side rounds its uploads to 16 bytes for exactly this reason, so this is
+    // the backstop for the paths that do not - and the write that is dropped is the last three bytes
+    // of an upload the caller was told is aligned.
+    if start % wgpu::COPY_BUFFER_ALIGNMENT != 0 || length % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
+        log::error!(
+            "wgpu-mc: refusing to write {length} bytes at {start}, which is not a multiple of the \
+             {} byte copy alignment",
+            wgpu::COPY_BUFFER_ALIGNMENT
+        );
+        return;
+    }
+
     // SAFETY: the caller guarantees `data` covers `length` bytes, per the contract above.
     let bytes = unsafe { std::slice::from_raw_parts(data, length as _) };
     wm.gpu.queue.write_buffer(buffer, start, bytes);
@@ -2932,6 +3006,25 @@ pub extern "C" fn read_buffer(
         return false;
     }
 
+    // A copy - `copy_buffer_to_buffer` below, and `map_async` as well - has to be a multiple of
+    // `COPY_BUFFER_ALIGNMENT` at both ends, and the caller has no reason to know that: a diagnostics
+    // readback asks for exactly the bytes it wants to look at, and the cloud mesh is `3 * faces`
+    // bytes, which is a multiple of 4 only when the face count is. Handing that to wgpu is a
+    // validation error, and a validation error ends the process - the client died twice on this, in
+    // `copy_buffer_to_buffer` with `Copy size 29349 does not respect COPY_BUFFER_ALIGNMENT` and then
+    // in `map_async` with `range_size 29349 must be multiple of 4`, which is a diagnostic taking the
+    // game down instead of answering its question. Both ends are widened to alignment here, and the
+    // caller still gets exactly the bytes it asked for: the padding is read, dropped, and never
+    // reaches the destination.
+    let aligned_start = offset & !(wgpu::COPY_BUFFER_ALIGNMENT - 1);
+    let aligned_end = end
+        .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+        .min(buffer.size());
+    let mapped_length = aligned_end - aligned_start;
+
+    // Where the bytes the caller asked for start inside the aligned range.
+    let alignment_padding = offset - aligned_start;
+
     let scratch;
     let mut from_scratch = false;
     let source = if buffer.usage().contains(wgpu::BufferUsages::MAP_READ) {
@@ -2941,13 +3034,13 @@ pub extern "C" fn read_buffer(
         // buffer. Mapping it here is safe: it is not mapped at this point, which is exactly why
         // Blaze3D is asking.
         buffer
-    } else if buffer.usage().contains(wgpu::BufferUsages::MAP_WRITE) {
-        // A buffer Minecraft writes through `mapBuffer` is one it maps itself. Mapping and
-        // unmapping that from here would pull the mapping out from under it, which is a price the
-        // diagnostics are not worth.
-        warn!("wgpu-mc: not reading back a buffer Minecraft maps itself");
-        return false;
     } else {
+        // A buffer Minecraft writes through `mapBuffer` comes through here too, and that is safe:
+        // this side never maps a wgpu buffer - a `mapBuffer` on the JVM side is a CPU staging buffer
+        // and a `write_to_buffer` when it closes - so there is no mapping here to disturb. It used to
+        // be refused, which turned every read-modify-write mapping into an empty read and left the
+        // diagnostics unable to answer the one question they exist for: whether the bytes a mapped
+        // write handed over are actually in the buffer.
         if !buffer.usage().contains(wgpu::BufferUsages::COPY_SRC) {
             error!("wgpu-mc: buffer {offset}..{end} has no COPY_SRC, so it cannot be read back");
             return false;
@@ -2955,7 +3048,7 @@ pub extern "C" fn read_buffer(
 
         scratch = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("<wm/mc readback>"),
-            size: length,
+            size: mapped_length,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2964,14 +3057,18 @@ pub extern "C" fn read_buffer(
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(buffer, offset, &scratch, 0, length);
+        encoder.copy_buffer_to_buffer(buffer, aligned_start, &scratch, 0, mapped_length);
         wm.gpu.queue.submit([encoder.finish()]);
 
         from_scratch = true;
         &scratch
     };
 
-    let slice = source.slice(if from_scratch { 0..length } else { offset..end });
+    let slice = source.slice(if from_scratch {
+        0..mapped_length
+    } else {
+        aligned_start..aligned_end
+    });
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
@@ -2997,8 +3094,14 @@ pub extern "C" fn read_buffer(
 
     {
         let data = slice.get_mapped_range();
+        // The mapped range starts at the aligned copy, which may begin a few bytes before the range
+        // the caller asked for; the padding is this side's and the caller never sees it.
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), destination, length as usize);
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(alignment_padding as usize),
+                destination,
+                length as usize,
+            );
         }
     }
 
@@ -3022,6 +3125,13 @@ pub extern "C" fn write_buffer_with(
     view.copy_from_slice(unsafe { std::slice::from_raw_parts(data, len as usize) });
 }
 
+/// A buffer that is handed to the JVM already mapped, for the JVM to fill in place.
+///
+/// `usages` was ignored here, and the two flags written instead were not enough for anything that
+/// also gets bound: a caller asking for `USAGE_UNIFORM_TEXEL_BUFFER` got a buffer with no `STORAGE`,
+/// which is a bind group validation error - and a validation error ends the process on this side.
+/// `mapped_at_creation` requires `MAP_WRITE`, so that one is always set; `MAP_READ` is dropped when
+/// the mask asks for `COPY_SRC`, because wgpu rejects that pair outright.
 #[unsafe(no_mangle)]
 pub extern "C" fn allocate_gpu_buffer_mapped(
     wm: &WmRenderer,
@@ -3031,10 +3141,15 @@ pub extern "C" fn allocate_gpu_buffer_mapped(
     LIVE_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
     LIVE_BUFFER_BYTES.fetch_add(size, Ordering::Relaxed);
 
+    let mut usage = wgpu_buffer_usages(usages as u32) | wgpu::BufferUsages::MAP_WRITE;
+    if !usage.contains(wgpu::BufferUsages::COPY_SRC) {
+        usage.insert(wgpu::BufferUsages::MAP_READ);
+    }
+
     Box::new(wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+        usage,
         mapped_at_creation: true,
     }))
 }
@@ -3377,21 +3492,7 @@ pub extern "C" fn create_buffer_init(
 
     let padded_data: Vec<u8> = data.iter().copied().chain(iter::repeat(0).take(diff)).collect();
 
-    let mut wgpu_usage_flags = wgpu::BufferUsages::empty();
-    wgpu_usage_flags.set(wgpu::BufferUsages::MAP_READ, usage & 1 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::MAP_WRITE, usage & 2 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::COPY_DST, usage & 8 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::COPY_SRC, usage & 16 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::VERTEX, usage & 32 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::INDEX, usage & 64 != 0);
-    wgpu_usage_flags.set(wgpu::BufferUsages::UNIFORM, usage & 128 != 0);
-
-    // Readable back for diagnostics, the same rule `create_buffer` follows: only for buffers that
-    // cannot be mapped, because wgpu rejects `MAP_READ | COPY_SRC` outright. Minecraft fills its
-    // ring buffers - the fog among them - through this entry point rather than `create_buffer`.
-    if usage & 1 == 0 {
-        wgpu_usage_flags.insert(wgpu::BufferUsages::COPY_SRC);
-    }
+    let wgpu_usage_flags = wgpu_buffer_usages(usage);
 
     let buffer = wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
         label: Some(label.to_str().unwrap()),

@@ -11,7 +11,6 @@ import com.mojang.blaze3d.vertex.VertexFormat;
 import dev.birb.wgpu.rust.NativeNames;
 import dev.birb.wgpu.rust.WmNative;
 import net.minecraft.util.ARGB;
-import net.minecraft.util.Mth;
 import org.jspecify.annotations.NonNull;
 
 import java.lang.foreign.Arena;
@@ -160,6 +159,10 @@ public class WgpuRenderPass implements RenderPassBackend {
     private final int targetHeight;
 
     private MemorySegment activePipeline = MemorySegment.NULL;
+
+    /** The location of the pipeline bound now, for the diagnostics that name one. */
+    private String activePipelineName = null;
+
     private int openDebugGroups;
 
     public WgpuRenderPass(
@@ -294,6 +297,7 @@ public class WgpuRenderPass implements RenderPassBackend {
         WgpuCompiledRenderPipeline compiled =
                 WgpuCompiledRenderPipeline.of(device, pipeline, device.defaultShaderSource(), wantsDepth);
         this.activePipeline = compiled.forDepth(wantsDepth);
+        this.activePipelineName = pipeline.getLocation().toString();
 
         // The slots of the new plan, and everything bound so far re-emitted into them: the same
         // binding name sits in a different slot under a different pipeline, so what was written for
@@ -376,11 +380,19 @@ public class WgpuRenderPass implements RenderPassBackend {
             dumpUniform(name, value);
         }
 
-        // wgpu wants uniform ranges to be a multiple of 16 bytes, but rounding *up* can run past
-        // the end of the buffer - a slice whose last byte is the buffer's last byte became a
-        // binding four bytes too large, which wgpu refuses. The rounding stops at the buffer.
+        // wgpu wants a buffer binding's size to sit on an alignment, and *which* alignment depends
+        // on the binding: a storage buffer's size has to be a multiple of `COPY_BUFFER_ALIGNMENT`
+        // (four bytes), a uniform block's the device's uniform alignment. Four satisfies both, and it
+        // has to be rounded *down*: rounding up runs past the end of the buffer, which is what the
+        // clamp below used to turn back into an unaligned size - a 181,818 byte face buffer became a
+        // 181,818 byte storage binding, and wgpu refused to build the cloud bind group at all
+        // ("Effective buffer binding size 181818 for storage buffers is expected to align to 4").
         long available = ((WgpuBuffer) value.buffer()).size() - value.offset();
-        long rounded = Mth.roundToward((int) Math.min(value.length(), available), 16);
+        long wanted = Math.min(value.length(), available);
+        long rounded = wanted - Math.floorMod(wanted, 4);
+        if (rounded <= 0) {
+            rounded = wanted;
+        }
 
         Bound binding = Bound.buffer(
                 ((WgpuBuffer) value.buffer()).nativeBuffer(),
@@ -389,6 +401,100 @@ public class WgpuRenderPass implements RenderPassBackend {
 
         boundBindings.put(name, binding);
         writeBinding(name, binding);
+        reportCloudBinding(name, (WgpuBuffer) value.buffer(), value.offset(), binding);
+
+        // Remember the texel buffer for the draw-range check below. A texel buffer is the one kind of
+        // binding whose *contents* this backend has to have uploaded itself: it is a storage buffer
+        // here, filled through a mapped write, and a draw that reads further than the write reached
+        // renders whatever the buffer held before.
+        if ((value.buffer().usage() & GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER) != 0) {
+            texelBuffer = (WgpuBuffer) value.buffer();
+        }
+    }
+
+    /** The texel buffer the current bindings read, for [checkTexelReadRange]. */
+    private WgpuBuffer texelBuffer = null;
+
+    /**
+     * Warns when a draw reads past what was uploaded into the buffer it reads from.
+     *
+     * A texel buffer is read by `gl_VertexIndex / 4` in the vertex shader, so a draw of `count`
+     * indices reads `count / 6` faces of three bytes each - and if the mapped write behind the
+     * buffer only reached part of that, the faces past the end are whatever the buffer already held.
+     * The result is a cloud layer with faces from an older cell in it, or a layer of stale faces
+     * that drift the wrong way, and nothing in the log says so: the upload succeeded, the draw has
+     * the count it was given, and the buffer is bound to the right slot.
+     *
+     * Once a second at most, because this runs per draw.
+     */
+    private void checkTexelReadRange(int count, boolean indexed) {
+        WgpuBuffer faces = texelBuffer;
+        if (faces == null || !indexed || count <= 0) {
+            return;
+        }
+
+        long written = faces.getLastMappedWrite();
+        if (written == WgpuBuffer.NEVER_UPLOADED) {
+            // Nothing was uploaded through a mapping yet; the buffer was created with its contents.
+            return;
+        }
+
+        long needed = 3L * (count / 6);
+        if (written >= needed || !rangeWarnDue()) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                "wgpu: a draw reads {} faces ({} bytes) from {} but only {} bytes were uploaded into it; the rest is whatever the buffer held before",
+                count / 6, needed, faces.getLabel(), written);
+    }
+
+    /** Whether a [checkTexelReadRange] warning is due, so a per-draw warning cannot flood the log. */
+    private static boolean rangeWarnDue() {
+        long now = System.nanoTime();
+        if (now - lastRangeWarning < 1_000_000_000L) {
+            return false;
+        }
+
+        lastRangeWarning = now;
+        return true;
+    }
+
+    private static volatile long lastRangeWarning = 0L;
+
+    /** Diagnostics: each `clouds` binding is reported once, with the slot and the buffer it got. */
+    private static final java.util.Set<String> CLOUD_BINDINGS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Diagnostics: which buffer a cloud uniform went into, and into which slot.
+     *
+     * A binding whose name is not in the pipeline's plan is dropped in silence - `writeBinding`
+     * returns without writing anything - so a shader that reads a face buffer nobody bound reads
+     * zeroes, and every face of the cloud mesh decodes to cell (0, 0). That is one square of cloud
+     * in the whole sky, and it looks exactly like a face buffer full of zeroes, which is why the
+     * slot and the buffer have to be checked together rather than guessed at.
+     */
+    private void reportCloudBinding(String name, WgpuBuffer buffer, long offset, Bound binding) {
+        if (!Diagnostics.isEnabled() || activePipelineName == null || !activePipelineName.contains("clouds")) {
+            return;
+        }
+
+        if (!CLOUD_BINDINGS.add(activePipelineName + "/" + name)) {
+            return;
+        }
+
+        int[] slots = bindings == null ? null : bindings.of(name);
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: {} bound {} -> slot {} of {} (buffer {} at {}, {} bytes from {}), write {}",
+                activePipelineName,
+                name,
+                slots == null ? "NONE" : java.util.Arrays.toString(slots),
+                bindings == null ? "?" : bindings.getCount(),
+                buffer.getLabel(),
+                binding.resource().address(),
+                buffer.size(),
+                offset,
+                binding.length());
     }
 
     /** Writes a remembered binding into the slot its name has in the current pipeline's plan. */
@@ -664,6 +770,57 @@ public class WgpuRenderPass implements RenderPassBackend {
                 indexType == VertexFormat.IndexType.INT
                         ? WmNative.INDEX_FORMAT_UINT32
                         : WmNative.INDEX_FORMAT_UINT16);
+
+        reportCloudIndexBuffer(((WgpuBuffer) indexBuffer), indexType);
+    }
+
+    /**
+     * Diagnostics: the first indices of the buffer the clouds are drawn with, read back from the GPU.
+     *
+     * The cloud vertex shader has no vertex buffer at all: it derives the face it draws from
+     * `gl_VertexIndex / 4`, which for an indexed draw is the value in the index buffer. An index
+     * buffer full of zeroes therefore draws the *first* face ten thousand times - one square of
+     * cloud where the layer should be - and it is indistinguishable, in a screenshot, from a face
+     * buffer full of zeroes. The counts cannot tell the two apart either: `drawIndexed` carries the
+     * count it was given whether or not the buffer behind it has anything in it.
+     */
+    private void reportCloudIndexBuffer(WgpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
+        if (!Diagnostics.isEnabled()
+                || activePipelineName == null
+                || !activePipelineName.contains("clouds")
+                || !CLOUD_BINDINGS.add(activePipelineName + "/index")) {
+            return;
+        }
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(32);
+            boolean read;
+            try {
+                read = (boolean) WmNative.readBuffer.invokeExact(
+                        device.renderer(), indexBuffer.nativeBuffer(), 0L, 32L, out);
+            } catch (Throwable error) {
+                dev.birb.wgpu.WgpuMcMod.LOGGER.warn("wgpu: the cloud index buffer could not be read back: {}", error);
+                return;
+            }
+
+            if (!read) {
+                dev.birb.wgpu.WgpuMcMod.LOGGER.warn("wgpu: could not read the cloud index buffer back");
+                return;
+            }
+
+            boolean wide = indexType == VertexFormat.IndexType.INT;
+            StringBuilder indices = new StringBuilder();
+            for (int i = 0; i < (wide ? 8 : 16); i++) {
+                long value = wide
+                        ? out.get(WmNative.INT, i * 4L)
+                        : out.get(ValueLayout.JAVA_SHORT_UNALIGNED, i * 2L) & 0xFFFFL;
+                indices.append(value).append(' ');
+            }
+
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                    "wgpu: the cloud index buffer ({}, {} bytes) starts with {}",
+                    indexType, indexBuffer.size(), indices.toString().trim());
+        }
     }
 
     @Override
@@ -700,8 +857,49 @@ public class WgpuRenderPass implements RenderPassBackend {
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INDEXED, indexed ? 1 : 0);
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_LEN, bindings.getCount());
 
+        reportCloudDraw(first, count, baseVertex, indexed);
+        checkTexelReadRange(count, indexed);
+
         invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
     }
+
+    /**
+     * Diagnostics: what the clouds are drawn with, once a second.
+     *
+     * `CloudRenderer` turns its face buffer into `drawIndexed(0, 0, 6 * quadCount, 1)`, so the index
+     * count says how many faces the mesh actually has - and the vertex shader derives the face it
+     * reads from `gl_VertexIndex / 4`, which makes a wrong or empty index buffer look exactly like a
+     * wrong face buffer: every quad reads the same face, and the sky has one square of cloud in it.
+     *
+     * Once a second and not once per pass: the pass is rebuilt every frame, so a field on it would
+     * report every frame, which is a line a frame and a megabyte a minute of the same sentence.
+     */
+    private void reportCloudDraw(int first, int count, int baseVertex, boolean indexed) {
+        if (!Diagnostics.isEnabled() || activePipelineName == null) {
+            return;
+        }
+
+        if (!activePipelineName.contains("clouds") || !cloudDrawDue()) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: {} drawn with {} indices{} from {} (base vertex {})",
+                activePipelineName, count, indexed ? "" : " and no index buffer", first, baseVertex);
+    }
+
+    /** Whether a [reportCloudDraw] line is due. */
+    private static boolean cloudDrawDue() {
+        long now = System.nanoTime();
+        if (now - lastCloudDraw < 1_000_000_000L) {
+            return false;
+        }
+
+        lastCloudDraw = now;
+        return true;
+    }
+
+    private static volatile long lastCloudDraw = 0L;
 
     /**
      * Replays a multi-draw one draw at a time.

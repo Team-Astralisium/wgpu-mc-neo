@@ -31,20 +31,55 @@ abstract class Option<T>(
 
     private var value: T = getter.get()
 
+    /**
+     * Whether the player edited this row, as opposed to its value merely differing from the setting
+     * behind it.
+     *
+     * The two are not the same thing and treating them as one is how a change could be silently
+     * undone by the screen itself: editing one row is what makes the *graphics preset* row differ
+     * from its setting (every individual option calls `setGraphicsPresetToCustom`), so applying the
+     * page re-applied the preset as well - and the preset sets a dozen options, the one that had
+     * just been edited among them. Only rows the player touched are applied now.
+     */
+    private var edited = false
+
     fun get(): T = value
 
     fun set(value: T) {
         this.value = value
+        this.edited = true
     }
 
-    fun isChanged(): Boolean = value != getter.get()
+    fun isChanged(): Boolean = edited && value != getter.get()
 
     fun apply() {
-        if (isChanged()) setter.accept(value)
+        if (!isChanged()) return
+
+        setter.accept(value)
+
+        // What was just applied is read back, so that the row shows what the setting *is* rather
+        // than what it was asked to be. They differ when the source refuses the value: a vanilla
+        // option logs the rejection and falls back to its initial value, which used to leave the row
+        // showing the refused value with the Apply button still lit, as if the change had worked.
+        value = getter.get()
+        edited = false
     }
 
     fun undo() {
         value = getter.get()
+        edited = false
+    }
+
+    /**
+     * Reads the setting back into the row, for a row that was not applied.
+     *
+     * An apply can change rows the player never touched - the graphics preset sets a dozen of them -
+     * and leaving them on their old values would make the screen disagree with the game until it was
+     * reopened. A row the player *is* editing keeps its pending value: that edit has not been
+     * applied yet, and losing it here is what the Undo button is for.
+     */
+    fun resync() {
+        if (!edited) value = getter.get()
     }
 
     abstract fun createWidget(x: Int, y: Int, width: Int): Widget
@@ -64,6 +99,14 @@ abstract class Option<T>(
         protected var requiresRestart: Boolean = false
         protected var getter: Supplier<T>? = null
         protected var setter: Consumer<T>? = null
+
+        /**
+         * How the setting answers a slider, when the side that owns it says - see [IntSlider].
+         *
+         * Taken from the option itself, because only it knows: the ranges this screen used to write
+         * down by hand are where a click could ask for a value the option refuses.
+         */
+        protected var slider: IntSlider? = null
 
         protected fun requireName(): Component {
             return requireNotNull(name) { "Option name must be set before build()" }
@@ -104,6 +147,16 @@ abstract class Option<T>(
                 option.set(v)
                 callback?.accept(v)
             }
+
+            // A vanilla option is the one case where this side does not get to decide what a slider
+            // means; see [IntSlider] for what went wrong when it tried.
+            this.slider = if (option.get() is Int) {
+                @Suppress("UNCHECKED_CAST")
+                IntSlider.of(option.values() as OptionInstance.ValueSet<Int>)
+            } else {
+                null
+            }
+
             return this as B
         }
 

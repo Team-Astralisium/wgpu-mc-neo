@@ -139,9 +139,10 @@ options screen and the config file edit the same value.
   DirectX 12. `config/fabric/wgpu-mc-renderer.json` is still read if it exists, because that is
   where the config used to live and NeoForge never creates the `fabric/` directory.
 
-The options screen is generated from the schema Rust serialises (`getSettingsStructure`), so the
-only two entries are the ones the renderer actually has: `backend` and `vsync`. The three
-placeholder settings the schema used to ship (`test_enum`, `test_float`, `test_int`) are gone,
+The options screen is generated from the schema Rust serialises (`getSettingsStructure`), so the rows
+on the Electrum page are exactly the settings the renderer has - `backend`, `vsync`, and the debug
+switches under their own heading - and adding one in `settings.rs` is enough to make it appear. The
+three placeholder settings the schema used to ship (`test_enum`, `test_float`, `test_int`) are gone,
 along with the `TestEnumSetting` enum they needed; a config file that still has them keeps loading,
 because every field is `#[serde(default)]` and unknown keys are ignored.
 
@@ -192,6 +193,50 @@ undo the player's choice on the next launch. So:
   there would make both lie. The sync runs on the render thread, at device creation: changing the
   option runs Minecraft's own consumer, which asserts it is on that thread, and a mod-loading
   worker is not.
+
+### Apply sent nothing, because the page was recognised by its label
+
+An edit on the Electrum page is persisted by sending the whole page to the renderer as one JSON
+document (`sendSettings`), which is also what applies the settings that can be applied live. Which
+page does that used to be decided *inside* `Page.apply()` by comparing the page's name to a literal:
+
+```kotlin
+if (name.string == "Electrum") { … sendSettings(…) … }   // before
+```
+
+`Page.name` is a `Component`, and once the page labels moved into the language files it resolves to
+the text of `wgpu_mc.page.electrum` - which is `Neolectrum`, in every language, and has been since
+before the localisation work. The comparison therefore stopped matching, `apply()` fell through to
+the branch meant for the vanilla pages, and every row on the page applied itself to a variable that
+only the screen can see. Nothing was sent, nothing was written, and the failure was invisible in
+both directions:
+
+- no error, because the fall-through branch is a legitimate one for a page without renderer
+  settings;
+- no *pending* edit left behind either - `Option.apply()` had committed the value on this side, so
+  the Apply button turned back into Close and the screen looked like it had saved something.
+
+The next launch then read the old value out of `config/wgpu-mc-renderer.json`, which is exactly what
+"the setting does not apply, and restarting puts it back" looks like from the outside. Every setting
+on the page was affected, `backend` included - a switch that needs a restart anyway, and so hid the
+bug for as long as the page's label happened to be the literal `Electrum`.
+
+A page holds the renderer's settings exactly when one of its rows carries a setting name, and the
+renderer is the side that named them, so that is what decides the branch now. It cannot go stale
+when a label is renamed or translated. `cargo test` reads `OptionPages.kt` with `include_str!` and
+fails if a page is recognised by `name.string` again
+(`the_renderer_settings_page_is_not_found_by_its_label`, in `settings.rs`) - the same shape as the
+tests that keep the language files and the two native bridges in step, and the only kind of test
+this can have: the branch is Kotlin, and the failure was silent rather than loud.
+
+The same launch also says what it loaded, because the renderer's own line about it is dropped: the
+config is read during mod construction, and `env_logger` is installed later, by `setPanicHook` - so
+`Loaded settings: …` went to a logger that did not exist yet. `WgpuMcModClient` reads the same
+document back once the bridge is up:
+
+```
+wgpu-mc renderer settings as loaded: {"backend":{"type":"enum","selected":1},"vsync":{…}}
+```
 
 ### The options are localised, and a missing translation is a test failure
 
@@ -262,6 +307,59 @@ vanilla keys such as `options.renderDistance` - with two exceptions that are now
 
 The F3 overlay's `Render backend:` line is deliberately still English, because vanilla's debug
 overlay is English throughout.
+
+### A vanilla option is adjusted through the option, not through a range this side guessed
+
+The General and Quality pages are vanilla options, and three of them could not be adjusted at all.
+Each row was a slider over a range written out here by hand, and a range written by hand is a guess
+about somebody else's setting:
+
+- `framerateLimit` is stored as `1..26` and shown as `10..260`, so vanilla's slider only ever
+  produces multiples of ten. This side offered `5..260` in fives, so a click at the far left asked
+  for **5** - and `OptionInstance#set` answered `Illegal option value 5 for 最大帧率` in the log,
+  put the option back to its initial value (120) and left the row showing the 5 that had been asked
+  for, with the Apply button still lit;
+- `simulationDistance` goes to 32 on a machine with the memory for it (the heap size decides), and
+  this side capped it at 16;
+- `guiScale`'s maximum depends on the size of the window (`ClampingLazyMaxIntRange`), which no
+  constant can express.
+
+The option itself knows all of it, so it is asked. `OptionInstance.SliderableValueSet` - where its
+slider mapping lives - is package-private in `net.minecraft.client`, so `IntSlider` asks the public
+question instead: `validateValue` over `0..1024`, which answers with exactly the values the option
+accepts, and the step falls out of them. A click between two accepted values snaps to the nearer one,
+so the frame-rate row now offers 10, 20, ... 260 and nothing else.
+
+Applying had a second way to lose a change, and it was the interesting one:
+
+```
+wgpu: applied 1 video option(s): 模拟距离=30      ← the row was applied …
+wgpu: applied 1 video option(s): 预设=FANCY       ← … and then the preset row was, too
+options.txt: simulationDistance:12                 ← GraphicsPreset.FANCY sets it back to 12
+```
+
+Editing any individual option is what makes the *graphics preset* row differ from its setting -
+every one of those options calls `setGraphicsPresetToCustom` - so "the value differs from the
+setting" was true for the preset as well, and the page applied it: `GraphicsPreset.FANCY.apply` sets
+a dozen options, the one that had just been edited among them. A row is now applied when the
+**player** edited it (`Option.edited`, set by the widgets, cleared by apply and undo) rather than
+when its value happens to differ, and every other row is read back afterwards so the screen goes on
+showing what the game has.
+
+Two smaller pieces belong with that. `Options#save` is called on apply and on close - which is what
+`OptionsSubScreen#removed` does, and nothing here did it, so a change lived in memory until the game
+exited *cleanly*; this game is usually killed, and the next launch came back with the old value. And
+each apply says what it did, because the alternative is a screen that looks like it saved something
+while the log disagrees:
+
+```
+wgpu: applied 1 video option(s): 模拟距离=30
+```
+
+One thing here is not a bug, so that nobody goes looking for it: `simulationDistance` takes effect
+when the world is loaded, not while it is running. The integrated server reads the option once, when
+it is constructed (`IntegratedServer`), and vanilla has no live path for it either - the value is
+what the *next* load of that world uses.
 
 ### Falling back
 
@@ -442,6 +540,31 @@ The section is what made the settings list taller than the window at the GUI sca
 allows, so the list scrolls with the wheel now instead of running under the Apply button - which is
 also what the General page's last row needed, and it is why a row is only drawn when it fits whole.
 
+The **tooltip is sized and placed the same way**, and for the same reason. It used to be as wide as
+the row it belonged to and always started at that row's lower edge, so hovering one of the last rows
+put it under the Apply button and off the bottom of the window, with the rest of the description
+simply gone - and the descriptions are what the debug switches are documented in. It is now laid out
+from its own content (`TooltipWidget`): the width is what the text asks for, capped by the list's
+width and by 320 GUI units, the height follows the wrapped text, and it is drawn *below* its row when
+there is room for it and *above* it when there is not. What it may cover is the band the rows
+themselves live in - `confineTo` is given the top of the button row as its bottom - and the text is
+clipped to the box, so a description too tall for that band ends at the box's edge rather than over
+the buttons. The one line that never gives way is the red `* Requires restart`, which is drawn at the
+box's bottom edge and has the paragraph clipped above it:
+
+```
+                                      ┌──────────────────────────────────────────────┐
+   图形后端   DirectX 12    ← hovered │ wgpu 使用的图形 API。Vulkan 在 Windows 和 …   │
+                                      │ … 所以切换要等到下次启动才生效。             │
+                                      │ * 需要重启                                   │
+                                      └──────────────────────────────────────────────┘
+                                    ↑ stops here; 关闭 / 应用 / 撤销 are below and stay visible
+```
+
+A row with no description now draws no box at all: `Option.tooltip` is never null - an option without
+one carries an empty component - so the vanilla pages used to show an empty rectangle under the row
+the mouse was over.
+
 `GPU-based validation` is the one that changed behaviour rather than moving: the instance used to be
 created with it unconditionally, so every launch paid for a driver validation layer that only a
 renderer being debugged wants. Host-side `VALIDATION` and `DEBUG` stay on always - they are what
@@ -502,11 +625,21 @@ apart. wgpu reported *"Resolve buffer offset has to be aligned to QUERY_RESOLVE_
 and a validation error on the render thread ends the process. Each frame now gets its own 256-byte
 slice of the resolve buffer, of which the first 16 bytes are used.
 
-**`PIX capture`** asks Microsoft's D3D12 debugger for a programmatic timing capture -
-`PIXBeginCapture(PIX_CAPTURE_TIMING, ...)`, which is the documented call, and the reason the
-parameters struct is written out by hand in `rust/wgpu-mc-jni/src/pix.rs`: `pix3.h` is not part of
-any SDK this crate builds against, so the layout is spelled out from Microsoft's documentation
-rather than included. Both halves of what PIX needs are loaded on demand:
+**`PIX capture support`** loads PIX's own libraries into the game, which is what both ways of using
+PIX need - attaching to the process *and* taking a programmatic capture:
+
+- `WinPixGpuCapturer.dll`, so PIX can attach at all. It hooks D3D12 as it is loaded, and PIX refuses
+  to attach to a process that loads it *after* its device exists: *"the process has not loaded
+  WinPixGpuCapturer.dll"* is the message PIX gives, and it is why this switch needs a restart and
+  why the load happens before `wgpu::Instance::new`. With it loaded, PIX draws its own HUD over the
+  game (`GPU: CaptureTaken 0, Frame Time 8 ms`), which is how a screenshot proves it is live.
+- `WinPixTimingCapturer.dll`, which a programmatic timing capture runs through.
+
+For the capture itself the switch calls `PIXBeginCapture(PIX_CAPTURE_TIMING, ...)` - the documented
+call, and the reason the parameters struct is written out by hand in `rust/wgpu-mc-jni/src/pix.rs`:
+`pix3.h` is not part of any SDK this crate builds against, so the layout is spelled out from
+Microsoft's documentation rather than included. Everything is looked for in the newest PIX
+installation, and nothing is linked against:
 
 - `WinPixTimingCapturer.dll`, from PIX's own installation (`C:\Program Files\Microsoft PIX\<version>`,
   newest version first); a timing capture needs the capturer *in the process*, which is what
@@ -520,7 +653,8 @@ Nothing is linked against, because most machines have no PIX and a missing impor
 mod loading at all. On a machine with PIX installed the log says what it found, and what PIX said:
 
 ```
-wgpu-mc: PIX: timing capturer C:\Program Files\Microsoft PIX\2603.25\WinPixTimingCapturer.dll
+wgpu-mc: PIX: C:\Program Files\Microsoft PIX\2603.25\WinPixGpuCapturer.dll loaded, so PIX can attach for a GPU capture
+wgpu-mc: PIX: C:\Program Files\Microsoft PIX\2603.25\WinPixTimingCapturer.dll loaded, so programmatic timing captures can start
 wgpu-mc: PIX: using C:\Program Files\Microsoft PIX\2603.25\WinPixEventRuntime_OneCore.dll
 [WinPixServices]: Starting
 Starting ETW session PixSysMonSession.…
@@ -529,17 +663,53 @@ wgpu-mc: PIX refused to start a timing capture (HRESULT 0x80070005). A programma
          WinPixTimingCapturer.dll loaded in the process, and no capture already running
 ```
 
-`0x80070005` is `E_ACCESSDENIED`, which is the one requirement this side cannot satisfy for you:
+`0x80070005` is `E_ACCESSDENIED`, and it is the one requirement this side cannot satisfy for you:
 PIX's documentation asks for the game to run **as Administrator** for a programmatic timing capture,
-and the development session this was written in is not elevated. Everything before that point works
-- PIX's service starts and the ETW session is attempted - so a launcher started as Administrator
-should produce the capture. On success the log reads:
+because the capture records through ETW providers and creating those sessions is refused without it.
+
+**Starting `gradlew` from an administrator terminal does not make the game elevated.** Gradle reuses
+a daemon that is already running, elevation is not part of the criteria it picks one by, and the game
+is *forked by the daemon* - so it inherits the daemon's token. A run that looked like this, on the
+machine this was written on, is what "I ran it as administrator and it still refuses" looks like:
+
+```
+pid 136512  java.exe  not elevated   GradleDaemon 9.4.1          started 10:49
+pid 122192  java.exe  ELEVATED       (the elevated terminal's Gradle client)
+pid 135472  java.exe  not elevated   parent = 136512   ← the game
+```
+
+The elevated client asked the *unelevated* daemon for the build, and the daemon forked the game. Both
+of these fix it:
+
+- `gradlew --stop` first, then `gradlew runClient` from the administrator terminal, so a new - and
+  elevated - daemon is started; or
+- `gradlew --no-daemon runClient`, which runs the build in a JVM forked by the elevated client.
+
+The mod now answers the question itself, because the HRESULT alone cannot: `GetTokenInformation`
+(`TokenElevation`) is asked once, the answer is part of the refusal message, and an unelevated launch
+with the switch on says so before a capture is ever attempted:
+
+```
+wgpu-mc: PIX: this process is not running elevated, so the timing capture the `pix capture` switch
+         takes will be refused … so run `gradlew --stop` first, or pass `--no-daemon`.
+wgpu-mc: PIX refused to start a timing capture (HRESULT 0x80070005, E_ACCESSDENIED). This process is
+         NOT elevated, and a timing capture needs administrator: …
+```
+
+Everything else in the sequence works without elevation: PIX's service starts, the ETW session is
+attempted, and PIX can attach to the process for a GPU capture - the switch buys that on an
+unelevated run too. What it cannot buy there is the programmatic timing capture. On success the log
+reads:
 
 ```
 wgpu-mc: PIX timing capture started, written to ...\wgpu-mc-capture-1.wpix
 wgpu-mc: PIX timing capture stopped
 wgpu-mc: PIX timing capture reached its 600 frames and stopped
 ```
+
+The lines about the capturers are printed from the **first frame** rather than where they happen:
+the loading is part of creating the device, and this crate's logger is only installed by the JVM
+afterwards, so a line logged there would never be seen.
 
 Two things about the call itself are worth knowing. It runs on a **thread of its own**: PIX's runtime
 sets up COM as it loads, and from the render thread - whose apartment is already set - every call
@@ -549,6 +719,145 @@ stopped and fills tooling memory measured in gigabytes; turning the switch back 
 capture into the next numbered file. The begin/end pairing, the wide-string file name,
 `flags=0x1` (the `PIX_CAPTURE_TIMING` bit) and `discard=0` were all checked against a stand-in
 runtime that writes down what it was asked to do.
+
+A capture is not only the GPU's clock. Every switch the capture API has is on:
+
+| What it records | `TimingCaptureParameters` field | Table it fills in the capture |
+| --- | --- | --- |
+| GPU work and PIX GPU events | `CaptureGpuTiming` | `ApiQueueExecution`, `GpuApiMarkerRange`, `GpuWorkRange` |
+| CPU samples, 4 kHz | `CaptureCpuSamples`, `CpuSamplesPerSecond` | `CpuSample` |
+| Call stacks | `CaptureCallstacks` | `StackEvents`, `Stacks`, `ContextSwitchRange` |
+| Win32 and DirectStorage file IO | `CaptureFileIO` | `FileIORange`, `FileInfo` |
+| VirtualAlloc/VirtualFree | `CaptureVirtualAllocEvents` | `MemoryEventRanges`, `MemoryPairing` |
+| HeapAlloc/HeapFree | `CaptureHeapAllocEvents` | `MemoryEventRanges`, `MemoryPairing` |
+| Custom allocator events | `CapturePixMemEvents` | (nothing here: the renderer does not use PIX's allocator) |
+| Page faults | `CapturePageFaultEvents` | `PageFaults` |
+
+The first three were on from the start; the rest are what turned a capture with **no memory data at
+all** into one with it. That is measurable rather than a claim - a `.wpix` is a **SQLite database**,
+so its tables can simply be counted:
+
+```
+$ node -e 'const {DatabaseSync}=require("node:sqlite");const db=new DatabaseSync(process.argv[1],{readOnly:true});for(const t of ["MemoryEventRanges","MemoryPairing","PageFaults","FileIORange","ApiObjects","SymbolStrings"])console.log(t,db.prepare(`select count(*) n from "${t}"`).get().n)' runs/client/wgpu-mc-capture-1.wpix
+
+                     capture-1               capture-2
+                     (in a world,            (at the title screen,
+                      memory events off)      memory events on)
+MemoryEventRanges         0                     5397
+MemoryPairing             0                   413569
+PageFaults                0                   673866
+FileIORange               0                      252
+ApiObjects                0                        0      ← not an API option: see below
+SymbolStrings             0                        0      ← needs a PDB: see below
+```
+
+The two captures are not the same scene - the first was taken in a world, the second during loading -
+so the comparison says nothing about, say, `CpuSample`; it is about the tables that were empty
+because nothing had asked for them, and the second capture is the quieter scene of the two.
+
+`MemoryUsageSamples` itself stays empty in the file the game writes: it is *derived* by PIX from
+those memory events (`MoveMemoryUsageSamples` in `pixstorage.dll`) when the capture is opened.
+
+**Three of the things an instrumented capture can show are not reachable programmatically.** PIX's
+timing-capture dialog has more options than its own capture API: `GPU resources` (the `ApiObjects`
+tables - D3D12 resources, heaps, pipeline states, residency, demoted allocations), `Memory Access
+Sampling`, `Kernel image information`, `Callstacks for non-title processes`, `Generate .etl file`,
+`CLR data`. The names live in `Microsoft.PIX.UI.dll` and in no runtime, and `PixCaptureParameters`
+has no field for any of them - it was checked field by field against
+`Include/WinPixEventRuntime/pix3.h` from the newest WinPixEventRuntime Microsoft publishes
+(1.0.240308001) and against Microsoft's GDK reference for the same struct. `pixtool
+take-new-timing-capture` offers the same subset as the API, and `pixtool open-capture` refuses a
+timing capture outright ("not a Windows GPU capture"). So a capture with those in it is one taken
+from PIX's UI - which is exactly what the switch's installed `WinPixGpuCapturer.dll` makes possible.
+
+**Function names need a PDB, and a release build had none.** The capture's `FunctionInformation`,
+`SymbolStrings`, `ModuleSymbols`, `SourceFile` and `SourceLine` tables are filled when PIX resolves
+symbols, and there was nothing to resolve: `cargo build --release` wrote a PDB with no source files
+in it (6 MB, not one `.rs` name in it), so every native frame was an address. Three changes:
+
+- `rust/Cargo.toml` asks for `debug = "line-tables-only"` in the release profile - line tables, no
+  locals, nothing added to the code at runtime, and the PDB grows to ~47 MB;
+- `copyNatives` copies that PDB into the mod's resources, and `WgpuNative` extracts it next to the
+  library it extracts (`<run>/lib/wgpu_mc_jni.pdb`), because a debugger looks for symbols *beside the
+  module* rather than in the mod's jar; the jar itself excludes `**/*.pdb`, since nobody profiles a
+  packaged build;
+- PIX still needs a symbol path for everything else (the JDK's `java.exe`, the driver, Windows):
+  *Configure PIX → Debug symbols*, or `_NT_SYMBOL_PATH=srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
+
+Two things about the API itself came out of this and are worth writing down, because both produced a
+wrong answer first:
+
+- **`SUCCEEDED`, not `S_FALSE`.** `pix3.h` documents `S_FALSE` from `PIXBeginCapture`, and that is
+  what older PIX returned; PIX 2603 returns plain `S_OK`. The code tested for `S_FALSE` alone, so a
+  capture that *had* started was logged as `PIX refused … (HRESULT 0x00000000)` and left running -
+  the frame counter that was supposed to stop it had already handed over. Both calls now ask the
+  question the header's `SUCCEEDED(hr)` macro asks, which is a sign test.
+- **Stopping a capture is not a flag flip.** `PIXEndCapture` writes the capture out, and with the
+  memory events on that is gigabytes: it took longer than the ten seconds the call used to wait for,
+  and the timeout left the capture running. It now runs on its own thread and is not waited for; a
+  capture ends by itself at 600 frames either way, and the log says which of the two happened.
+
+The cost is real and worth knowing before turning the switch on to profile frame times: 600 frames
+of a world is now **1.7-2.7 GB** instead of 265 MB, the frame rate during a capture drops to a few
+frames per second (the events are recorded synchronously), and PIX itself drops events it cannot keep
+up with (`DroppedData` in the capture: 67k-240k rows). That is why the switch is off by default and
+why `CAPTURE_FRAMES` is a constant rather than a setting - 600 frames of *play* is what a timing
+capture is for, and a capture taken at three frames per second says more about the capture than about
+the renderer.
+
+### RTSS and PIX both hook D3D12, and together they crash the game
+
+MSI Afterburner's on-screen display is RivaTuner Statistics Server, which works by injecting
+`RTSSHooks64.dll` into the game and detouring `IDXGISwapChain::Present`, `ExecuteCommandLists` and
+friends. PIX's `WinPixGpuCapturer.dll` hooks the same runtime. With both in the process, the game has
+been taken down with the render thread inside the present path:
+
+```
+#  EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=…, tid=110920
+# Problematic frame:
+# C  [D3D12Core.dll+0x11fd5]
+Native frames: (J=a compiled Java code, …)
+C  [D3D12Core.dll+0x11fd5]
+C  [D3D12Core.dll+0x112bd]
+C  [RTSSHooks64.dll+0x71a86]          ← the fault is reached through RTSS's hook
+C  [d3d11.dll+0x495d2]
+C  [RTSSHooks64.dll+0x4beee]
+C  [wgpu_mc_jni.dll+0x5a3dbb]
+J  dev.birb.wgpu.backend.WgpuSurface.blitAndPresent(…)     ← our present
+```
+
+`siginfo: … reading address 0x0000000000000733` is a pointer that is not an object at all, and the
+module list of that same crash holds both hook libraries at once - `RTSSHooks64.dll` from
+`C:\Program Files (x86)\RivaTuner Statistics Server` and `WinPixGpuCapturer.dll`,
+`WinPixTimingCapturer.dll`, `PixStorage.dll` and `WinPixSysMonController.dll` from PIX. RTSS's own
+`Profiles\Config` says how it does the D3D12 half: it caches the *private offsets* of
+`IDXGISwapChain1::m_pCommandQueue` and of `ID3D12CommandQueue::ExecuteCommandLists` per Windows
+version, and drives the overlay through them. A capturer that wraps the D3D12 objects is exactly what
+those cached offsets do not survive.
+
+None of that is this mod's code and none of it can be fixed from here, so what this side does is
+refuse to load the capturer when the hook module is in its own process. A warning would leave a game
+that dies a second after the first frame to be diagnosed by whoever hits it; the switch instead does
+nothing, and says why:
+
+```
+wgpu-mc: PIX: RTSSHooks64.dll is loaded into this process, so RivaTuner Statistics Server - MSI
+         Afterburner's on-screen display - is already hooking D3D12. PIX hooks the same runtime, and
+         the two hook chains crash this game inside RTSS's present hook … whether or not a capture is
+         running. PIX's libraries are therefore NOT loaded this launch and the `pix capture` switch
+         does nothing. Add the `java.exe` this game runs as to RTSS's profile list and set its
+         Application detection level to None, or quit RTSS/Afterburner, then start the game again.
+         To load PIX anyway … create a file named `wgpu-pix-with-rtss` next to the game.
+```
+
+The exclusion is per application, so the OSD can stay on everywhere else: in RTSS, add the
+`java.exe` the game runs as (`…\GraalVM\JDKs\25.1\bin\java.exe` in a dev run) and set its
+*Application detection level* to **None**. Closing RTSS and Afterburner does the same thing more
+bluntly. The `wgpu-pix-with-rtss` marker is the way back if a later RTSS or PIX makes the two
+coexist: it is the same shape as every other override in this renderer, a file rather than a rebuild.
+A crash during a capture also leaves PIX's own spool files beside the capture
+(`wgpu-mc-capture-N.wpix-wal`, `.wpix-shm`, hundreds of megabytes); they are safe to delete, and the
+`.wpix` next to them is what PIX can open.
 
 ### A shader may declare more than its pipeline provides
 
@@ -996,13 +1305,154 @@ wrong place and the decoded cell coordinates were nonsense. The shim now declare
 extracts the byte:
 
 ```glsl
-ivec4(int((CloudFaces.inner[uint(index) >> 2u] >> ((uint(index) & 3u) << 3u)) & 0xFFu), 0, 0, 1)
+ivec4(((int((CloudFaces.inner[uint(index) >> 2u] >> ((uint(index) & 3u) << 3u)) & 0xFFu) ^ 0x80) - 0x80), 0, 0, 1)
 ```
 
-Zero-extended rather than sign-extended, because every use of a fetched value in that shader is a
-mask or a shift, which sign extension would not have changed. The three tests it comes with encode
-Minecraft's byte layout, decode it back, and check that the four-byte read the shim used to do gives
-a different answer - so a future change to the layout has to fail a test rather than a screenshot.
+**And the byte is signed, which was the second half of the same bug.** The first version of this
+fetch zero-extended it, on the reasoning that every use of a fetched value in that shader is a mask
+or a shift - which is true of the *flags* byte and false of the coordinates: a cell west or north of
+the camera has a negative coordinate, so `cellX >> 1` is negative, and zero-extending `-3` gives
+`509`. Every one of those cells was drawn about twenty times further away than it should have been,
+which put them outside the fog. What was left was the two-by-two cells around the player, drifting
+with the cloud offset and snapping back whenever the centre cell changed - the report was "one square
+of cloud above my head that bounces", and it is exactly what half a cloud layer drawn 6 km away looks
+like. `(byte ^ 0x80) - 0x80` is the sign extension, chosen over a shift pair because it does not
+depend on how a backend shifts a signed value.
+
+The tests encode Minecraft's byte layout, decode it back - with negative coordinates now, which the
+first version's test never did - and check that the four-byte read the shim used to do gives a
+different answer, so a future change to the layout has to fail a test rather than a screenshot.
+
+### The cloud layer was one square, and the reason was `COPY_DST`
+
+Fixing the byte layout was not enough, because the shader was not reading the faces at all. A mapped
+write - `mapBuffer` on the JVM side, `write_to_buffer` on this one - is `Queue::write_buffer`, a copy
+from the CPU, and wgpu refuses that on a buffer created without `COPY_DST`. Vanilla asks for
+`USAGE_COPY_DST` on the buffers it uploads into, but **not** on the ones it maps itself, and the cloud
+face buffer is one of those (`USAGE_MAP_WRITE | USAGE_UNIFORM_TEXEL_BUFFER`): 181,824 bytes of faces
+were written on the CPU every time the mesh was rebuilt, never copied to the GPU, and the shader read
+the zeroes the buffer was created with. Every face decoded to cell `(0, 0)` facing down - one square
+of cloud above the player's head, drifting with the cloud offset, and nothing else in the sky. The
+buffer creation now asks for `COPY_DST` for anything `MAP_WRITE` as well, since that is how this side
+uploads.
+
+Two things came out of it that are worth keeping:
+
+- `write_to_buffer` refuses to write into a buffer without `COPY_DST` and says so at error level. A
+  wgpu validation error would end the process instead, and the *silent* version of this - a write
+  that never happened - cost an afternoon: the clouds were drawn, from zeroes, with nothing in the
+  log to say why. `read_buffer` also stopped refusing buffers Minecraft maps itself, because this
+  side's mappings are CPU staging buffers rather than wgpu mappings, so there was nothing to disturb.
+- With diagnostics on, a mapped write to a `Cloud*` buffer is **read back and compared** with what was
+  sent, once a second. It compares the whole written range rather than a prefix, counts the non-zero
+  bytes on both sides, and names the entry point and the wgpu usage flags the buffer ended up with:
+  `all 30099 written bytes arrived in Cloud UTB #1 (30099 of them non-zero); created via createBuffer,
+  blaze usage MAP_WRITE|UNIFORM_TEXEL_BUFFER, wgpu usage MAP_WRITE|COPY_DST|STORAGE|COPY_SRC`. A mesh
+  that arrives with its second half missing passes a 16-byte check, and the second half is what draws
+  the rest of the layer.
+- The same report decodes the buffer as **faces**, which is what the shader will make of it:
+  `Cloud UTB #1 holds 10033 faces: x -86..86, z -86..86, 0 beyond 120 cells, 48 marked inside;
+  directions down=9985 north=8 south=6 west=17 east=17; first [0,0 down inside] ...`. A mesh of real
+  cells and a mesh of zeroes look identical in a screenshot - both are one square of cloud above the
+  player - and this is the line that tells them apart without a GPU debugger.
+- A draw that reads further than the write reached warns, once a second: `a draw reads 9987 faces
+  (29961 bytes) from Cloud UTB #2 but only 120 bytes were uploaded into it`. The texel buffer is bound
+  as a storage buffer here, so the draw's range and the upload's range are two numbers this side has
+  and can compare, and "the shader is reading stale faces" stops being invisible.
+
+### The same usage mask made three different buffers
+
+The `COPY_DST` fix above was made in `create_buffer`, and `create_buffer_init` and
+`allocate_gpu_buffer_mapped` had their own copies of the same translation. They had drifted:
+`create_buffer_init` never translated `USAGE_UNIFORM_TEXEL_BUFFER` to `STORAGE`, so a texel buffer
+created with initial contents was a buffer no texel-buffer bind group could bind, and
+`allocate_gpu_buffer_mapped` ignored the usage mask it was handed altogether and created
+`MAP_READ | MAP_WRITE`. Any of those is a wgpu validation error - which ends the process here - and
+the bug only hides as long as vanilla happens not to take that path. There is now one function,
+`wgpu_buffer_usages`, and all three entry points call it; the mapped one adds `MAP_WRITE` on top,
+because `mapped_at_creation` requires it, and drops `MAP_READ` when the mask asks for `COPY_SRC`,
+because wgpu rejects that pair.
+
+The JVM side can ask what a buffer ended up with (`buffer_usages`), which is what puts the flags into
+the log lines above: the mask the JVM passes is not the mask the buffer has.
+
+### A bounds check naga will not compile
+
+An out-of-range `texelFetch` is undefined in GL, and until the sign extension was fixed this side's
+texel-buffer shim was reading one: the fetch clamps its index in the natural way,
+
+```glsl
+ivec4(((uint(index) >> 2u) < uint(CloudFaces.inner.length()) ? byte : 0), 0, 0, 1)
+```
+
+and that shader does not compile. naga 29's GLSL front end lowers `.length()` on a runtime-sized
+array member to a `Load` of the array rather than a pointer to it, and its validator answers
+`InvalidPointerType` - in an expression, in a local, in a comparison, and in an `if` condition alike;
+all four were tried. A shader module that fails validation is a wgpu error, which is fatal here, so
+the first run with the clamp in it died in `create_shader_module` with the process's own crash log.
+
+The clamp is left out, and it costs nothing: **WebGPU requires robust buffer access**, so an
+out-of-bounds read of a storage buffer reads zero rather than the word after the mesh, which is what
+the clamp was there to guarantee. `a_length_bounds_check_is_still_impossible` runs naga over the
+idiom and fails if a later version starts accepting it, so the clamp goes back in when it can. The
+test that would have caught the crash - `the_rewritten_texel_fetch_survives_naga` - runs the
+rewritten fetch through naga's front end and validator, because "this is valid GLSL" and "naga
+compiles this" are two different claims and only the second one keeps the game running.
+
+### The mesh is rebuilt when the cell changes, and that is what vanilla does
+
+`CloudOffset` is written into the `CloudInfo` uniform every frame, but the face buffer is only
+rebuilt when the *cell* the camera is over changes, when the camera moves above or below the layer,
+when the cloud status changes, or when the renderer asks for it - `CloudRenderer#render` compares
+`cellX`/`cellZ` against the previous frame's, and `MappableRingBuffer#rotate` moves to the next of
+three buffers for the new mesh. A cell is 12 blocks and the drift covers one in 400 ticks, so at a
+walk that is a rebuild every few seconds and a stationary camera rebuilds every twenty, all of it
+intended: the offset moves the layer smoothly and the mesh only has to be laid out again when a whole
+cell has been crossed. What would *not* be intended is a frame drawn with a mesh from a different
+cell, and that is what the draw-range warning and the face decode above exist to catch.
+
+### The cloud ring was rebuilt every frame, because the buffer reported the wrong size
+
+`COPY_DST` made the faces arrive, and the faces were a layer - the diagnostics read the buffer back,
+decoded it, and printed `Cloud UTB #1 holds 9783 faces: x -85..85, z -85..85`. The sky stayed empty
+anyway, one square of cloud over the player's head at best, flickering.
+
+`GpuBuffer#size` is not a description, it is an *interface*: `CloudRenderer#render` compares
+`this.utb.currentBuffer().size()` against the `utbSize` it computed, and rebuilds the ring of three
+face buffers whenever they differ:
+
+```java
+if (this.utb == null || this.utb.currentBuffer().size() != utbSize) { ... this.utb = new MappableRingBuffer(...); }
+```
+
+wgpu needs buffer sizes to be a multiple of 16, and this side rounded every size *up* before handing
+it to `GpuBuffer` - so the vanilla `utbSize` of 181,818 was reported back as 181,824, the comparison
+never matched, and **the ring was closed and recreated on every frame of every cloud draw**. A
+recreated ring is three freshly created, zeroed buffers, and on a frame where the cell did not change
+nothing is written into them: the draw bound a buffer of zeroes, every face decoded to cell `(0, 0)`
+facing down, and the whole layer collapsed into one square that drifted with the cloud offset. On the
+frames where a rebuild did happen, the mesh was written into the new buffer and the layer appeared -
+which is the flicker.
+
+The rounded size now goes to wgpu and the size Minecraft asked for is what the buffer reports. The
+diagnostic that names it exists because a buffer created sixty times a second is not visible in a
+screenshot: `created buffer Cloud UTB #0 (181818 bytes asked for, 181824 bytes allocated)`, once for
+the run instead of three times a frame.
+
+Two smaller alignment bugs came out of the same change, both of which used to end the process with a
+wgpu validation error rather than a wrong picture:
+
+- **A readback has to be aligned at both ends.** `read_buffer` copies through a scratch buffer, and
+  the diagnostic that verifies a mapped write asks for exactly the bytes that were written - which is
+  `3 * faces`, i.e. a multiple of four only when the face count is. `Copy size 29349 does not respect
+  COPY_BUFFER_ALIGNMENT` took the client down, and once that was fixed, `map_async` answered
+  `range_size 29349 must be multiple of 4`. The copy is widened to alignment - offsets included - and
+  the caller still gets exactly the bytes it asked for.
+- **A bind group's buffer binding size has to be aligned too.** `setUniform` rounds a slice's length
+  up to 16 and then clamps it to what is left of the buffer, and the clamp is what put the unrounded
+  181,818 back: `Effective buffer binding size 181818 for storage buffers is expected to align to 4`.
+  Rounding *down* to the four-byte alignment is what satisfies both a storage binding and a uniform
+  block, and it can never run past the end of the buffer, which is what the clamp was for.
 
 ### What this side hands out, and what brings it back
 

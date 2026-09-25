@@ -93,11 +93,21 @@ val rustReleaseDir = rustProjectDir.dir("target/release")
 val nativeLibraryFileName = System.mapLibraryName("wgpu_mc_jni")
 val nativeLibrary = rustReleaseDir.file(nativeLibraryFileName)
 
+// The PDB the release build writes beside the library, when the profile asks for one (`debug =
+// "line-tables-only"` in `rust/Cargo.toml`). It rides along into this module's resources for one
+// reason: the game extracts the library into `<run>/lib`, and PIX resolves a timing capture's
+// function names through the PDB that sits *there* - a debugger looks for symbols beside the module,
+// not in the mod's jar. Absent when the Rust build produced none, which is not an error.
+val nativeSymbols = rustReleaseDir.file(nativeLibraryFileName.substringBeforeLast('.') + ".pdb")
+
 val copyNatives = tasks.register<Copy>("copyNatives") {
 	description = "Copies the freshly built Rust JNI bridge into this module's resources."
 	group = "build"
 	onlyIf { nativeLibrary.asFile.exists() }
 	from(nativeLibrary) {
+		into("assets/$modId/natives")
+	}
+	from(nativeSymbols) {
 		into("assets/$modId/natives")
 	}
 	into(layout.buildDirectory.dir("generated/natives"))
@@ -142,6 +152,11 @@ tasks.named<ProcessResources>("processResources") {
 
 tasks.named<Jar>("jar") {
 	dependsOn(unpackExports, "deleteExports")
+
+	// The debug symbols ride along to a development run, where the game extracts them beside the
+	// library for PIX to find, but not into the mod jar: it is tens of megabytes of line tables, and
+	// a packaged build is not the one anybody profiles.
+	exclude("**/*.pdb")
 }
 
 listOf("runClient", "runData", "runGameTestServer", "runServer").forEach { runTaskName ->

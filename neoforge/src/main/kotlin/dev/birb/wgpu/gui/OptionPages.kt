@@ -117,6 +117,11 @@ class OptionPages : Iterable<OptionPages.Page> {
         val mc = Minecraft.getInstance()
         val options = mc.options
 
+        // The slider behaviour of a vanilla row comes from the option itself (`Option.Builder
+        // .setOption` picks it up), so the range written here is only what would be used if that
+        // ever came back empty - but it should still be the option's own range rather than one that
+        // looks plausible: `simulationDistance` really does go to 32 on a machine with the memory
+        // for it, and `framerateLimit` really is 10..260 in tens.
         page.add(IntOption.Builder()
             .setName(Component.translatable("options.renderDistance"))
             .setOption(options.renderDistance())
@@ -128,7 +133,7 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setName(Component.translatable("options.simulationDistance"))
             .setOption(options.simulationDistance())
             .setFormatter { integer -> Component.translatable("options.chunks", integer) }
-            .setRange(5, 16)
+            .setRange(5, 32)
             .build())
 
         page.add(IntOption.Builder()
@@ -179,8 +184,10 @@ class OptionPages : Iterable<OptionPages.Page> {
                 if (integer == 260) Component.translatable("options.framerateLimit.max")
                 else Component.literal(integer.toString())
             }
-            .setRange(5, 260)
-            .setStep(5)
+            // Vanilla stores this one as 1..26 and shows it as 10..260, so its slider only ever
+            // produces multiples of ten - asking for 5 was a value the option rejected outright.
+            .setRange(10, 260)
+            .setStep(10)
             .build())
 
         page.space()
@@ -328,25 +335,58 @@ class OptionPages : Iterable<OptionPages.Page> {
         fun hasPendingRestartChanges(): Boolean =
             options().any { it.isChanged() && it.requiresRestart }
 
+        /**
+         * Commits the page's edits, and hands the renderer the ones that are its own.
+         *
+         * Which of the two this is does *not* depend on [name]. It used to - the test was
+         * `name.string == "Electrum"` - and that broke the moment the page's label became a
+         * translation key: the label is `Neolectrum` in every language, so the comparison stopped
+         * matching, no settings were ever sent, and an edit to this page was kept on this side
+         * only. The Apply button then turned back into Close and the next launch read the old
+         * value out of the config, which is exactly what "the change did not apply" looks like.
+         *
+         * A page holds the renderer's settings exactly when one of its rows carries a setting name,
+         * and the renderer is the side that named them, so this cannot go stale when a label does.
+         */
         fun apply() {
-            if (name.string == "Electrum") {
-                val options = options()
-                val json = GSON.toJson(options, SETTINGS_TYPE_TOKEN.type)
+            val rendererOptions = options().filter { it.setting != null }
+
+            if (rendererOptions.isNotEmpty()) {
+                val json = GSON.toJson(rendererOptions, SETTINGS_TYPE_TOKEN.type)
                 if (!WgpuNative.sendSettings(json)) {
-                    WgpuMcMod.LOGGER.error("Failed to save Electrum renderer settings")
+                    WgpuMcMod.LOGGER.error("Failed to save the renderer settings")
                     return
                 }
                 // `sendSettings` applies what it can immediately - `vsync` reconfigures the
                 // swapchain, and the debug switches are read on the next draw - so by the time this
                 // returns, the renderer is already running with the new values. This side has its
                 // own copy of the diagnostics switch, because it is the side that dumps frames.
-                options.forEach { it.apply() }
+                rendererOptions.forEach { it.apply() }
                 Diagnostics.refresh()
-                syncVanillaVsync(options)
+                syncVanillaVsync(rendererOptions)
                 return
             }
 
+            // What changed is read before it is applied and reported after, because the two can
+            // disagree: a vanilla option that refuses a value logs an error of its own and keeps the
+            // one it had, and the row used to go on showing the value that was asked for. The line
+            // below names what was applied and what each setting is *after* applying it.
+            val changed = options().filter { it.isChanged() }
+
             options().forEach { it.apply() }
+
+            // Then every row is read back, because applying one can change others: a graphics preset
+            // sets a dozen options at once, and a page that went on showing the values from before
+            // would be lying about the game it is editing.
+            options().forEach { it.resync() }
+
+            if (changed.isNotEmpty()) {
+                WgpuMcMod.LOGGER.info(
+                    "wgpu: applied {} video option(s): {}",
+                    changed.size,
+                    changed.joinToString(", ") { "${it.name.string}=${it.get()}" },
+                )
+            }
         }
 
         fun undo() = options().forEach { it.undo() }

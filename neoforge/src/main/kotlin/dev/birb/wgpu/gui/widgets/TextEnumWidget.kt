@@ -21,10 +21,6 @@ class TextEnumWidget(x: Int, y: Int, width: Int, private val option: TextEnumOpt
             val direction = if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) 1 else -1
             option.set(option.cycle(direction))
 
-            previousValueName = valueName
-            valueName = TextEnumOption.FORMATTER.apply(option)
-            animation = 0.0
-
             playClickSound()
             return true
         }
@@ -32,6 +28,14 @@ class TextEnumWidget(x: Int, y: Int, width: Int, private val option: TextEnumOpt
     }
 
     override fun render(renderer: WidgetRenderer, mouseX: Int, mouseY: Int, delta: Float) {
+        // The label follows the value rather than the click; see `EnumWidget`.
+        val currentName = TextEnumOption.FORMATTER.apply(option)
+        if (currentName != valueName) {
+            previousValueName = valueName
+            valueName = currentName
+            animation = 0.0
+        }
+
         animation = Mth.clamp(animation + delta * 6.0, 0.0, 1.0)
 
         // Background

@@ -54,6 +54,18 @@ object Diagnostics {
     const val DUMP_PASS_PREFIX = "Animate "
 
     /**
+     * Passes whose label starts with this are dumped too, after the prefix list above.
+     *
+     * The clouds are the reason this exists. They are the one thing in the level that is drawn into
+     * a texture of its *own* choosing - `CloudRenderer` asks for the main target, or for the
+     * separate cloud target when shader transparency is on - and a cloud layer that is drawn
+     * somewhere nobody looks at is indistinguishable, in a screenshot of the window, from one that
+     * was never drawn. Dumping the pass's own target tells the two apart. The pass is not
+     * per-frame: the label is what is keyed on, so one dump per label per run.
+     */
+    const val DUMP_PASS_PREFIX_2 = "Clouds"
+
+    /**
      * Whether the diagnostics are on.
      *
      * Not a `lazy`: the setting is applied from the options screen, and a dump or a counter that
@@ -171,7 +183,7 @@ object Diagnostics {
     private val dumpedPasses = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /**
-     * Dumps the colour target of an `Animate ...` pass once per label.
+     * Dumps the colour target of an `Animate ...` or `Clouds` pass once per label.
      *
      * Called after the pass has been submitted, so what lands in the file is the atlas as the GPU
      * had it at the end of that pass rather than whatever the texture held before it ran.
@@ -179,10 +191,19 @@ object Diagnostics {
     @JvmStatic
     fun dumpPassTarget(renderer: MemorySegment, label: String, texture: MemorySegment?) {
         if (texture == null) return
-        if (!label.startsWith(DUMP_PASS_PREFIX)) return
-        if (!dumpedPasses.add(label)) return
 
-        val name = "atlas-" + label.removePrefix(DUMP_PASS_PREFIX).replace(Regex("[^A-Za-z0-9]+"), "-").trim('-') + ".raw"
-        dumpTexture(renderer, texture, name)
+        val prefix = when {
+            label.startsWith(DUMP_PASS_PREFIX) -> DUMP_PASS_PREFIX
+            label.startsWith(DUMP_PASS_PREFIX_2) -> DUMP_PASS_PREFIX_2
+            else -> return
+        }
+
+        if (!dumpedPasses.add("$prefix/$label")) return
+
+        val name = "pass-" + label.removePrefix(prefix).replace(Regex("[^A-Za-z0-9]+"), "-").trim('-') + ".raw"
+        // A pass target is a render target, so its rows are the other way up from the image that
+        // ends up on screen - see `dumpTexture` - and the point of this dump is to be looked at next
+        // to a frame dump.
+        dumpTexture(renderer, texture, name, true)
     }
 }

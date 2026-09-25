@@ -466,11 +466,35 @@ pub struct RemovePointSize {
 pub struct SamplerBufferRewriter<'a> {
     pub is_sampler_buffer: bool,
     pub buffers: Vec<String>,
+    /// What each rewritten buffer's texels were declared as, by name. The SSBO that replaces the
+    /// texel buffer is always `uint[] inner`, so this is what says whether a byte out of it is a
+    /// signed 8-bit value - `isamplerBuffer`, which is what `CloudRenderer` binds - or an unsigned
+    /// one.
+    pub kinds: HashMap<String, TexelKind>,
+    /// The kind the current declaration is for, with the same "set by the type visitor, read by the
+    /// declaration visitor" ordering as [`SamplerBufferRewriter::is_sampler_buffer`].
+    pub current_kind: TexelKind,
     pub uniform_sets: &'a HashMap<String, (u32, u32)>,
+}
+
+/// The texel type a `*samplerBuffer` uniform was declared with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TexelKind {
+    /// `isamplerBuffer`: one byte of the SSBO is a signed 8-bit value.
+    #[default]
+    Int,
+    /// `usamplerBuffer`: one byte of the SSBO is an unsigned 8-bit value.
+    Uint,
+    /// `samplerBuffer`: a float texel buffer. The byte layout of one of these depends on the
+    /// texture format the buffer was filled from - an `R8_UNORM` texel is `byte / 255`, an
+    /// `R8_SNORM` texel is `byte / 127 - 1` - and the shim is handed neither, so a float fetch is
+    /// decoded as unsigned and the shader is told about it once instead of being silently wrong.
+    Float,
 }
 
 pub struct RewriteFetches<'a> {
     pub buffers: &'a [String],
+    pub kinds: &'a HashMap<String, TexelKind>,
 }
 
 impl VisitorMut for RemovePointSize {
@@ -514,13 +538,46 @@ impl<'a> VisitorMut for RewriteFetches<'a> {
 
                     show_expr(&mut expr_out, op);
 
+                    let name = &ident.0;
+                    let kind = self.kinds.get(name).copied().unwrap_or_default();
+
                     // One texel is one byte, so the word is `index / 4` and the byte inside it is
-                    // selected by `(index % 4) * 8`. `ivec4`, not `ivec2`, because an `isamplerBuffer`
-                    // fetch returns four components and `.g`/`.b`/`.a` would otherwise not compile;
-                    // a texel buffer's unused components are zero and alpha is one.
+                    // selected by `(index % 4) * 8`.
+                    //
+                    // The byte is *signed* for an `isamplerBuffer`: `CloudRenderer#encodeFace`
+                    // writes `cellX >> 1` of a coordinate that is negative for every cell west or
+                    // north of the camera, and the shader shifts the fetched value back up. Reading
+                    // it as an unsigned byte put those cells 2*|x| cells away instead of |x| cells
+                    // away - so the whole western and northern half of the cloud layer was drawn
+                    // outside the fog, and what was left was the two-by-two cells around the player.
+                    // `(byte ^ 0x80) - 0x80` is sign extension without depending on how the backend
+                    // shifts a signed value; a `usamplerBuffer` gets the plain zero-extended byte,
+                    // which is what GL would have handed it.
+                    let byte = match kind {
+                        TexelKind::Int => format!(
+                            "((int(({name}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu) ^ 0x80) - 0x80)"
+                        ),
+                        TexelKind::Uint | TexelKind::Float => format!(
+                            "int(({name}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu)"
+                        ),
+                    };
+
+                    // An out-of-range `texelFetch` is undefined in GL, and this was where a clamp
+                    // belonged - `i >> 2 < inner.length() ? ... : 0`. It cannot be written: naga
+                    // 29's GLSL front end lowers `.length()` on a runtime-sized array member to a
+                    // `Load` of the array itself, and the validator rejects that ("Expression is
+                    // invalid / Loading of ... can't be done"), which fails the whole shader module
+                    // and takes the process down with it. Nothing is lost by leaving it out: WebGPU
+                    // requires robust buffer access, so an out-of-bounds read of a storage buffer
+                    // reads zero rather than the word after the mesh - which is what the clamp was
+                    // for. What *was* missing is the sign extension below, and it is the difference
+                    // between a cloud layer and one square of it.
+                    //
+                    // `ivec4`, not `ivec2`, because an `isamplerBuffer` fetch returns four
+                    // components and `.g`/`.b`/`.a` would otherwise not compile; a texel buffer's
+                    // unused components are zero and alpha is one.
                     *expression_base = Expr::parse(format!(
-                        "ivec4(int(({}.inner[uint({expr_out}) >> 2u] >> ((uint({expr_out}) & 3u) << 3u)) & 0xFFu), 0, 0, 1)",
-                        ident.0
+                        "ivec4({byte}, 0, 0, 1)"
                     ))
                     .unwrap();
                 }
@@ -540,6 +597,14 @@ impl VisitorMut for SamplerBufferRewriter<'_> {
 
             if self.is_sampler_buffer {
                 self.buffers.push(name.clone());
+                self.kinds.insert(name.clone(), self.current_kind);
+
+                if self.current_kind == TexelKind::Float {
+                    log::warn!(
+                        "wgpu-mc: {name} is a float texel buffer; its bytes are decoded as \
+                         unsigned, which is only right for an unnormalised 8-bit format"
+                    );
+                }
 
                 let (set, binding) = self.uniform_sets.get(name).copied().unwrap();
 
@@ -553,7 +618,17 @@ impl VisitorMut for SamplerBufferRewriter<'_> {
     }
 
     fn visit_type_specifier_non_array(&mut self, t: &mut TypeSpecifierNonArray) -> Visit {
-        self.is_sampler_buffer = matches!(t, TypeSpecifierNonArray::ISamplerBuffer);
+        self.is_sampler_buffer = true;
+
+        self.current_kind = match t {
+            TypeSpecifierNonArray::ISamplerBuffer => TexelKind::Int,
+            TypeSpecifierNonArray::USamplerBuffer => TexelKind::Uint,
+            TypeSpecifierNonArray::SamplerBuffer => TexelKind::Float,
+            _ => {
+                self.is_sampler_buffer = false;
+                TexelKind::Int
+            }
+        };
 
         Visit::Parent
     }
@@ -1031,12 +1106,15 @@ pub fn apply_layouts(
     let mut rewriter = SamplerBufferRewriter {
         is_sampler_buffer: false,
         buffers: vec![],
+        kinds: HashMap::new(),
+        current_kind: TexelKind::default(),
         uniform_sets: &uniform_map,
     };
 
     vert_stage.visit_mut(&mut rewriter);
     vert_stage.visit_mut(&mut RewriteFetches {
         buffers: &rewriter.buffers,
+        kinds: &rewriter.kinds,
     });
 
     uniform_annotator.uniform_found = false;
@@ -1050,6 +1128,7 @@ pub fn apply_layouts(
     frag_stage.visit_mut(&mut rewriter);
     frag_stage.visit_mut(&mut RewriteFetches {
         buffers: &rewriter.buffers,
+        kinds: &rewriter.kinds,
     });
 }
 
@@ -1107,8 +1186,14 @@ pub struct ProcessedShaderResult {
 /// `inner[index]` therefore read *four* bytes per face from a buffer laid out one byte per face -
 /// every field after the first came out of the wrong place, the decoded cell coordinates were
 /// nonsense, and the clouds were drawn as a handful of faces somewhere near the camera. The SSBO is
-/// a `uint[]` and the fetch extracts the byte, zero-extended: every use of a fetched value in those
-/// shaders is a mask or a shift, which sign extension would not have changed.
+/// a `uint[]` and the fetch extracts the byte.
+///
+/// The byte is *signed*, which was the second half of the same bug: a cell west or north of the
+/// camera has a negative coordinate, so `cellX >> 1` is negative, and zero-extending it turned `-3`
+/// into `509`. Every one of those cells was drawn roughly twenty times further away than it should
+/// have been - outside the fog, invisible - which left the two-by-two cells around the player as the
+/// only cloud in the sky, drifting with the cloud offset and snapping back whenever the centre cell
+/// changed. The fetch now sign-extends with `(byte ^ 0x80) - 0x80`.
 ///
 /// The index expression is used twice, which is safe for the one buffer this shim exists for -
 /// `CloudRenderer`'s shader fetches with a local variable - and would not be for a fetch with a
@@ -1285,12 +1370,13 @@ mod texel_buffer_tests {
     use glsl::syntax::ShaderStage;
     use glsl::transpiler::glsl::show_translation_unit;
     use std::collections::HashMap;
+    use wgpu_mc::wgpu::naga;
 
     /// The shader side of the contract: what the rewritten GLSL computes for one fetched texel.
     ///
     /// This is the same arithmetic the generated expression performs - take the 4-byte word, shift
-    /// the byte into place, mask it - so a change to that expression that this does not follow is a
-    /// change that has to be made in two places, which is what the test is for.
+    /// the byte into place, mask it, sign-extend it - so a change to that expression that this does
+    /// not follow is a change that has to be made in two places, which is what the test is for.
     fn fetch_byte(buffer: &[u8], index: usize) -> i32 {
         let word = u32::from_le_bytes([
             *buffer.get(index & !3).unwrap_or(&0),
@@ -1299,7 +1385,10 @@ mod texel_buffer_tests {
             *buffer.get((index & !3) + 3).unwrap_or(&0),
         ]);
 
-        ((word >> ((index as u32 & 3) * 8)) & 0xFF) as i32
+        let byte = ((word >> ((index as u32 & 3) * 8)) & 0xFF) as i32;
+
+        // `(byte ^ 0x80) - 0x80`, which is what the generated expression does.
+        (byte ^ 0x80) - 0x80
     }
 
     /// Minecraft's `CloudRenderer#encodeFace`: three bytes per face, one texel each.
@@ -1317,7 +1406,9 @@ mod texel_buffer_tests {
         let mut buffer = Vec::new();
         encode_face(&mut buffer, 3, 0, 0, 0);
         encode_face(&mut buffer, 2, 2, 4, 16);
-        encode_face(&mut buffer, 255, 254, 7, 16 | 32);
+        // West and north of the camera, which is half of every cloud layer and the half that was
+        // drawn in the wrong place for as long as the fetched byte was zero-extended.
+        encode_face(&mut buffer, -3, -4, 7, 16 | 32);
         assert_eq!(buffer.len(), 9);
         assert_eq!(buffer[..3], [0x01, 0x00, 0x80]);
 
@@ -1332,7 +1423,7 @@ mod texel_buffer_tests {
             let expected = match face {
                 0 => (3, 0, 0, false, false),
                 1 => (2, 2, 4, true, false),
-                _ => (255, 254, 7, true, true),
+                _ => (-3, -4, 7, true, true),
             };
 
             assert_eq!(
@@ -1371,34 +1462,141 @@ mod texel_buffer_tests {
 
     #[test]
     fn the_rewriter_produces_a_byte_fetch() {
-        let uniform_map: HashMap<String, (u32, u32)> =
-            HashMap::from([("CloudFaces".to_string(), (0, 4))]);
-
-        let mut stage = ShaderStage::parse(
-            "uniform isamplerBuffer CloudFaces; void main() { int index = 3; int cellX = texelFetch(CloudFaces, index).r; }"
-                .to_string(),
-        )
-        .unwrap();
-
-        let mut rewriter = SamplerBufferRewriter {
-            is_sampler_buffer: false,
-            buffers: vec![],
-            uniform_sets: &uniform_map,
-        };
-        stage.visit_mut(&mut rewriter);
-        stage.visit_mut(&mut RewriteFetches {
-            buffers: &rewriter.buffers,
-        });
-
-        let mut printed = String::new();
-        show_translation_unit(&mut printed, &mut stage);
-        println!("{printed}");
+        let printed = rewrite(&[
+            "uniform isamplerBuffer CloudFaces;",
+            "uniform usamplerBuffer OtherFaces;",
+            "void main() {",
+            "  int index = 3;",
+            "  int cellX = texelFetch(CloudFaces, index).r;",
+            "  int other = texelFetch(OtherFaces, index).r;",
+            "  int far = texelFetch(CloudFaces, 99999).r;",
+            "}",
+        ]);
 
         assert!(printed.contains("uint[] inner"), "the SSBO is not a uint array: {printed}");
         // The printer writes `0xFFu` as `255u`, so the mask is matched by its value.
         assert!(
             printed.contains(">>2u") && printed.contains("&3u") && printed.contains("&255u"),
             "the fetch is not a byte extraction: {printed}"
+        );
+        // The sign extension is what makes a western cell decode to a western cell, and it is only
+        // right for the signed buffer: the unsigned one gets the byte as it is.
+        assert_eq!(
+            printed.matches("^128").count(),
+            2,
+            "the two isamplerBuffer fetches did not each get a sign extension: {printed}"
+        );
+        let unsigned = printed
+            .lines()
+            .find(|line| line.contains("int other ="))
+            .expect("the usamplerBuffer fetch is gone");
+        assert!(
+            !unsigned.contains('^'),
+            "the sign extension leaked into a usamplerBuffer fetch: {unsigned}"
+        );
+        // Whatever index the shader asks for: naga rejects a bounds check written with `.length()`
+        // (see `RewriteFetches`), so this only pins down that the fetch is a plain byte read.
+        assert!(
+            !printed.contains(".inner.length()"),
+            "the fetch gained a bounds check naga will not compile: {printed}"
+        );
+    }
+
+    /// Runs both rewriters over a shader and prints the result, which is what a shader the game
+    /// actually compiles goes through.
+    fn rewrite(lines: &[&str]) -> String {
+        let uniform_map: HashMap<String, (u32, u32)> = HashMap::from([
+            ("CloudFaces".to_string(), (0, 4)),
+            ("OtherFaces".to_string(), (0, 5)),
+        ]);
+
+        let mut stage = ShaderStage::parse(lines.join("\n")).unwrap();
+
+        let mut rewriter = SamplerBufferRewriter {
+            is_sampler_buffer: false,
+            buffers: vec![],
+            kinds: HashMap::new(),
+            current_kind: TexelKind::default(),
+            uniform_sets: &uniform_map,
+        };
+        stage.visit_mut(&mut rewriter);
+        stage.visit_mut(&mut RewriteFetches {
+            buffers: &rewriter.buffers,
+            kinds: &rewriter.kinds,
+        });
+
+        let mut printed = String::new();
+        show_translation_unit(&mut printed, &mut stage);
+        println!("{printed}");
+        printed
+    }
+
+    /// What naga makes of a rewritten shader, which is what decides whether the game runs.
+    ///
+    /// The rewrite is only half the story: a shader this side produces can be perfectly good GLSL
+    /// and still fail naga's validator, and a shader module that fails validation is a wgpu error on
+    /// this side - a panic, and the process ends. That is what a `.length()` bounds check in the
+    /// texel fetch did the first time it was tried, and nothing but running the game said so.
+    fn naga_error(source: &str, stage: naga::ShaderStage) -> Option<String> {
+        use wgpu_mc::wgpu::naga;
+
+        let mut frontend = naga::front::glsl::Frontend::default();
+        let options = naga::front::glsl::Options {
+            stage,
+            defines: Default::default(),
+        };
+
+        let module = match frontend.parse(&options, source) {
+            Ok(module) => module,
+            Err(errors) => return Some(format!("{errors:?}")),
+        };
+
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+
+        match validator.validate(&module) {
+            Ok(_) => None,
+            Err(error) => Some(format!("{error:?}")),
+        }
+    }
+
+    /// The fetch a texel buffer is read with has to survive naga, bounds check included or not.
+    #[test]
+    fn the_rewritten_texel_fetch_survives_naga() {
+        let printed = rewrite(&[
+            "#version 450",
+            "uniform isamplerBuffer CloudFaces;",
+            "void main() {",
+            "  int index = 9;",
+            "  int cellX = texelFetch(CloudFaces, index).r;",
+            "  int cellZ = texelFetch(CloudFaces, index + 1).r;",
+            "  gl_Position = vec4(float(cellX), float(cellZ), 0.0, 1.0);",
+            "}",
+        ]);
+
+        if let Some(error) = naga_error(&printed, naga::ShaderStage::Vertex) {
+            panic!("naga rejects the rewritten texel buffer shader: {error}\n{printed}");
+        }
+    }
+
+    /// The tripwire for the bounds check that cannot be written yet.
+    ///
+    /// `texelFetch` past the end of the buffer is undefined in GL, so the fetch would like to clamp
+    /// its index - `(i >> 2) < inner.length() ? byte : 0`. naga 29's GLSL front end lowers
+    /// `.length()` on a runtime-sized array member to a *value* rather than a pointer, and its
+    /// validator refuses that outright (`InvalidPointerType`), in every position it was tried in.
+    /// The clamp is therefore left out, and this test says so: if a later naga accepts the idiom,
+    /// this fails, and the clamp can go into [`RewriteFetches`] and be deleted from the comment
+    /// above it.
+    #[test]
+    fn a_length_bounds_check_is_still_impossible() {
+        let source = "#version 450\nlayout(std430, set = 0, binding = 4) readonly buffer CloudFacesBlock { uint[] inner; } CloudFaces;\nlayout(location = 0) out vec4 colour;\nvoid main() {\n  int index = 9;\n  int cellX = ((uint(index) >> 2u) < uint(CloudFaces.inner.length())) ? int(CloudFaces.inner[uint(index) >> 2u] & 255u) : 0;\n  colour = vec4(float(cellX), 0.0, 0.0, 1.0);\n}\n";
+
+        assert!(
+            naga_error(source, naga::ShaderStage::Vertex).is_some(),
+            "naga now compiles a `.length()` bounds check: put the clamp back into the texel fetch"
         );
     }
 }

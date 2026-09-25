@@ -135,8 +135,43 @@ object WgpuNative {
 					)
 				}
 			}
+
+			// The symbols for that same build, next to the library - which is where a debugger looks
+			// for them. A PIX timing capture resolves the functions in its CPU samples and
+			// callstacks through the PDB that matches the module, so without this every frame from
+			// the native renderer is an address in the capture's function information. Written at
+			// the same time as the library and for the same reason: the two are one build, and a
+			// PDB from the previous one no longer matches.
+			copySymbolsBeside(mappedName)
 		}
 		return libraryFile.absolutePath
+	}
+
+	/**
+	 * Puts the PDB for [mappedName] beside the extracted library, if this build has one.
+	 *
+	 * Best effort on purpose: a build without symbols - or a packaged jar that carries only the
+	 * library - works exactly as before, it just profiles by address. The file is not locked by the
+	 * process that loaded the library (only debuggers read it), so it can be replaced while another
+	 * client is running.
+	 */
+	@JvmStatic
+	@Throws(IOException::class)
+	fun copySymbolsBeside(mappedName: String) {
+		val symbolsName = mappedName.substringBeforeLast('.') + ".pdb"
+		val resourceName = NATIVE_RESOURCE_ROOTS
+			.firstOrNull { WgpuNative::class.java.classLoader.getResource(it + symbolsName) != null }
+			?: return
+
+		val symbolsFile = File("lib", symbolsName)
+
+		try {
+			WgpuNative::class.java.classLoader.getResourceAsStream(resourceName + symbolsName).use { input ->
+				Files.copy(input!!, symbolsFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+			}
+		} catch (error: IOException) {
+			dev.birb.wgpu.WgpuMcMod.LOGGER.warn("wgpu: could not write {}: {}", symbolsFile, error.message)
+		}
 	}
 
 	@JvmStatic
