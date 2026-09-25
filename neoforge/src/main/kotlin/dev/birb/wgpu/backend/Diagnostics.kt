@@ -182,25 +182,47 @@ object Diagnostics {
     /** Labels already dumped by [dumpPassTarget], so an atlas is written once, not once per mip. */
     private val dumpedPasses = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    /** The dump prefix [label] matches, or null when its target is not dumped at all. */
+    private fun dumpPrefixFor(label: String): String? = when {
+        label.startsWith(DUMP_PASS_PREFIX) -> DUMP_PASS_PREFIX
+        label.startsWith(DUMP_PASS_PREFIX_2) -> DUMP_PASS_PREFIX_2
+        else -> null
+    }
+
+    /**
+     * Whether [dumpPassTarget] would dump this pass, i.e. whether it is worth submitting for.
+     *
+     * A dump is a readback, and a readback is one of the two places this backend submits - so the
+     * caller asks first, because submitting for every pass of the frame would put the submission
+     * count back where it was and then some.
+     */
+    @JvmStatic
+    fun dumpsPass(label: String): Boolean {
+        val prefix = dumpPrefixFor(label) ?: return false
+        return !dumpedPasses.contains("$prefix/$label")
+    }
+
     /**
      * Dumps the colour target of an `Animate ...` or `Clouds` pass once per label.
      *
-     * Called after the pass has been submitted, so what lands in the file is the atlas as the GPU
-     * had it at the end of that pass rather than whatever the texture held before it ran.
+     * Called by the pass after it has closed - and after the caller has submitted for it, because
+     * the pass's own commands are still in the frame's encoder until then, and a dump reads what the
+     * GPU has rather than what the encoder is holding.
      */
     @JvmStatic
     fun dumpPassTarget(renderer: MemorySegment, label: String, texture: MemorySegment?) {
         if (texture == null) return
 
-        val prefix = when {
-            label.startsWith(DUMP_PASS_PREFIX) -> DUMP_PASS_PREFIX
-            label.startsWith(DUMP_PASS_PREFIX_2) -> DUMP_PASS_PREFIX_2
-            else -> return
-        }
-
+        val prefix = dumpPrefixFor(label) ?: return
         if (!dumpedPasses.add("$prefix/$label")) return
 
-        val name = "pass-" + label.removePrefix(prefix).replace(Regex("[^A-Za-z0-9]+"), "-").trim('-') + ".raw"
+        // Stripping the prefix leaves nothing for a pass that *is* the prefix ("Clouds"), so the
+        // label itself is the fallback rather than an empty file name.
+        val trimmed = label.removePrefix(prefix)
+        val suffix = (if (trimmed.isBlank()) label else trimmed)
+            .replace(Regex("[^A-Za-z0-9]+"), "-")
+            .trim('-')
+        val name = "pass-$suffix.raw"
         // A pass target is a render target, so its rows are the other way up from the image that
         // ends up on screen - see `dumpTexture` - and the point of this dump is to be looked at next
         // to a frame dump.

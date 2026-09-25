@@ -950,8 +950,12 @@ public class WgpuRenderPass implements RenderPassBackend {
             // pool for the next pass on this thread: nothing here frees anything per draw.
             drawCallBuffer.release();
             encoder.onRenderPassClosed();
-            // After the pass is submitted, not before: the atlas this dumps is a render result.
-            if (Diagnostics.isEnabled()) {
+            // After the pass has closed, so the target holds a render result rather than whatever it
+            // held before it ran - and submitted for, because this dump is a readback and the pass's
+            // own commands are still waiting in the frame's encoder. Only for a pass that is dumped:
+            // submitting for every pass of every frame is what this backend just stopped doing.
+            if (Diagnostics.isEnabled() && Diagnostics.dumpsPass(label)) {
+                encoder.submitForReadback();
                 Diagnostics.dumpPassTarget(device.renderer(), label, nativeColorTexture);
             }
         }

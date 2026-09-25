@@ -32,6 +32,21 @@ private const val MAPPING_ALIGNMENT = 16
 private fun roundUpToAlignment(length: Long): Long =
     (length + MAPPING_ALIGNMENT - 1) / MAPPING_ALIGNMENT * MAPPING_ALIGNMENT
 
+/** `TextureAtlas#uploadAnimationFrames` labels its pass `"Animate " + the atlas location`. */
+private const val ANIMATE_PASS_PREFIX = "Animate "
+
+/**
+ * Sprite animation passes since the renderer started, and the count the last report was made at.
+ *
+ * Shared by every encoder, because Minecraft makes a fresh one per pass and a per-instance counter
+ * would report each pass as the first one.
+ */
+private val ANIMATION_PASSES = java.util.concurrent.atomic.AtomicLong()
+private val ANIMATION_REPORTED_COUNT = java.util.concurrent.atomic.AtomicLong()
+
+@Volatile
+private var ANIMATION_REPORTED_AT = 0L
+
 /**
  * Blaze3D's command encoder, forwarding to a `wgpu::CommandEncoder`.
  *
@@ -114,26 +129,80 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
     ): RenderPassBackend {
         check(!closed.get()) { "Command encoder is closed" }
         inPass = true
+
+        val name = label.get()
+        if (name.startsWith(ANIMATE_PASS_PREFIX)) {
+            reportAnimationPass()
+        }
+
         return WgpuRenderPass(device, this, label, colorTexture, clearColor, depthTexture, clearDepth)
+    }
+
+    /**
+     * Diagnostics: that the atlas animation is running, once a second.
+     *
+     * `TextureAtlas#cycleAnimationFrames` re-renders every animated sprite into the atlas through an
+     * `Animate <atlas>` pass whenever a frame of it is due, so these passes going by at a steady rate
+     * *is* the animation: the passes are the only thing that makes an animated texture change. This
+     * side used to cancel that call outright (a mixin, from before the atlas render path worked), and
+     * with the cancel in place the count drops to zero once the resources are loaded - which looks
+     * exactly like an atlas whose sprites are simply not animated.
+     */
+    private fun reportAnimationPass() {
+        val now = System.nanoTime()
+        val count = ANIMATION_PASSES.incrementAndGet()
+        if (now - ANIMATION_REPORTED_AT < 1_000_000_000L) {
+            return
+        }
+
+        val since = count - ANIMATION_REPORTED_COUNT.getAndSet(count)
+        ANIMATION_REPORTED_AT = now
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info("wgpu: {} sprite animation passes in the last second", since)
     }
 
     /** Invoked by [WgpuRenderPass.close] once the pass has been recorded natively. */
     fun onRenderPassClosed() {
         inPass = false
-        flush()
     }
 
     override fun isInRenderPass(): Boolean = inPass
 
-    private fun flush() {
+    /**
+     * Submits everything recorded so far.
+     *
+     * This is called from exactly two kinds of place: before a **readback** - a copy whose result
+     * somebody is about to look at - and, through the native blit, before a **present**. Everything
+     * else is recorded and left alone, because a submission is not free and there is no reason to
+     * have more than one a frame:
+     *
+     *  - wgpu keeps recording order inside one encoder, so a clear, a pass, an upload and the next
+     *    pass are executed in the order they were recorded whichever submission carries them, and
+     *    the barriers between them are inserted by wgpu either way;
+     *  - an upload through `Queue::write_buffer` or `write_texture` is applied at the *next*
+     *    submission, ahead of the commands in it. That is what makes batching safe for Minecraft's
+     *    uploads: it writes every uniform, vertex block and face mesh into a *fresh* slice of a ring
+     *    buffer and never re-writes a region an already recorded draw reads, so "all of this frame's
+     *    uploads, then all of this frame's commands" is the order it is written for;
+     *  - a *readback* is the exception in both directions: `Queue::write_buffer` data is not
+     *    visible to a command that was recorded after it unless the two are submitted together, and
+     *    a copy whose result is read on the CPU has to have been submitted at all.
+     *
+     * A render pass borrows the encoder for as long as it is open, so this must not be called from
+     * inside one - the native side refuses (and says so) rather than finishing an encoder wgpu is
+     * still holding.
+     */
+    fun submitForReadback() {
         WmNative.flushEncoder.invokeExact(device.renderer, nativeEncoder) as Unit
     }
 
     // wgpu has no standalone clear, so each of these records a render pass whose only job is its
-    // load op and submits it. They are not optional: `GameRenderer` clears the main colour and
-    // depth textures this way before drawing anything, every frame, and with the clear dropped the
-    // frame kept whatever the textures already held - a black window once the depth test became a
-    // real `LESS_THAN_OR_EQUAL`, because an uncleared depth buffer rejects every fragment.
+    // load op. They are not optional: `GameRenderer` clears the main colour and depth textures this
+    // way before drawing anything, every frame, and with the clear dropped the frame kept whatever
+    // the textures already held - a black window once the depth test became a real
+    // `LESS_THAN_OR_EQUAL`, because an uncleared depth buffer rejects every fragment.
+    //
+    // They are *recorded*, not submitted: the pass is one more command in the frame's encoder, and
+    // the submission at present carries it - see `submitForReadback`.
     //
     // `clear_texture` would not do: it clears to zero, and Minecraft clears depth to 1.0.
 
@@ -143,7 +212,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             (colorTexture as WgpuTexture).nativeTexture,
             clearColor,
         ) as Unit
-        flush()
     }
 
     override fun clearColorAndDepthTextures(
@@ -159,7 +227,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             (depthTexture as WgpuTexture).nativeTexture,
             clearDepth,
         ) as Unit
-        flush()
     }
 
     override fun clearColorAndDepthTextures(
@@ -183,7 +250,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             regionWidth,
             regionHeight,
         ) as Unit
-        flush()
     }
 
     override fun clearDepthTexture(depthTexture: GpuTexture, clearDepth: Double) {
@@ -192,7 +258,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             (depthTexture as WgpuTexture).nativeTexture,
             clearDepth,
         ) as Unit
-        flush()
     }
 
     /**
@@ -209,7 +274,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             data.remaining().toLong(),
             MemorySegment.ofBuffer(data),
         ) as Unit
-        flush()
     }
 
     /**
@@ -648,7 +712,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             target.offset(),
             source.length(),
         ) as Unit
-        flush()
     }
 
     /**
@@ -696,7 +759,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             ) as Unit
         }
         dumpUploadIfRequested(destination as WgpuTexture, depthOrLayer)
-        flush()
     }
 
     override fun writeToTexture(
@@ -738,7 +800,6 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             height,
         ) as Unit
         dumpUploadIfRequested(destination as WgpuTexture, depthOrLayer)
-        flush()
     }
 
     override fun copyTextureToBuffer(
@@ -782,7 +843,11 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             width,
             height,
         ) as Unit
-        flush()
+
+        // A readback: the callback is handed a buffer the copy has to have filled, so this is one of
+        // the two places a submission is not optional. It is also what `Screenshot` goes through -
+        // `UberGpuBuffer` copies the frame into a mappable buffer and reads it in the callback.
+        submitForReadback()
         callback.run()
     }
 
@@ -809,16 +874,12 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             width,
             height,
         ) as Unit
-        flush()
     }
 
     override fun presentTexture(texture: GpuTextureView) {
-        // Everything recorded so far has to be on the queue before the blit is, or the swapchain
-        // gets an image of the target as it was before this frame's draws went in. Pass closes
-        // already flush, but the frame that ends with an open pass would present one frame behind,
-        // and "one frame behind" is indistinguishable from "a frame nothing drew into".
-        flush()
-
+        // No submission here: the native blit records itself into the same encoder the frame is in
+        // and submits once, at the end, before the swapchain image is presented. That is the frame's
+        // one submission - the clears, the passes, the writes and this blit all travel in it.
         val view = texture as WgpuTextureView
         val described = "${view.texture.getWidth(0)}x${view.texture.getHeight(0)}"
         if (Diagnostics.isEnabled() && presented.add(described)) {

@@ -777,6 +777,9 @@ pub struct CommandEncoderHandle;
 /// The one native encoder, heap-allocated so its address is stable for the passes that borrow it.
 static SHARED_ENCODER: Mutex<Option<usize>> = Mutex::new(None);
 
+/// Submissions since the last `log_render_stats`, reported there.
+static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
 fn new_encoder(wm: &WmRenderer) -> wgpu::CommandEncoder {
     wm.gpu
         .device
@@ -818,7 +821,27 @@ fn with_shared_encoder<R>(body: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> 
 }
 
 /// Submits whatever the shared encoder has recorded and starts a new one.
+///
+/// This is the *only* submission point there is: the JVM side records clears, passes, copies and
+/// uploads into this one encoder and asks for a submit from two places - before a readback, and,
+/// through the blit below, before a present. Everything else used to flush after itself, which was
+/// ten submissions a frame, and the frame's own boundaries are cleaner for it: the start timestamp
+/// of a frame's GPU measurement now lands at the start of the frame rather than at whichever
+/// mid-frame flush happened last.
+///
+/// A render pass borrows the encoder while it is recording it, so finishing the encoder here would
+/// pull it out from under that borrow. The JVM side does not do that, and if it ever does, this
+/// refuses and says so rather than corrupting the recording.
 fn flush_shared_encoder(wm: &WmRenderer) {
+    if LIVE_PASS_COUNT.load(Ordering::Relaxed) != 0 {
+        error!(
+            "wgpu-mc: refusing to submit while {} render pass(es) are open; the recording stays in \
+             the encoder",
+            LIVE_PASS_COUNT.load(Ordering::Relaxed)
+        );
+        return;
+    }
+
     let pointer = shared_encoder();
 
     // Safety: as above - the render thread is the only one recording, and it is here.
@@ -828,6 +851,7 @@ fn flush_shared_encoder(wm: &WmRenderer) {
     // frame has already been presented, its start timestamp goes here - see `timing`.
     crate::timing::frame_begin(wm, unsafe { &mut *pointer });
 
+    SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
     wm.gpu.queue.submit([finished.finish()]);
 }
 
@@ -2274,6 +2298,11 @@ pub extern "C" fn log_render_stats() {
     // block nobody reads.
     let stats = with_counters(Counters::take);
 
+    // Submissions are not one of the per-thread counters: there is one encoder for the whole
+    // renderer, so this is the number the frame boundary costs - one per frame is the target, and
+    // the diagnostics line is where "did that stay true" is answered.
+    let submissions = SUBMISSIONS.swap(0, Ordering::Relaxed);
+
     let RenderStats {
         passes,
         pipelines,
@@ -2304,7 +2333,7 @@ pub extern "C" fn log_render_stats() {
     info!(
         "wgpu-mc: render stats: {passes} render passes ({empty} of them empty, last had {last} \
          draws), {pipelines} pipeline binds, {draws} draws ({bind_groups} bind groups built, \
-         {hits} cache hits and {misses} misses), {vertices} vertices"
+         {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions"
     );
 
     // Read in one lock rather than two: a guard taken inside the `info!` argument list lives until
@@ -3427,7 +3456,8 @@ pub extern "C" fn submit_command_encoder(wm: &WmRenderer, _encoder: Box<CommandE
 /// Blits the frame into the swapchain image, and submits it.
 ///
 /// The blit is what turns the main target's clip space back over - see `PresentBlit` - and it is
-/// recorded into the shared encoder rather than one of its own.
+/// recorded into the shared encoder rather than one of its own: the whole frame is in that encoder,
+/// and this is the submission that carries it, right before the swapchain image is presented.
 #[unsafe(no_mangle)]
 pub extern "C" fn blit_from_texture(
     wm: &WmRenderer,
@@ -3460,10 +3490,10 @@ pub extern "C" fn blit_from_texture(
                 array_layer_count: None,
             });
 
-        // Recorded into the one encoder this side owns and submitted here, rather than through an
-        // encoder of its own: Minecraft's encoder was flushed just before this, so the shared one is
-        // empty, and the last thing it recorded is the frame that is about to be presented. This was
-        // a `create_command_encoder` and a submit of its own every frame.
+        // Recorded into the one encoder this side owns, after everything else the frame recorded,
+        // and submitted here: this is the frame's single submission and the swapchain image is
+        // presented straight after it. The blit has to be in the same submission as the passes that
+        // drew the target, or the swapchain gets the image as it was before them.
         with_shared_encoder(|encoder| {
             state
                 .blitter

@@ -1052,6 +1052,34 @@ Flipping the dumped atlas made it look like a normal `gui.png` again. After the 
 reports the sprite's *first* row at (723, 1), rows running downwards, which is the coordinate the
 stitcher packed it at.
 
+### The atlas animation was cancelled, and is not any more
+
+Animated sprites did not animate: water, lava, fire, the clock and the compass all held their first
+frame. That was deliberate, and it was a leftover from before the render path above worked - a mixin
+cancelled `TextureAtlas#cycleAnimationFrames` outright:
+
+```java
+@Inject(method = "cycleAnimationFrames", cancellable = true, at = @At("HEAD"))
+private void dontTickAnimatedSprites(CallbackInfo ci) { ci.cancel(); }
+```
+
+The mixin is gone. `cycleAnimationFrames` re-renders the dirty frames of every animated sprite
+through the same `Animate <atlas>` pass that builds the atlas in the first place
+(`SpriteContents.AnimationState#drawToAtlas`), so once that pass renders correctly - one mip level
+per pass, the right way up - there is nothing left for the cancel to work around.
+
+It is worth knowing that these passes are the *only* thing that makes an animated texture change:
+`TextureAtlas#uploadAnimationFrames` runs them, and if it does not, the atlas simply keeps the frame
+it was built with. The renderer therefore counts them, once a second, with the diagnostics on:
+
+```
+wgpu: 130 sprite animation passes in the last second
+```
+
+Zero there after the resource load means the animation is not running, which is a diagnosis rather
+than a guess - the passes are cheap (one quad per dirty sprite per mip) and ~130 a second is a world
+running at ~150 frames a second with the blocks, items and GUI atlases all animating.
+
 ### The scissor rectangle is OpenGL's, and is forwarded as it is
 
 `RenderPassBackend#enableScissor` used to be a no-op on the grounds that 26.1 never calls it. It
@@ -1226,6 +1254,44 @@ and the diagnostics that read a uniform back are rationed to four a second. The 
 doing 4722 readbacks for the blocks atlas alone - Minecraft binds one uniform *per sprite* while it
 animates an atlas, and keying the "report this again" set by offset instead of by name made every
 sprite a fresh readback, each one allocating, submitting and waiting.
+
+### One submission a frame, and only where something reads the result
+
+One encoder was the first half of that fix and this is the second: an encoder that everything shares
+is no use if everything also *submits* it. `flush_encoder` used to be called after every clear, every
+pass close, every upload, every copy and the blit, which is ten submissions a frame at two hundred
+frames a second - ten command buffers, ten sets of GPU-side allocations and ten chances for the
+driver to serialise.
+
+There are now two submission points, and both exist because something is about to *look* at the
+result:
+
+- **before a present**, inside the native blit - which is also where the frame's GPU timestamp ends,
+  so the frame boundary and the submission boundary are the same thing. That is what makes the
+  measurement mean "this frame" rather than "the last segment of this frame", which is what it
+  measured while a frame was split into ten submissions;
+- **before a readback**: `copyTextureToBuffer`'s callback (26.1's screenshots go through it) and a
+  pass-target dump. A readback is the one case where batching cannot be left implicit, because
+  `Queue::write_buffer` data is applied *at* a submission and a copy whose result is read on the CPU
+  has to have been submitted at all.
+
+Everything else - clears, passes, texture uploads, buffer copies - is recorded and left in the
+encoder. That is safe for the same reason the ring buffers exist: Minecraft writes every uniform,
+vertex block and face mesh into a *fresh* slice of a ring and never re-writes a region an already
+recorded draw reads, so "all of this frame's uploads, then all of this frame's commands" is the order
+it is written for, and recording order inside one encoder is execution order either way.
+
+The result is one submission for 120 presented frames, which the render stats line now says out loud:
+
+```
+wgpu-mc: render stats: 1476 render passes (0 of them empty, last had 1 draws), 2726 pipeline binds,
+27545 draws (...), 43925112 vertices, 120 submissions
+```
+
+A pass borrows the encoder while it is open, so `flush_shared_encoder` refuses to submit while
+`LIVE_PASS_COUNT` is non-zero and says so at error level: finishing an encoder out from under an open
+pass is not a thing to do quietly, and the count being non-zero there would be a bug in the caller
+rather than a timing accident.
 
 ### One plan for a pipeline's bindings
 
