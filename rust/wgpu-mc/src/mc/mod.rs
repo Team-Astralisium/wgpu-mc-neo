@@ -90,7 +90,7 @@ impl Block {
                     }
                 }
 
-                let mesh = multipart.generate_mesh(key, resource_provider, block_atlas);
+                let mesh = multipart.generate_mesh(key, resource_provider, block_atlas)?;
 
                 let mut multipart_write = multipart.keys.write();
                 multipart_write.insert(key_string, mesh.clone());
@@ -98,21 +98,25 @@ impl Block {
                 Some((mesh, multipart_write.len() as u16 - 1))
             }
             Block::Variants(variants) => {
+                // A variant whose models all failed to bake is skipped rather than indexed into:
+                // `variants` can hold an empty mesh list now that a bad model is dropped instead of
+                // taking the registry with it (see `bake_blocks`).
                 let full =
                     variants
                         .iter()
                         .enumerate()
-                        .find(|(_, (variant_key, _model_mesh))| {
-                            variant_key.iter().all(
-                                |(variant_property_key, variant_property_value)| {
-                                    key_map
-                                        .get(&variant_property_key[..])
-                                        .map_or(false, |v| v == &variant_property_value)
-                                },
-                            )
+                        .find(|(_, (variant_key, model_meshes))| {
+                            !model_meshes.is_empty()
+                                && variant_key.iter().all(
+                                    |(variant_property_key, variant_property_value)| {
+                                        key_map
+                                            .get(&variant_property_key[..])
+                                            .map_or(false, |v| v == &variant_property_value)
+                                    },
+                                )
                         })?;
 
-                Some((full.1.1[0].clone(), full.0 as u16))
+                Some((full.1.1.first()?.clone(), full.0 as u16))
             }
         }
     }
@@ -125,13 +129,18 @@ pub struct Multipart {
 }
 
 impl Multipart {
+    /// The mesh a multipart block's cases add up to, or `None` if one of them cannot be baked.
+    ///
+    /// A multipart mesh is generated on demand - once per state a player actually looks at - so a
+    /// model that fails here fails in the middle of the game rather than during the block cache, and
+    /// `None` lets the caller fall back to the block it uses for a state with no model.
     pub fn generate_mesh<'a>(
         &self,
         key: impl IntoIterator<Item = (&'a str, &'a schemas::blockstates::multipart::StateValue)>
         + Clone,
         resource_provider: &dyn ResourceProvider,
         block_atlas: &Atlas,
-    ) -> Arc<ModelMesh> {
+    ) -> Option<Arc<ModelMesh>> {
         let apply_variants = self.cases.iter().filter_map(|case| {
             if case.applies(key.clone()) {
                 Some(case.apply.models())
@@ -140,14 +149,20 @@ impl Multipart {
             }
         });
 
-        let mesh = ModelMesh::bake(
+        match ModelMesh::bake(
             apply_variants.into_iter().flatten(),
             resource_provider,
             block_atlas,
-        )
-        .unwrap();
-
-        Arc::new(mesh)
+        ) {
+            Ok(mesh) => Some(Arc::new(mesh)),
+            Err(err) => {
+                log::warn!(
+                    "wgpu-mc: a multipart model could not be baked ({err:?}); the state is drawn as \
+                     bedrock, the same as one with no model at all"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -184,6 +199,12 @@ pub struct RenderEffectsData {
 pub struct Scene {
     pub section_storage: RwLock<SectionStorage>,
     pub camera_section_pos: RwLock<IVec2>,
+    /// The camera section the arena was last trimmed against.
+    ///
+    /// Trimming walks every section the arena holds, so it happens when the camera crosses into
+    /// another section rather than once per frame: a frame where the camera stayed put has nothing to
+    /// free, and the walk would cost more than the frames it ran on.
+    pub trimmed_section_pos: RwLock<IVec2>,
     pub chunk_buffer: Arc<BindableBuffer>,
 
     pub indirect_buffer: Arc<wgpu::Buffer>,
@@ -208,6 +229,7 @@ impl Scene {
         Self {
             section_storage: RwLock::new(SectionStorage::new((buffer_size / 4) as u32)),
             camera_section_pos: RwLock::new(ivec2(0, 0)),
+            trimmed_section_pos: RwLock::new(ivec2(i32::MAX, i32::MAX)),
             chunk_buffer: Arc::new(BindableBuffer::new_deferred(
                 wm,
                 buffer_size,
@@ -313,22 +335,44 @@ impl MinecraftState {
     ) {
         let mut block_manager = self.block_manager.write();
         let atlases = self.texture_manager.atlases.read();
-        let block_atlas = atlases.get(BLOCK_ATLAS).unwrap();
+        // Not a panic: nothing registers a block atlas in this build yet - the Fabric module's atlas
+        // loader was never ported - and a `#[jni_fn]` frame cannot unwind, so a missing atlas used to
+        // be the JVM aborting on the block cache thread. Say what is missing and leave the registry
+        // empty; everything that needs block models (the Rust terrain baker) will find it empty and
+        // do nothing.
+        let Some(block_atlas) = atlases.get(BLOCK_ATLAS) else {
+            log::error!(
+                "wgpu-mc: no block atlas is registered, so block models cannot be baked - the Rust \
+                 terrain path needs one (see `bake_blocks`)"
+            );
+            return;
+        };
 
         //Figure out which block models there are
         block_states
             .into_iter()
             .for_each(|(block_name, block_state)| {
-                let blockstates: schemas::BlockStates =
-                    serde_json::from_str(&self.resource_provider.get_string(block_state).unwrap())
-                        .unwrap();
+                // One missing or malformed blockstate file must not take the game down: this runs on
+                // a background thread whose panics abort the JVM.
+                let Some(json) = self.resource_provider.get_string(block_state) else {
+                    log::warn!("wgpu-mc: {} has no blockstate file; skipping it", block_state.0);
+                    return;
+                };
+
+                let blockstates: schemas::BlockStates = match serde_json::from_str(&json) {
+                    Ok(blockstates) => blockstates,
+                    Err(err) => {
+                        log::warn!("wgpu-mc: {} could not be read: {err}", block_state.0);
+                        return;
+                    }
+                };
 
                 let block = match &blockstates {
                     schemas::BlockStates::Variants { variants } => {
                         let meshes: IndexMap<Vec<(String, StateValue)>, Vec<Arc<ModelMesh>>> =
                             variants
                                 .iter()
-                                .map(|(variant_id, variant)| {
+                                .filter_map(|(variant_id, variant)| {
                                     let key_iter = if !variant_id.is_empty() {
                                         variant_id
                                             .split(',')
@@ -352,23 +396,31 @@ impl MinecraftState {
                                         vec![]
                                     };
 
-                                    (
-                                        key_iter,
-                                        variant
-                                            .models()
-                                            .iter()
-                                            .map(|variation| {
-                                                Arc::new(
-                                                    ModelMesh::bake(
-                                                        std::slice::from_ref(variation),
-                                                        &*self.resource_provider,
-                                                        block_atlas,
-                                                    )
-                                                    .unwrap(),
-                                                )
-                                            })
-                                            .collect::<Vec<Arc<ModelMesh>>>(),
-                                    )
+                                    // A variant whose model cannot be baked is dropped rather than
+                                    // unwrapped: one bad model in one blockstate file used to abort
+                                    // the whole registry, which is the difference between a block
+                                    // that does not draw and no terrain at all. The block itself
+                                    // stays registered, with the variants that did bake.
+                                    let mut meshes = Vec::with_capacity(variant.models().len());
+                                    for variation in variant.models() {
+                                        match ModelMesh::bake(
+                                            std::slice::from_ref(variation),
+                                            &*self.resource_provider,
+                                            block_atlas,
+                                        ) {
+                                            Ok(mesh) => meshes.push(Arc::new(mesh)),
+                                            Err(err) => {
+                                                log::warn!(
+                                                    "wgpu-mc: {} variant {variant_id} could not be \
+                                                     baked ({err:?}); skipping it",
+                                                    block_name.as_ref()
+                                                );
+                                                return None;
+                                            }
+                                        }
+                                    }
+
+                                    Some((key_iter, meshes))
                                 })
                                 .collect();
 

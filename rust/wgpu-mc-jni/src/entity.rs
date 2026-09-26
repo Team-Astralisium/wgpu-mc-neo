@@ -183,25 +183,73 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
     let entities_json_javastr = env.get_string(&string).unwrap();
     let entities_json: String = entities_json_javastr.into();
 
-    let mpd: HashMap<String, ModelPartData> =
-        serde_json::from_str::<HashMap<String, Wrapper1>>(&entities_json)
-            .unwrap()
-            .into_iter()
-            .map(|(name, wrapper)| (name, wrapper.data.data))
-            .collect();
+    // What arrives is Gson's reflection over the game's own layer definitions, not a shape this side
+    // owns, so a field it does not expect - or one that is missing - is a parse failure, and the
+    // whole upload used to be an `unwrap`: the process ended on the way *out* of a world, because
+    // the renderer is recreated when a world is left and the upload runs again. The layers that
+    // cannot be read are skipped instead, which leaves the ones from the first upload in place.
+    let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(&entities_json) {
+        Ok(raw) => raw,
+        Err(err) => {
+            log::error!("wgpu-mc: the entity models could not be read ({err}); keeping the ones already registered");
+            return;
+        }
+    };
+
+    let mut skipped = Vec::new();
+    let mpd: HashMap<String, ModelPartData> = raw
+        .into_iter()
+        .filter_map(|(name, value)| match serde_json::from_value::<Wrapper1>(value) {
+            Ok(wrapper) => Some((name, wrapper.data.data)),
+            Err(err) => {
+                skipped.push(format!("{name} ({err})"));
+                None
+            }
+        })
+        .collect();
+
+    if !skipped.is_empty() {
+        log::warn!(
+            "wgpu-mc: {} entity model layer(s) could not be read: {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+
+    // Nothing readable at all: the entity registry is left as it was rather than emptied. The
+    // renderer is recreated when a world is left, and the upload that follows does not have to
+    // produce the same graph - clearing the registry there would take every entity's model away for
+    // the rest of the session.
+    if mpd.is_empty() {
+        log::error!(
+            "wgpu-mc: no entity model layer could be read, so the ones already registered are kept"
+        );
+        return;
+    }
 
     let atlases = wm.mc.texture_manager.atlases.write();
-    let _atlas = atlases.get(ENTITY_ATLAS).unwrap();
+    let Some(_atlas) = atlases.get(ENTITY_ATLAS) else {
+        log::error!(
+            "wgpu-mc: no entity atlas is registered, so entity models cannot be built - the entity \
+             pass needs one (see `WmRenderer::init`)"
+        );
+        return;
+    };
 
     let entities: HashMap<String, Arc<Entity>> = mpd
         .iter()
-        .map(|(name, mpd)| {
-            let entity_part = tmd_to_wm("root".into(), mpd, [0, 0]).unwrap();
+        .filter_map(|(name, mpd)| {
+            // The same trade as above: a layer whose parts do not describe a single cuboid is one
+            // entity that does not draw, rather than an upload that ends the process.
+            let Some(entity_part) = tmd_to_wm("root".into(), mpd, [0, 0]) else {
+                log::warn!("wgpu-mc: entity model {name} has parts this side cannot read; skipping it");
+                return None;
+            };
 
-            (
+            Some((
                 name.clone(),
                 Arc::new(Entity::new(name.clone(), entity_part, &wm.gpu)),
-            )
+            ))
         })
         .collect();
 

@@ -1115,6 +1115,13 @@ public class WgpuRenderPass implements RenderPassBackend {
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INDEXED, indexed ? 1 : 0);
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_LEN, bindings.getCount());
 
+        // The combination this draw's bindings make up, and whether the table in the buffer is the
+        // one it was built from. Zero means "work the identity out from the table", which is what the
+        // native side did before combinations existed; numbering them is what turns that per-draw
+        // walk into one integer comparison, and it is done where the bindings are known - here.
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COMBO, 0);
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, 1);
+
         reportCloudDraw(first, count, baseVertex, indexed);
         checkTexelReadRange(count, indexed);
         traceDraw(first, count, baseVertex, instanceCount, indexed);
@@ -1126,7 +1133,16 @@ public class WgpuRenderPass implements RenderPassBackend {
         // build a bind group from it, and this names the culprit before that happens.
         reportEmptySlots();
 
-        invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
+        boolean recorded = (boolean) invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
+
+        if (!recorded) {
+            // Unreachable while every draw carries its whole binding table: the native side only
+            // refuses a draw that names a combination it has never seen *and* leaves the bindings
+            // behind. If it ever happens, the picture is missing draws rather than wrong ones.
+            dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                    "wgpu: the native side refused a draw of {} that carried its bindings",
+                    activePipelineName);
+        }
     }
 
     /**

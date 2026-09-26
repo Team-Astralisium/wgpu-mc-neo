@@ -11,7 +11,7 @@ use glsl::syntax::{
 use glsl::transpiler::glsl::show_translation_unit;
 use glsl::visitor::HostMut;
 use jni::objects::JClass;
-use jni::sys::jlong;
+use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use log::{error, info, warn};
@@ -661,7 +661,26 @@ fn try_create_renderer(
 /// that are not addressed by pointer (`getBackend`, `bakeSection`, `reloadShaders`) read it from
 /// there, and because a `OnceCell` in a `static` is never dropped, the pointer stays valid for
 /// as long as the process runs.
-fn register_renderer(wm: WmRenderer) -> jlong {
+fn register_renderer(wm: WmRenderer, framebuffer: (u32, u32)) -> jlong {
+    // The renderer's own atlases - the block atlas among them - are created here, as the Fabric
+    // module did before the port. Nothing is packed into them yet: the atlas fills as block models
+    // are read (`block.rs` allocates a texture the first time a model names one), so this only has to
+    // happen before the first bake, and this is the earliest point where there is a device to make
+    // the textures with.
+    wm.init();
+
+    // The scene needs a framebuffer size and the renderer needs to exist before it can have one, so
+    // it is created here, with the size the JVM read from the window it just made. A renderer created
+    // without a window - or before the window has a size - gets its scene on the first presented
+    // frame instead; see `blit_from_texture`.
+    if framebuffer.0 != 0 && framebuffer.1 != 0 {
+        wm.ensure_scene(wgpu::Extent3d {
+            width: framebuffer.0,
+            height: framebuffer.1,
+            depth_or_array_layers: 1,
+        });
+    }
+
     if RENDERER.set(wm).is_err() {
         error!("wgpu-mc: a renderer has already been registered");
         return 0;
@@ -675,7 +694,7 @@ fn register_renderer(wm: WmRenderer) -> jlong {
 ///
 /// Kept separate from the JNI wrappers below so the renderer can also be created from Rust code
 /// and so every JVM-side declaration shares one implementation.
-pub fn create_renderer(env: &mut JNIEnv, display: u64, window: u64) -> jlong {
+pub fn create_renderer(env: &mut JNIEnv, display: u64, window: u64, width: u32, height: u32) -> jlong {
     let requested = selected_backend();
 
     // The configured backend is tried first, then the other one. A backend that is valid in the
@@ -703,7 +722,7 @@ pub fn create_renderer(env: &mut JNIEnv, display: u64, window: u64) -> jlong {
             info!("wgpu-mc: renderer created through {backend:?}");
         }
 
-        return register_renderer(wm);
+        return register_renderer(wm, (width, height));
     }
 
     error!(
@@ -716,14 +735,22 @@ pub fn create_renderer(env: &mut JNIEnv, display: u64, window: u64) -> jlong {
 /// JNI entry point used by the Java/Kotlin backend to obtain the `WmRenderer` pointer.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn createWmRenderer(mut env: JNIEnv, _: JClass) -> jlong {
-    create_renderer(&mut env, 0, 0)
+    // No window, so no framebuffer size: the scene is made by the first presented frame.
+    create_renderer(&mut env, 0, 0, 0, 0)
 }
 
 /// JNI entry point that also registers an existing window, so the adapter can be required to be
 /// able to present to it. `display` and `window` are the raw handles GLFW reports.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn createWmRendererOnWindow(mut env: JNIEnv, _: JClass, display: jlong, window: jlong) -> jlong {
-    create_renderer(&mut env, display as u64, window as u64)
+pub fn createWmRendererOnWindow(
+    mut env: JNIEnv,
+    _: JClass,
+    display: jlong,
+    window: jlong,
+    width: jint,
+    height: jint,
+) -> jlong {
+    create_renderer(&mut env, display as u64, window as u64, width as u32, height as u32)
 }
 
 #[unsafe(no_mangle)]
@@ -779,6 +806,32 @@ static SHARED_ENCODER: Mutex<Option<usize>> = Mutex::new(None);
 
 /// Submissions since the last `log_render_stats`, reported there.
 static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Presents since the last `log_render_stats`, reported beside the submissions.
+///
+/// The two numbers together are the question this path is judged by - "how many submissions does a
+/// frame cost" - and neither is answerable without the other: a submission count alone cannot tell
+/// one-per-frame apart from two, and the frame rate is not the same number as the present count.
+static PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+
+
+/// The submission the frame being recorded ended with, if it has submitted yet.
+static LAST_SUBMISSION: Mutex<Option<wgpu::SubmissionIndex>> = Mutex::new(None);
+
+/// The submissions of the frames in flight, oldest first.
+///
+/// A present pushes the frame it is presenting and waits for whatever is left once
+/// the rames in flight setting of them are outstanding, which is what the wait at the bottom of
+/// `present_surface` uses.
+static IN_FLIGHT_SUBMISSIONS: Mutex<std::collections::VecDeque<wgpu::SubmissionIndex>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Notes the submission a frame - or a readback - ended with, so the next present knows what to wait
+/// for and how much is in flight.
+fn remember_submission(index: wgpu::SubmissionIndex) {
+    *LAST_SUBMISSION.lock() = Some(index);
+}
 
 fn new_encoder(wm: &WmRenderer) -> wgpu::CommandEncoder {
     wm.gpu
@@ -852,7 +905,8 @@ fn flush_shared_encoder(wm: &WmRenderer) {
     crate::timing::frame_begin(wm, unsafe { &mut *pointer });
 
     let submission = SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
-    wm.gpu.queue.submit([finished.finish()]);
+    let index = wm.gpu.queue.submit([finished.finish()]);
+    remember_submission(index);
 
     // Everything that was staged is in the stream that just went out, so the ring can hand those
     // buffers out again - once that submission has completed, which is what the callback says.
@@ -1236,9 +1290,13 @@ pub extern "C" fn create_render_pass(
 /// The whole per-draw ABI: the call carries the pipeline, the vertex and index buffers, the draw
 /// parameters and every binding by slot. The bind groups it needs live in the pass, which is where
 /// they are reused and where they are freed - so no draw allocates and none frees.
+///
+/// The answer says whether the draw was recorded: a draw that names a binding combination nobody
+/// has seen, and does not carry the bindings it was built from, is refused so that the JVM can send
+/// them and ask again. See `DrawCall::combo`.
 #[unsafe(no_mangle)]
-pub extern "C" fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
-    crate::blaze::draw_call(wm, pass, call);
+pub extern "C" fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
+    crate::blaze::draw_call(wm, pass, call)
 }
 
 /// The wgpu usage flags a Blaze3D usage mask asks for.
@@ -2786,8 +2844,10 @@ pub extern "C" fn log_render_stats() {
 
     // Submissions are not one of the per-thread counters: there is one encoder for the whole
     // renderer, so this is the number the frame boundary costs - one per frame is the target, and
-    // the diagnostics line is where "did that stay true" is answered.
+    // the diagnostics line is where "did that stay true" is answered. The present count is what
+    // makes that checkable: at one submission a frame the two numbers are equal.
     let submissions = SUBMISSIONS.swap(0, Ordering::Relaxed);
+    let presents = PRESENTS.swap(0, Ordering::Relaxed);
 
     let RenderStats {
         passes,
@@ -2819,8 +2879,8 @@ pub extern "C" fn log_render_stats() {
     info!(
         "wgpu-mc: render stats: {passes} render passes ({empty} of them empty, last had {last} \
          draws), {pipelines} pipeline binds, {draws} draws ({bind_groups} bind groups built, \
-         {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions; \
-         uploads: {} staged ({} MB), {} fell back to queue writes",
+         {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions for \
+         {presents} presented frame(s); uploads: {} staged ({} MB), {} fell back to queue writes",
         STAGED_UPLOADS.swap(0, Ordering::Relaxed),
         STAGED_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024),
         STAGING_FALLBACKS.swap(0, Ordering::Relaxed),
@@ -3098,7 +3158,9 @@ pub unsafe extern "C" fn compile_render_pipeline(
 
     let directives = format!("#version 440\n{}\n", render_pipeline_description.directives);
 
-    let vertex_stage_input_layout = render_pipeline_description
+    // A list, not a map, because the key below has to be canonical and the same list is turned into
+    // the map `process_shaders` wants.
+    let vertex_stage_input_layout: Vec<(String, u32)> = render_pipeline_description
         .vertex_formats
         .iter()
         .scan(0, |location, format| {
@@ -3121,19 +3183,115 @@ pub unsafe extern "C" fn compile_render_pipeline(
     // are built from at draw time. They used to be three separate walks over three descriptions.
     let mut plan = BindGroupPlan::number(render_pipeline_description);
 
-    let ProcessedShaderResult { frag: frag_processed, vert: vert_processed, sampler_types, implicit_uniforms } = process_shaders(
-        &*render_pipeline_description.vertex_shader,
-        &*render_pipeline_description.fragment_shader,
+    // Everything the translation depends on, in a form a hash can be taken of: the two shader
+    // sources, the defines, the binding numbers the annotator writes into the GLSL, and the vertex
+    // locations it declares. The plan and the layout are *derived* from the pipeline description, so
+    // keying on them is keying on the description - and on nothing that changes between launches.
+    let shader_locations = plan.shader_locations();
+    let cache_key = crate::shader_cache::key(&[
+        &render_pipeline_description.vertex_shader,
+        &render_pipeline_description.fragment_shader,
         &directives,
-        &plan.shader_locations(),
-        vertex_stage_input_layout,
-    );
+        &crate::shader_cache::canonical(
+            shader_locations
+                .iter()
+                .map(|(name, (set, binding))| (name.clone(), format!("{set}:{binding}"))),
+        ),
+        &crate::shader_cache::canonical(
+            vertex_stage_input_layout
+                .iter()
+                .map(|(name, location)| (name.clone(), *location)),
+        ),
+        // The backend is part of the key even though the translation is backend-independent today:
+        // what comes out of it is GLSL for naga, and a future shim that emits something else - HLSL,
+        // or a different set of workarounds - must not be answered with this build's entry. The cost
+        // is one re-translation per pipeline when the player switches backend, which happens once.
+        wm.gpu.adapter.get_info().backend.to_str(),
+    ]);
+
+    let (vert_processed, frag_processed, sampler_types, implicit_uniforms, block_sizes) =
+        match crate::shader_cache::load(&cache_key) {
+            Some(cached) => {
+                // The preprocessor only ever produces `sampler2D` or `samplerCube` for a combined
+                // sampler - its own match over the type is exhaustive over those two - so the flag
+                // the cache keeps turns back into exactly the type it was made from.
+                let samplers = cached
+                    .cube_samplers
+                    .iter()
+                    .map(|(name, cube)| {
+                        (
+                            name.clone(),
+                            if *cube {
+                                TypeSpecifierNonArray::SamplerCube
+                            } else {
+                                TypeSpecifierNonArray::Sampler2D
+                            },
+                        )
+                    })
+                    .collect();
+
+                let block_sizes = cached.blocks();
+
+                // Destructured rather than moved field by field: the two maps are built from the
+                // borrowed entry, and a partial move would leave it unusable for them.
+                let crate::shader_cache::Translation {
+                    vert,
+                    frag,
+                    implicit_uniforms,
+                    ..
+                } = cached;
+
+                (vert, frag, samplers, implicit_uniforms, block_sizes)
+            }
+            None => {
+                let ProcessedShaderResult {
+                    frag,
+                    vert,
+                    sampler_types,
+                    implicit_uniforms,
+                } = process_shaders(
+                    &*render_pipeline_description.vertex_shader,
+                    &*render_pipeline_description.fragment_shader,
+                    &directives,
+                    &shader_locations,
+                    vertex_stage_input_layout.iter().cloned().collect(),
+                );
+
+                // The reflection pass parses both shaders again, through naga this time, so it is the
+                // other half of what a cache hit saves - and it depends on nothing but the two
+                // strings above, which is why it can be cached with them.
+                let block_sizes = reflected_block_sizes(&vert, &frag);
+
+                crate::shader_cache::store(
+                    &cache_key,
+                    &crate::shader_cache::Translation {
+                        vert: vert.clone(),
+                        frag: frag.clone(),
+                        cube_samplers: sampler_types
+                            .iter()
+                            .map(|(name, ty)| {
+                                (
+                                    name.clone(),
+                                    matches!(ty, TypeSpecifierNonArray::SamplerCube),
+                                )
+                            })
+                            .collect(),
+                        implicit_uniforms: implicit_uniforms.clone(),
+                        block_sizes: block_sizes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                    },
+                );
+
+                (vert, frag, sampler_types, implicit_uniforms, block_sizes)
+            }
+        };
+
+    crate::shader_cache::report_once();
 
     dump_shaders(&render_pipeline_description.name, &vert_processed, &frag_processed);
 
     plan.add_implicit_uniforms(&implicit_uniforms);
     plan.apply_sampler_types(&sampler_types);
-    plan.apply_block_sizes(&reflected_block_sizes(&vert_processed, &frag_processed));
+    plan.apply_block_sizes(&block_sizes);
 
     let vert_module = wm
         .gpu
@@ -3809,18 +3967,68 @@ pub extern "C" fn acquire_next_texture(wm: &WmRenderer) -> *mut SurfaceTexture {
     }
 }
 
-/// Presents the frame, and lets wgpu reclaim what the submissions behind it were holding.
+/// Presents the frame, waits until only the rames in flight setting's worth of frames are outstanding, and lets wgpu
+/// reclaim what the submissions behind them were holding.
 ///
 /// The poll is not optional. wgpu frees a submission's command buffers, staging memory and
 /// destroyed resources when the device is polled and the GPU has caught up - and this side never
 /// polled, so every submission of every frame stayed allocated. With ten submissions a frame and a
 /// few hundred frames a second without vsync, that is the rest of the twenty gigabytes: the leak
 /// looked like "the game asks for memory and never gives it back" because it was exactly that.
+///
+/// That poll used to be `PollType::Poll`, which never blocks: the CPU was free to record frame N+1,
+/// N+2, ... while the GPU was still on frame N, and nothing bounded the distance between them. The
+/// only thing that did was the swapchain running out of images, which is a stall that arrives
+/// whenever the driver decides. Waiting for a *named* submission instead is the same poll with a
+/// bound on it: the frame that leaves that many behind has to be finished before the CPU
+/// records the next one.
 #[unsafe(no_mangle)]
 pub extern "C" fn present_surface(wm: &WmRenderer, surface_texture: Box<SurfaceTexture>) {
     surface_texture.present();
+    PRESENTS.fetch_add(1, Ordering::Relaxed);
 
-    if let Err(error) = wm.gpu.device.poll(wgpu::PollType::Poll) {
+    // The `frames in flight` setting, read per present rather than cached: one relaxed lock read a
+    // frame, and lowering it has to take effect now - a player would be lowering it because the
+    // latency is what they are looking at.
+    let limit = crate::SETTINGS
+        .read()
+        .as_ref()
+        .map_or(2, |settings| settings.frames_in_flight());
+
+    // What is left once this frame is counted among those in flight - `None` until there are `limit`
+    // of them, which is the warm-up of a run and the case where nothing was submitted at all.
+    //
+    // The loop is a loop because the limit can change: waiting for the newest of the submissions
+    // that fell out is enough to cover all of the older ones, so only one wait is ever made.
+    let finished_frame = {
+        let mut in_flight = IN_FLIGHT_SUBMISSIONS.lock();
+
+        if let Some(index) = LAST_SUBMISSION.lock().take() {
+            in_flight.push_back(index);
+        }
+
+        let mut wait_for = None;
+        while in_flight.len() >= limit {
+            match in_flight.pop_front() {
+                Some(index) => wait_for = Some(index),
+                None => break,
+            }
+        }
+
+        wait_for
+    };
+
+    let poll = match finished_frame {
+        // A submission index wgpu has already seen; if its frame is done, this returns at once.
+        Some(index) => wm.gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: None,
+        }),
+        // Nothing to wait for: release whatever the GPU is finished with and carry on.
+        None => wm.gpu.device.poll(wgpu::PollType::Poll),
+    };
+
+    if let Err(error) = poll {
         warn!("wgpu-mc: polling the device after a present failed: {error:?}");
     }
 
@@ -4019,6 +4227,67 @@ pub extern "C" fn submit_command_encoder(wm: &WmRenderer, _encoder: Box<CommandE
 /// The blit is what turns the main target's clip space back over - see `PresentBlit` - and it is
 /// recorded into the shared encoder rather than one of its own: the whole frame is in that encoder,
 /// and this is the submission that carries it, right before the swapchain image is presented.
+///
+/// This is also where the scene is ticked, because it is the one point in a frame that is known to
+/// happen exactly once and to have a framebuffer size behind it: the sections the baker finished
+/// since the last frame are moved into the arena here, the ones the camera has left behind are
+/// trimmed, and the depth texture is rebuilt if this frame is a different size from the last one. It
+/// happens *before* the blit records itself, so the buffer writes belong to the frame they are for.
+/// Says how far the arena should reach, in chunks, which is what the arena is trimmed to.
+///
+/// The render distance is Minecraft's own - the setting the player moves on the video options
+/// screen - and it is sent rather than guessed because the arena's job is to hold exactly what the
+/// game is drawing: trim it tighter and sections are freed while their meshes are still on screen,
+/// leave it wider and the arena grows with everything the player has ever walked past.
+///
+/// Once per change, not once per frame: the distance moves when the slider does.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
+    let Some(wm) = RENDERER.get() else {
+        return;
+    };
+
+    let Some(scene) = wm.scene() else {
+        // No scene yet, so nothing to size: the value is a setting, and the JVM sends it again when
+        // the scene exists - the first frame that presents asks for both.
+        return;
+    };
+
+    let chunks = chunks.max(0);
+    let previous = scene.section_storage.read().width();
+
+    scene.section_storage.write().set_width(chunks);
+
+    if previous != chunks {
+        info!("wgpu-mc: the section arena now reaches {chunks} chunk(s) from the camera");
+    }
+}
+
+/// Says where the camera is, in sections, which is what the arena is trimmed against.
+///
+/// Called once per frame from the JVM, before the frame is presented. Sections are what the terrain
+/// path is keyed by everywhere - the baker's positions, the arena's ranges, the graph pass's grid -
+/// so this is the one coordinate the renderer needs from the camera, and it is sent rather than
+/// derived because the renderer has no camera of its own: Minecraft's matrices arrive as matrices.
+///
+/// `x` and `z` only: the arena trims horizontally, because a vertical slice of the world is loaded
+/// all at once. This is the signature the Fabric module's `setSectionPos` had, kept for the same
+/// reason it had it.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn setCameraSection(_env: JNIEnv, _class: JClass, x: jint, z: jint) {
+    let Some(wm) = RENDERER.get() else {
+        return;
+    };
+
+    let Some(scene) = wm.scene() else {
+        // No framebuffer yet, so no scene to trim: the position is dropped rather than kept, because
+        // the JVM sends one per frame and the next one is a frame away.
+        return;
+    };
+
+    *scene.camera_section_pos.write() = glam::ivec2(x, z);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn blit_from_texture(
     wm: &WmRenderer,
@@ -4036,6 +4305,16 @@ pub extern "C" fn blit_from_texture(
             warn!("wgpu-mc: nothing to blit into yet, the swapchain has not been configured");
             return;
         };
+
+        // The swapchain's own size, which is what the scene's depth texture has to match: this is the
+        // size the frame is presented at, and the terrain pass renders into an attachment of it.
+        if let Some(scene) = wm.ensure_scene(wgpu::Extent3d {
+            width: state.width,
+            height: state.height,
+            depth_or_array_layers: 1,
+        }) {
+            wm.tick_scene(scene);
+        }
 
         let view = surface_texture
             .texture

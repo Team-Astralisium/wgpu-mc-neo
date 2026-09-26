@@ -89,6 +89,11 @@ impl SectionStorage {
         self.allocator.reset();
         self.storage.clear();
     }
+    /// How far the arena reaches from the camera, in chunks.
+    pub fn width(&self) -> i32 {
+        self.width
+    }
+
     pub fn set_width(&mut self, w: i32) {
         self.width = w;
     }
@@ -147,6 +152,15 @@ impl SectionStorage {
     pub fn iter(&self) -> std::collections::hash_map::Iter<IVec3, Section> {
         self.storage.iter()
     }
+
+    /// How many sections the arena holds geometry for.
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
 }
 
 #[derive(Clone)]
@@ -185,8 +199,49 @@ pub fn bake_section<Provider: BlockStateProvider>(pos: IVec3, wm: &WmRenderer, b
 
     let baked_section = bake_layers(pos, &bm, bsp);
 
+    report_bake(pos, &baked_section);
+
     wm.chunk_update_queue.0.send((pos, baked_section)).unwrap();
 }
+
+/// Says what one bake produced, without flooding the log with a world's worth of sections.
+///
+/// While the render graph does not draw these sections yet, these numbers are the only thing that
+/// separates "the Java side handed us the right data" from "the bake found nothing"; so the first
+/// few are always reported and the rest are sampled - unless the renderer's logging switch is on, in
+/// which case every bake is a line, because a session that turned logging on is one where the
+/// question is about specific sections rather than about the shape of a world's worth of them.
+fn report_bake(pos: IVec3, layers: &[BakedLayer]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BAKES: AtomicU64 = AtomicU64::new(0);
+
+    let baked = BAKES.fetch_add(1, Ordering::Relaxed);
+    if baked >= 8 && !baked.is_multiple_of(64) && !DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let vertices: usize = layers.iter().map(|layer| layer.vertices.len()).sum();
+    let indices: usize = layers.iter().map(|layer| layer.indices.len()).sum();
+    let solids = layers
+        .get(RenderLayer::Solid as usize)
+        .map(|layer| layer.indices.len() / 4)
+        .unwrap_or(0);
+
+    log::info!(
+        "wgpu-mc: baked {pos:?} in Rust: {vertices} B of vertices, {indices} B of indices \
+         ({solids} in the solid layer), {} bake(s) so far",
+        baked + 1
+    );
+}
+
+/// Whether the renderer's diagnostic log lines are on.
+///
+/// Set from the JVM side when the settings are applied - see `wgpu_mc_jni::debug` - because the
+/// switch itself lives there. It is read for the *sampled* lines in this crate: a per-bake line is
+/// worth having when someone turned logging on to look at one section, and is noise otherwise.
+pub static DIAGNOSTIC_LOGGING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Default)]
 pub struct BakedLayer {

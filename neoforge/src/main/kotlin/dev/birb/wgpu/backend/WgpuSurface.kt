@@ -8,6 +8,7 @@ import org.lwjgl.glfw.GLFWNativeCocoa
 import org.lwjgl.glfw.GLFWNativeWayland
 import org.lwjgl.glfw.GLFWNativeWin32
 import org.lwjgl.glfw.GLFWNativeX11
+import org.lwjgl.system.MemoryUtil
 import java.lang.foreign.MemorySegment
 import java.lang.invoke.MethodHandle
 import java.util.Objects
@@ -235,6 +236,35 @@ class WgpuSurface internal constructor(
             else -> throw IllegalStateException(
                 "wgpu-mc: unsupported GLFW platform ${GLFW.glfwGetPlatform()}"
             )
+        }
+
+        /**
+         * The window's framebuffer size, in pixels.
+         *
+         * Read from GLFW rather than from Minecraft's window object because that is what exists at
+         * the moment the renderer is created - the device is asked for before the client has a
+         * `Window` it can be asked about - and because it is the framebuffer, not the logical size: a
+         * scaled window renders at the larger of the two, and a scene's depth texture has to match
+         * the attachment the terrain pass renders into.
+         *
+         * `(0, 0)` for a window that has not been sized yet - a minimised one, or one created before
+         * its monitor's scale is known. The renderer takes that as "no size yet" and makes its scene
+         * on the first frame that presents instead.
+         */
+        fun framebufferSize(windowHandle: Long): Pair<Int, Int> {
+            val width = MemoryUtil.memAllocInt(1)
+            val height = MemoryUtil.memAllocInt(1)
+
+            return try {
+                GLFW.glfwGetFramebufferSize(windowHandle, width, height)
+                width.get(0) to height.get(0)
+            } catch (error: Throwable) {
+                WgpuMcMod.LOGGER.warn("wgpu: could not read the window's framebuffer size", error)
+                0 to 0
+            } finally {
+                MemoryUtil.memFree(width)
+                MemoryUtil.memFree(height)
+            }
         }
 
         /**

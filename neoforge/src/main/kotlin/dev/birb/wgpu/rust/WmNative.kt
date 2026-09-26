@@ -187,6 +187,8 @@ object WmNative {
         PTR,  // index_buffer
         MemoryLayout.sequenceLayout(MAX_VERTEX_BUFFERS.toLong(), DRAW_VERTEX_BUFFER),
         MemoryLayout.sequenceLayout(MAX_DRAW_BINDINGS.toLong(), DRAW_BINDING),
+        INT,  // combo
+        INT,  // bindings_present
     )
 
     /** Offsets inside [DRAW_CALL]. */
@@ -202,6 +204,13 @@ object WmNative {
     const val DRAW_CALL_INDEX_BUFFER = 40L
     const val DRAW_CALL_VERTEX_BUFFERS = 48L
     const val DRAW_CALL_BINDINGS = 240L
+
+    /**
+     * The two fields after the binding table: the JVM's number for this set of bindings, and whether
+     * the table next to it is the one that number was built from. See `DrawCall` in `blaze.rs`.
+     */
+    const val DRAW_CALL_COMBO = 1264L
+    const val DRAW_CALL_BINDINGS_PRESENT = 1268L
 
     /** Offsets inside [PLAN_BINDING] and [DRAW_BINDING]. */
     const val PLAN_BINDING_NAME = 0L
@@ -377,9 +386,13 @@ object WmNative {
      * This is what the per-binding entry points used to be: `bind_buffer`, `bind_texture_and_sampler`,
      * `bind_render_pipeline_to_pass`, `set_vertex_buffer`, `set_index_buffer` and the two draw
      * calls, each with a name resolved against the plan on the native side.
+     *
+     * The answer says whether the draw was recorded. It is false when the call names a binding
+     * combination the native side has not seen and does not carry the bindings it was built from -
+     * the caller then writes the table and calls again.
      */
     @JvmField val drawCall: MethodHandle =
-        handle("draw_call", FunctionDescriptor.ofVoid(PTR, PTR, PTR))
+        handle("draw_call", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR, PTR, PTR))
 
     @JvmField val createCommandEncoder: MethodHandle =
         handle("create_command_encoder", FunctionDescriptor.of(PTR, PTR))

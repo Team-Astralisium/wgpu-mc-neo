@@ -65,6 +65,18 @@ public class DebugHUDMixin {
             lines.add("[Neolectrum] avg uploading entities: " + (WgpuMcMod.TIME_SPENT_ENTITIES / WgpuMcMod.ENTRIES) + "ns");
         }
 
+        // The section feed, phase by phase, averaged over the rebuilds it has served: what Minecraft's
+        // chunk-build threads spend in this renderer's half of a rebuild. One line, because the three
+        // numbers are only meaningful next to each other - the question is which part dominates.
+        long offers = WgpuMcMod.SECTION_OFFERS.sum();
+        if (offers > 0) {
+            lines.add("[Neolectrum] section feed per offer: light "
+                    + (WgpuMcMod.TIME_SPENT_SECTION_LIGHT.sum() / offers) + "ns, blocks "
+                    + (WgpuMcMod.TIME_SPENT_SECTION_BLOCKS.sum() / offers) + "ns, call "
+                    + (WgpuMcMod.TIME_SPENT_SECTION_CALL.sum() / offers) + "ns, "
+                    + (WgpuMcMod.SECTION_PAYLOAD_BYTES.sum() / offers) + " B");
+        }
+
         report("left", lines);
         return lines;
     }

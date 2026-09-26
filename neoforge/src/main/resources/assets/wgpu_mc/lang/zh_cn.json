@@ -16,6 +16,8 @@
   "wgpu_mc.option.backend.tooltip": "为 Neoletrum 指定使用的图形 API。\n关于后端的说明：DirectX 12 仅在 Windows 上可用。\n注意：此选项在运行中无法切换。这是因为 WebGPU 的实例、适配器以及其下所有资源都是为某一个特定后端创建的，创建后一直存活到游戏结束。",
   "wgpu_mc.option.backend.vulkan": "Vulkan",
   "wgpu_mc.option.backend.directx12": "DirectX 12",
+  "wgpu_mc.option.frames_in_flight": "等待帧数",
+  "wgpu_mc.option.frames_in_flight.tooltip": "CPU 最多可以领先 GPU 处理多少帧。",
   "wgpu_mc.option.vsync": "垂直同步",
   "wgpu_mc.option.vsync.tooltip": "把帧率与显示器的刷新率相同步。\n可能可以改善画面撕裂，但会增加输入延迟。\n此选项应用后立即生效，交换链会用另一种呈现模式重新配置。",
   "wgpu_mc.option.gpu_based_validation": "GPU 侧校验",
@@ -37,5 +39,7 @@
   "wgpu_mc.option.pix_capture.tooltip": "此项设置为 DirectX 专用。\n把 PIX 的捕获库加载进游戏，让 PIX 能够检查它。\nWinPixGpuCapturer.dll 让 PIX 可以附加进程做 GPU 捕获，WinPixTimingCapturer.dll 供程序化计时捕获使用。两者都从本机最新的 PIX 安装目录加载，并且必须在 D3D12 设备创建之前完成。\n打开后即可用 PIX 附加（或由 PIX 启动）到Minecraft。\n计时捕获通过 ETW provider 记录，注意：创建这些会话需要管理员权限，没有管理员权限时捕获会以 E_ACCESSDENIED 被拒绝，日志会写明进程是否提权。捕获内容包含捕获 API 能要求的全部内容：GPU 自身计时、4 kHz 的 CPU 采样与调用栈，以及内存事件——文件 IO、VirtualAlloc、HeapAlloc、自定义分配器和页错误。\n记录的数据库文件非常大、性能开销非常高。\n函数名来自/libs中的 PDB 文件，在 PIX 打开捕获时读取它。\n需要注意的是， GPU 资源/API 对象、内存访问采样、内核映像信息这几项并不在捕获 API 的参数结构里。\n另外，在 RivaTuner Statistics Server 存在时日志会报出对应信息，并且不会加载 PIX 的库。\n若要强行启用，请在游戏目录放一个名为 wgpu-pix-with-rtss 的文件即可强行加载。\n在没有 Microsoft PIX 的设备上启用此选项不会真正执行操作，日志会写明缺哪个库。",
   "wgpu_mc.option.dump_shaders.tooltip": "把经过本渲染器预处理、最终送进着色器编译器的 GLSL 写入 wgpu-shaders/。naga 看到的源码并不是 Minecraft 提供的源码——uniform 被标注了绑定计划给它们的 binding、隐式块被补上、采样器被拆分——而这里是唯一能看出其中哪一步出了错的地方。这是 wgpu-dump-shaders 标记文件的开关形式。",
   "wgpu_mc.option.binding_verbosity": "绑定分析日志",
-  "wgpu_mc.option.binding_verbosity.tooltip": "Log how every binding name was resolved against a pipeline's binding plan, and what the plan was left holding: a name that only matched through the shader shim's _wm_texshim / _wm_sampler suffix, the names a plan can be bound under when one of them is not in it, and the slots a pipeline change left empty. This is the detailed version of the warning the renderer always prints when a binding is not in the plan at all, and it is the switch to turn on when a shader reads nothing and the question is which name it was looking for. This is the wgpu-binding-log marker as a switch."
+  "wgpu_mc.option.binding_verbosity.tooltip": "Log how every binding name was resolved against a pipeline's binding plan, and what the plan was left holding: a name that only matched through the shader shim's _wm_texshim / _wm_sampler suffix, the names a plan can be bound under when one of them is not in it, and the slots a pipeline change left empty. This is the detailed version of the warning the renderer always prints when a binding is not in the plan at all, and it is the switch to turn on when a shader reads nothing and the question is which name it was looking for. This is the wgpu-binding-log marker as a switch.",
+  "wgpu_mc.option.section_timing": "区块喂送计时",
+  "wgpu_mc.option.section_timing.tooltip": "分相计时区块喂送路径并给出平均值。\n这条路径跑在 Minecraft 的区块构建线程上：查一次重建周围 27 节的光照、把方块数据从 PalettedContainer 里读出来、再把整份数据一次调用交给 Rust 侧。\n所以这个开关用三个数字回答\"一次区块重建要花多少、花在哪一段\"，而不是靠猜。\n开启期间平均值显示在 F3 界面上，计数按 offer 计，因此没活干的帧不会有数字。\n默认关闭：它是每节每相一次读时钟，关掉时完全没有开销。这是 wgpu-section-timing 标记文件的开关形式。"
 }

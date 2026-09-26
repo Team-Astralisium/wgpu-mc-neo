@@ -32,6 +32,15 @@ pub struct Settings {
     pub backend: EnumSetting,
     #[serde(default)]
     pub vsync: BoolSetting,
+    /// How many frames the CPU may record ahead of the GPU.
+    ///
+    /// One is a full stall on every frame; two hides the recording behind the GPU's own work, which
+    /// is what a frame time is made of; three buys a little more slack at the cost of a frame of
+    /// latency and one more swapchain image. The present waits for the frame that leaves this many
+    /// behind - see `present_surface` - so lowering it takes effect on the next present, not on the
+    /// next launch.
+    #[serde(default = "two_frames_in_flight")]
+    pub frames_in_flight: IntSetting,
     /// The two switches that change how the frame is rendered, under the `Optimization` heading.
     ///
     /// **Field order here is the row order on the options screen**, and the sections have to come out
@@ -69,6 +78,15 @@ pub struct Settings {
     pub gpu_timestamps: BoolSetting,
     #[serde(default = "off")]
     pub pix_capture: BoolSetting,
+    /// Whether the section feed is timed, phase by phase.
+    ///
+    /// The feed is the one path that runs on Minecraft's chunk-build threads, so "is this cheap" is a
+    /// question with a number behind it: how long the light lookup, the block data and the call into
+    /// the native side each take, per section rebuild. Off by default because it is a clock read per
+    /// phase per section, and a session that wants the number is one that would rather have it than
+    /// not.
+    #[serde(default = "off")]
+    pub section_timing: BoolSetting,
 }
 
 /// The default of a setting that is off unless a player asks for it.
@@ -79,10 +97,19 @@ fn off() -> BoolSetting {
     BoolSetting::of(false)
 }
 
+/// The default of `frames_in_flight`: one frame recorded ahead of the one being presented.
+///
+/// Written out rather than left to `IntSetting::default`, whose range is 0..100 - and a zero here
+/// would mean waiting for a frame that was never submitted.
+fn two_frames_in_flight() -> IntSetting {
+    IntSetting::of(1, 3, 1, 2)
+}
+
 #[derive(Serialize)]
 pub struct SettingsInfo {
     backend: EnumSettingInfo<GraphicsBackend>,
     vsync: SettingInfo,
+    frames_in_flight: SettingInfo,
     /// The two switches that change *how* the frame is rendered rather than what is reported about
     /// it. **This order has to match [`Settings`]'s**, because the two halves of a row come from the
     /// two documents: the row itself and its order from the settings, and the heading it sits under
@@ -97,6 +124,7 @@ pub struct SettingsInfo {
     dump_shaders: SettingInfo,
     gpu_timestamps: SettingInfo,
     pix_capture: SettingInfo,
+    section_timing: SettingInfo,
 }
 
 /// The section the options screen puts a setting under, when it is not one of the plain ones.
@@ -129,6 +157,13 @@ lazy_static! {
             // Unlike `backend`, this is not a property of the wgpu instance: it only picks the
             // swapchain's present mode, and a surface can be reconfigured at any time. `sendSettings`
             // does exactly that, which is why this one is applied without a restart.
+            needs_restart: false,
+            section: None,
+        },
+        frames_in_flight: SettingInfo {
+            desc: "How many frames the CPU may record ahead of the GPU. One is a full stall on \
+            every frame and two hides the recording behind the GPU's own work; three adds a frame \
+            of latency for a little more slack. Applies to the next present, without a restart.",
             needs_restart: false,
             section: None,
         },
@@ -253,6 +288,16 @@ lazy_static! {
             missing.",
             true,
         ),
+        section_timing: SettingInfo::debug(
+            "Time the section feed, phase by phase, and report the averages. The feed is what runs \
+            on Minecraft's chunk-build threads - the light lookup, the block data and the call into \
+            the native side - so this is the switch that answers \"what does one section rebuild \
+            cost, and which part of it\" with three numbers instead of a guess. The averages appear \
+            on the F3 screen while it is on, and the counts are per offer, so a quiet frame is one \
+            with nothing to show. Off by default: it is a clock read per phase per section, and \
+            closing it costs nothing at all. This is the `wgpu-section-timing` marker as a switch.",
+            false,
+        ),
     };
     pub static ref SETTINGS_INFO_JSON: String = serde_json::to_string(&*SETTINGS_INFO).unwrap();
 }
@@ -363,6 +408,15 @@ impl Settings {
 }
 
 impl Settings {
+    /// How many frames may be in flight, clamped.
+    ///
+    /// The config is a text file and the schema's range is only advice to the options screen: a
+    /// hand-edited `0` or `9` has to mean one frame or three, not "wait for a frame that will never
+    /// be submitted" or "run a second ahead".
+    pub fn frames_in_flight(&self) -> usize {
+        self.frames_in_flight.value.clamp(1, 3) as usize
+    }
+
     /// The graphics API to build the wgpu instance with, falling back to [`GraphicsBackend::default`]
     /// when the settings have not been loaded yet (the JVM sends the run directory during client
     /// setup, which happens before the window and therefore before `create_renderer`).
@@ -376,6 +430,7 @@ impl Default for Settings {
         Settings {
             backend: EnumSetting::from_variant(GraphicsBackend::default()),
             vsync: BoolSetting::default(),
+            frames_in_flight: two_frames_in_flight(),
             // The debug switches default to the behaviour the renderer had before they existed:
             // logging and tracing off, the bind group cache and dynamic offsets on, and GPU-based
             // validation off - it used to be unconditional, which cost every player the driver's
@@ -390,6 +445,7 @@ impl Default for Settings {
             dump_shaders: BoolSetting::of(false),
             gpu_timestamps: BoolSetting::of(false),
             pix_capture: BoolSetting::of(false),
+            section_timing: BoolSetting::of(false),
         }
     }
 }
@@ -413,6 +469,8 @@ pub struct DebugSettings {
     pub dump_shaders: bool,
     pub gpu_timestamps: bool,
     pub pix_capture: bool,
+    /// Whether the section feed is timed - see [`Settings::section_timing`].
+    pub section_timing: bool,
 }
 
 impl Settings {
@@ -428,6 +486,7 @@ impl Settings {
             dump_shaders: self.dump_shaders.value,
             gpu_timestamps: self.gpu_timestamps.value,
             pix_capture: self.pix_capture.value,
+            section_timing: self.section_timing.value,
         }
     }
 }
@@ -581,6 +640,18 @@ pub struct IntSetting {
     pub value: i32,
 }
 
+impl IntSetting {
+    /// A setting a player can move between `min` and `max` in `step`s.
+    pub const fn of(min: i32, max: i32, step: i32, value: i32) -> Self {
+        Self {
+            min,
+            max,
+            step,
+            value,
+        }
+    }
+}
+
 impl Default for IntSetting {
     fn default() -> Self {
         IntSetting {
@@ -705,6 +776,7 @@ mod tests {
             "dump_shaders",
             "gpu_timestamps",
             "pix_capture",
+            "section_timing",
         ] {
             assert_eq!(
                 info[name]["section"],
@@ -819,9 +891,10 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 12] = [
+    const NAME_LIST: [&str; 14] = [
         "backend",
         "vsync",
+        "frames_in_flight",
         "bind_group_cache",
         "dynamic_offsets",
         "gpu_based_validation",
@@ -832,6 +905,7 @@ mod tests {
         "dump_shaders",
         "gpu_timestamps",
         "pix_capture",
+        "section_timing",
     ];
 
     /// The options screen, pulled in for the one part of it that is a contract with this side: how

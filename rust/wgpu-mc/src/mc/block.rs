@@ -71,60 +71,147 @@ pub struct BlockModelFace {
     pub animation_uv_offset: u32,
 }
 
+/// Parses a model file, allowing for the object form of a texture that 26.1 introduced.
+///
+/// A model texture may be an object rather than a string:
+///
+/// ```json
+/// "textures": { "all": { "sprite": "minecraft:block/black_stained_glass", "force_translucent": true } }
+/// ```
+///
+/// The `minecraft_assets` schema this crate parses models with - a git dependency pinned to a
+/// revision older than that - has `Textures` as a map of `String`, so one of those fails the whole
+/// model with `invalid type: map, expected a string` and the block is drawn as bedrock. That is 163
+/// entries in vanilla alone: every stained glass and stained glass pane, and redstone dust.
+///
+/// The retry rewrites those objects into the sprite string they carry, which is everything this
+/// renderer reads from a texture entry; `force_translucent` only picks the render layer, and
+/// Minecraft's own mesh is what decides that for the blocks drawn today. A model that fails for any
+/// other reason fails again, and the error reported is the first one - the one that names the field
+/// that was actually wrong.
+fn parse_model(json: &str) -> Result<schemas::Model, serde_json::Error> {
+    let error = match serde_json::from_str(json) {
+        Ok(model) => return Ok(model),
+        Err(error) => error,
+    };
+
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Err(error);
+    };
+
+    if !flatten_textures(&mut value) {
+        return Err(error);
+    }
+
+    serde_json::from_value(value).map_err(|_| error)
+}
+
+/// Replaces every object-valued entry of `textures` with the sprite it names.
+///
+/// Returns whether anything was rewritten, so the caller can tell "this model does not use the
+/// object form" from "it does, and it still does not parse".
+fn flatten_textures(value: &mut serde_json::Value) -> bool {
+    let Some(textures) = value
+        .get_mut("textures")
+        .and_then(|textures| textures.as_object_mut())
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+
+    for texture in textures.values_mut() {
+        if let Some(sprite) = texture.get("sprite").and_then(|sprite| sprite.as_str()) {
+            *texture = serde_json::Value::String(sprite.to_string());
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 fn recurse_model_parents(
     model: &schemas::Model,
     resource_provider: &dyn ResourceProvider,
     models: &mut Vec<ResourcePath>,
-) {
+) -> Result<(), MeshBakeError> {
     if let Some(parent_path_string) = &model.parent {
         let parent_path: ResourcePath = ResourcePath::from(parent_path_string)
             .prepend("models/")
             .append(".json");
-        recurse_model_parents(
-            &serde_json::from_str(
-                &resource_provider
-                    .get_string(&parent_path)
-                    .expect(&parent_path.0),
-            )
-            .unwrap(),
-            resource_provider,
-            models,
-        );
+
+        // A model whose parent is not in the pack - a mod that ships the child without the vanilla
+        // parent it extends, a pack that removes one - used to be an `expect` naming the path, and a
+        // panic here is a block the game cannot draw *and* a block registry that never finishes
+        // baking. The error carries the path instead, and the caller drops the model.
+        let parent_json = resource_provider
+            .get_string(&parent_path)
+            .ok_or_else(|| MeshBakeError::UnresolvedResourcePath(parent_path.clone()))?;
+
+        // Named here as well as in the caller, which only knows the block: a parse failure inside a
+        // model has to say *which* file, and the error itself carries serde's line and column.
+        let parent: schemas::Model = parse_model(&parent_json).map_err(|err| {
+            log::warn!("wgpu-mc: the parent model {parent_path} could not be read: {err}");
+            MeshBakeError::JsonError(err)
+        })?;
+
+        recurse_model_parents(&parent, resource_provider, models)?;
         models.push(parent_path);
     }
+
+    Ok(())
 }
 
 fn resolve_model(
     model: schemas::Model,
     resource_provider: &dyn ResourceProvider,
-) -> schemas::Model {
+) -> Result<schemas::Model, MeshBakeError> {
     if model.parent.is_none() {
-        return model;
+        return Ok(model);
     }
 
     let mut parent_paths = Vec::new();
-    recurse_model_parents(&model, resource_provider, &mut parent_paths);
+    recurse_model_parents(&model, resource_provider, &mut parent_paths)?;
 
     let parents: Vec<schemas::Model> = parent_paths
         .iter()
         .map(|parent_path| {
-            serde_json::from_str(&resource_provider.get_string(parent_path).unwrap()).unwrap()
+            let json = resource_provider
+                .get_string(parent_path)
+                .ok_or_else(|| MeshBakeError::UnresolvedResourcePath(parent_path.clone()))?;
+
+            parse_model(&json).map_err(MeshBakeError::JsonError)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let mut schema = ModelResolver::resolve_model([&model].into_iter().chain(parents.iter()));
 
     if let Some(textures) = &mut schema.textures {
         let copy = textures.clone();
 
+        // `resolve` is `None` for a reference that does not name anything in the model or its
+        // parents - `#all` with no `all` - so it is reported rather than unwrapped.
+        let mut unresolved = None;
+
         textures.iter_mut().for_each(|(_key, texture)| {
             if texture.reference().is_some() {
-                texture.0 = texture.resolve(&copy).unwrap().to_string();
+                match texture.resolve(&copy) {
+                    Some(resolved) => texture.0 = resolved.to_string(),
+                    None => {
+                        unresolved.get_or_insert_with(|| {
+                            MeshBakeError::UnresolvedTextureReference(texture.0.clone())
+                        });
+                    }
+                }
             }
-        })
+        });
+
+        if let Some(err) = unresolved {
+            return Err(err);
+        }
     }
 
-    schema
+    Ok(schema)
 }
 
 fn get_atlas_uv(face: &schemas::models::ElementFace, block_atlas: &Atlas) -> Option<UV> {
@@ -191,17 +278,22 @@ impl ModelMesh {
                 //Recursively resolve the model using it's parents if it has any
                 let model: schemas::Model = resolve_model(
                     //Parse the JSON into the model schema
-                    serde_json::from_str(
+                    parse_model(
                         //Get the model JSON
                         &resource_provider
                             .get_string(&model_resource_path)
                             .ok_or_else(|| {
-                                MeshBakeError::UnresolvedResourcePath(model_resource_path)
+                                MeshBakeError::UnresolvedResourcePath(model_resource_path.clone())
                             })?,
                     )
-                    .map_err(MeshBakeError::JsonError)?,
+                    .map_err(|err| {
+                        log::warn!(
+                            "wgpu-mc: the model {model_resource_path} could not be read: {err}"
+                        );
+                        MeshBakeError::JsonError(err)
+                    })?,
                     resource_provider,
-                );
+                )?;
                 if let Some(textures) = model.textures {
                     //Make sure the textures in the model are fully resolved with no references
                     if let Some(reference) = textures
@@ -231,15 +323,29 @@ impl ModelMesh {
 
                     drop(uv_map);
 
+                    // A model can name a texture this provider cannot read - a pack that ships the
+                    // model without its image, a reference that only resolves under another
+                    // namespace, a block that NeoForge offers but never registers a sprite for.
+                    // That used to be an `unwrap`, and it took the whole block registry down with
+                    // it: nothing is cached, every block is baked, and the panic lands on whichever
+                    // thread was asked to bake. Skipping the texture instead leaves the faces that
+                    // use it untextured - `get_atlas_uv` below drops them - which is the same thing
+                    // the game shows for a missing texture, and the warning says which path to look
+                    // at.
                     let unallocated_textures: Vec<(&ResourcePath, Vec<u8>)> = unallocated_textures
                         .iter()
-                        .map(|path| {
-                            (
-                                path,
-                                resource_provider
-                                    .get_bytes(&path.prepend("textures/").append(".png"))
-                                    .unwrap(),
-                            )
+                        .filter_map(|path| {
+                            let texture_path = path.prepend("textures/").append(".png");
+                            match resource_provider.get_bytes(&texture_path) {
+                                Some(data) => Some((path, data)),
+                                None => {
+                                    log::warn!(
+                                        "wgpu-mc: {texture_path} is named by a model but cannot \
+                                        be read; the faces using it are left untextured"
+                                    );
+                                    None
+                                }
+                            }
                         })
                         .collect();
 

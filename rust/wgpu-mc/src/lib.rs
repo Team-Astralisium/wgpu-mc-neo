@@ -93,6 +93,16 @@ pub struct WmRenderer {
     pub bind_group_layouts: Arc<HashMap<String, BindGroupLayout>>,
     pub mc: MinecraftState,
     pub chunk_update_queue: (Sender<ChunkUpdateData>, Mutex<Receiver<ChunkUpdateData>>),
+    /// What the renderer draws, and the GPU resources that belong to the world rather than to the
+    /// renderer: the section arena the Rust terrain baker writes into, the buffer it lives in, the
+    /// frame's depth texture, and the camera's section position.
+    ///
+    /// A `OnceLock` rather than a field built in [`WmRenderer::new`] because a scene needs the
+    /// renderer it belongs to - the device, for the arena's buffer - and because it needs a
+    /// *framebuffer size*, which is only known once there is a surface: the JVM passes the window's
+    /// size when it creates the renderer, and a renderer created before the window has one gets its
+    /// scene on the first presented frame instead.
+    pub scene: std::sync::OnceLock<Scene>,
 }
 
 #[derive(Copy, Clone)]
@@ -106,6 +116,56 @@ pub trait HasWindowSize {
 }
 
 impl WmRenderer {
+    /// The scene, or `None` while the renderer has no framebuffer size yet.
+    pub fn scene(&self) -> Option<&Scene> {
+        self.scene.get()
+    }
+
+    /// The scene, created if it is not there, with its depth texture brought to `framebuffer_size`.
+    ///
+    /// The size is checked on every call rather than only at creation because this is also the
+    /// resize path: a frame that presents at a different size from the one the depth texture was
+    /// made for is a frame whose terrain pass would render into the wrong attachment - and wgpu
+    /// refuses a pass whose attachment does not match the pipeline's, so the failure would be an
+    /// error rather than a wrong picture. `None` for a zero-sized framebuffer, which is a
+    /// minimised window: there is nothing to render into and nothing to rebuild.
+    pub fn ensure_scene(&self, framebuffer_size: wgpu::Extent3d) -> Option<&Scene> {
+        if framebuffer_size.width == 0 || framebuffer_size.height == 0 {
+            return self.scene.get();
+        }
+
+        let created = self.scene.get().is_none();
+        let scene = self
+            .scene
+            .get_or_init(|| Scene::new(self, framebuffer_size));
+
+        if created {
+            log::info!(
+                "wgpu-mc: the scene is up, sized {}x{}",
+                framebuffer_size.width,
+                framebuffer_size.height
+            );
+        }
+
+        let (width, height) = {
+            let depth = scene.depth_texture.read();
+            (depth.width(), depth.height())
+        };
+
+        if width != framebuffer_size.width || height != framebuffer_size.height {
+            scene.resize_depth_texture(self, framebuffer_size.width, framebuffer_size.height);
+            log::info!(
+                "wgpu-mc: the scene's depth texture is now {}x{} (was {width}x{height})",
+                framebuffer_size.width,
+                framebuffer_size.height
+            );
+        }
+
+        Some(scene)
+    }
+}
+
+impl WmRenderer {
     pub fn new(display: Arc<Gpu>, resource_provider: Arc<dyn ResourceProvider>) -> WmRenderer {
         let mc = MinecraftState::new(&display, resource_provider);
         let (sender, receiver) = channel();
@@ -114,6 +174,7 @@ impl WmRenderer {
             gpu: display,
             mc,
             chunk_update_queue: (sender, Mutex::new(receiver)),
+            scene: std::sync::OnceLock::new(),
         }
     }
 
@@ -165,11 +226,41 @@ impl WmRenderer {
         );
     }
 
+    /// Moves every section the baker finished into the arena, and drops the ones the camera has left
+    /// behind.
+    ///
+    /// Called once per frame, before the frame is presented: the bakes themselves ran on the pool,
+    /// and this is where their results become the arena's contents - one `write_buffer` per layer,
+    /// into the ranges the arena handed out. Trimming here rather than in the baker is what keeps the
+    /// arena's size a function of where the camera is: a section's ranges are freed when the camera
+    /// is more than the render distance plus two chunks away from it, and a section that is walked
+    /// back into is baked again, because Minecraft re-meshes what it unloads.
+    pub fn tick_scene(&self, scene: &Scene) {
+        self.submit_chunk_updates(scene);
+
+        let camera = *scene.camera_section_pos.read();
+
+        {
+            let mut last = scene.trimmed_section_pos.write();
+            if *last == camera {
+                return;
+            }
+
+            *last = camera;
+        }
+
+        scene.section_storage.write().trim(camera);
+    }
+
     pub fn submit_chunk_updates(&self, scene: &Scene) {
         let receiver = self.chunk_update_queue.1.lock();
         let updates = receiver.try_iter();
 
+        let mut moved = 0usize;
+
         updates.for_each(|(pos, layers)| {
+            moved += 1;
+
             let mut storage = scene.section_storage.write();
             let section = storage.replace(pos, &layers);
             for (i, ranges) in section.layers.iter().enumerate() {
@@ -187,6 +278,25 @@ impl WmRenderer {
                 }
             }
         });
+
+        // The count of sections that became the arena's contents in this frame: the one number that
+        // says the baker's output is reaching the buffer the terrain pass will draw from, and that
+        // the queue is being drained rather than growing behind it.
+        if moved != 0 && mc::chunk::DIAGNOSTIC_LOGGING.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "wgpu-mc: {moved} baked section(s) moved into the arena ({} in it now)",
+                scene.section_storage.read().len()
+            );
+        }
+    }
+
+    /// The wgpu version this build was compiled against, as the build script saw it.
+    ///
+    /// The same string `get_backend_description` reports, for the callers that need a version without
+    /// a renderer: the processed-shader cache stamps its entries with it, so shaders translated by one
+    /// wgpu are not fed to another.
+    pub fn wgpu_version() -> &'static str {
+        env!("WGPUMC_WGPU_VER")
     }
 
     pub fn get_backend_description(&self) -> String {

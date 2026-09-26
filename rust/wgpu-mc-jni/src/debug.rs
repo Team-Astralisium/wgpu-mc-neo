@@ -60,6 +60,9 @@ static PIX_CAPTURE: AtomicBool = AtomicBool::new(false);
 /// why the setting that feeds it is marked as needing a restart.
 static GPU_BASED_VALIDATION: AtomicBool = AtomicBool::new(false);
 
+/// Whether the section feed is timed. See [`section_timing`].
+static SECTION_TIMING: AtomicBool = AtomicBool::new(false);
+
 #[inline]
 pub fn diagnostics() -> bool {
     DIAGNOSTICS.load(Ordering::Relaxed)
@@ -106,6 +109,15 @@ pub fn pix_capture() -> bool {
     PIX_CAPTURE.load(Ordering::Relaxed)
 }
 
+/// Whether the section feed is timed, phase by phase.
+///
+/// Read on Minecraft's chunk-build threads, once per rebuild, so the switch is what keeps the clock
+/// reads out of the path entirely when it is off.
+#[inline]
+pub fn section_timing() -> bool {
+    SECTION_TIMING.load(Ordering::Relaxed)
+}
+
 #[inline]
 pub fn gpu_based_validation() -> bool {
     GPU_BASED_VALIDATION.load(Ordering::Relaxed)
@@ -123,6 +135,7 @@ pub fn apply(settings: &Settings) {
         dump_shaders,
         gpu_timestamps,
         pix_capture,
+        section_timing,
         logging,
     } = settings.debug();
 
@@ -153,6 +166,11 @@ pub fn apply(settings: &Settings) {
     // to end a capture, and a capture that never ends is worse than none.
     set(&GPU_TIMESTAMPS, gpu_timestamps);
     set(&PIX_CAPTURE, pix_capture);
+    set(&SECTION_TIMING, section_timing || marker("wgpu-section-timing"));
+
+    // The `wgpu-mc` crate writes lines of its own - the per-bake report, for one - and the switch
+    // that decides whether they are sampled or written is the same one this file just resolved.
+    wgpu_mc::mc::chunk::DIAGNOSTIC_LOGGING.store(LOGGING.load(Ordering::Relaxed), Ordering::Relaxed);
 
     crate::timing::set_enabled(gpu_timestamps);
     crate::pix::set_capturing(pix_capture);
@@ -179,6 +197,7 @@ fn name(flag: &AtomicBool) -> &'static str {
         f if std::ptr::eq(f, &DUMP_SHADERS) => "dump shaders",
         f if std::ptr::eq(f, &GPU_TIMESTAMPS) => "gpu timestamps",
         f if std::ptr::eq(f, &PIX_CAPTURE) => "pix capture",
+        f if std::ptr::eq(f, &SECTION_TIMING) => "section timing",
         _ => "gpu based validation",
     }
 }
@@ -194,7 +213,7 @@ fn marker(file_name: &'static str) -> bool {
 
     MARKERS
         .get_or_init(|| {
-            const NAMES: [&str; 7] = [
+            const NAMES: [&str; 8] = [
                 "wgpu-dump-frames",
                 "wgpu-no-bind-group-cache",
                 "wgpu-no-dynamic-offsets",
@@ -202,6 +221,7 @@ fn marker(file_name: &'static str) -> bool {
                 "wgpu-dump-shaders",
                 "wgpu-binding-log",
                 "wgpu-logging",
+                "wgpu-section-timing",
             ];
 
             let mut present = std::collections::HashSet::new();

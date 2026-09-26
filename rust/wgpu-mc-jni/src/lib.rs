@@ -12,7 +12,7 @@ use jni::objects::{
     AutoElements, GlobalRef, JByteArray, JClass, JIntArray, JLongArray, JObject, JObjectArray,
     JPrimitiveArray, JString, JValue, JValueOwned, ReleaseMode, WeakRef,
 };
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jint, jsize, jstring};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyte, jint, jlong, jsize, jstring};
 use jni::{JNIEnv, JavaVM};
 use jni_fn::jni_fn;
 use once_cell::sync::{Lazy, OnceCell};
@@ -27,6 +27,7 @@ use std::fmt::Debug;
 use std::io::{Cursor, Write, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::{mem, thread};
 use wgpu::Extent3d;
@@ -43,9 +44,10 @@ use wgpu_mc::texture::{BindableTexture, TextureAndView};
 use wgpu_mc::wgpu::{self, CurrentSurfaceTexture, TextureFormat};
 use wgpu_mc::{Frustum, WmRenderer};
 
-use crate::lighting::DeserializedLightData;
-use crate::palette::JavaPalette;
-use crate::pia::PackedIntegerArray;
+use crate::section::{
+    CachedBlockstateProvider, Payload, SECTIONS, SectionBlocks, SectionLight, WORLD,
+    neighbour_offset,
+};
 use crate::settings::Settings;
 
 mod alloc;
@@ -61,6 +63,8 @@ mod pia;
 mod pix;
 pub mod preprocessing;
 mod renderer;
+mod section;
+mod shader_cache;
 mod settings;
 mod timing;
 
@@ -104,22 +108,39 @@ static MC_STATE: Lazy<ArcSwap<MinecraftRenderState>> = Lazy::new(|| {
 
 static CLEAR_COLOR: Lazy<ArcSwap<[f32; 3]>> = Lazy::new(|| ArcSwap::new(Arc::new([0.0; 3])));
 
-static AIR: Lazy<BlockstateKey> = Lazy::new(|| BlockstateKey {
-    block: RENDERER
+/// The block state a section's holes are, or `None` while the block registry is empty.
+///
+/// `None` is a real state of the world, not an error: this build has no block atlas yet, so
+/// `bake_blocks` bakes nothing and `minecraft:air` is simply not in the registry. Baking without it
+/// would have to guess what "air" is, and guessing wrong is geometry built out of nothing, so the
+/// bake refuses instead - see `bakeSection`.
+static AIR: Lazy<Option<BlockstateKey>> = Lazy::new(|| {
+    RENDERER
         .get()
-        .unwrap()
-        .mc
-        .block_manager
-        .read()
-        .blocks
-        .get_full("minecraft:air")
-        .unwrap()
-        .0 as u16,
-    augment: 0,
+        .and_then(|renderer| {
+            renderer
+                .mc
+                .block_manager
+                .read()
+                .blocks
+                .get_full("minecraft:air")
+                .map(|(id, _, _)| BlockstateKey {
+                    block: id as u16,
+                    augment: 0,
+                })
+        })
 });
 
 static BLOCKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static BLOCK_STATES: Mutex<Vec<(String, String, GlobalRef)>> = Mutex::new(Vec::new());
+
+/// Set once [`cacheBlockStates`] has built the block manager from the game's resources.
+///
+/// Everything that bakes geometry needs it: `AIR` and the model lookup behind [`bake_layers`] are
+/// built from that registry, and asking for them before it exists used to be a panic - which, on a
+/// `#[jni_fn]` frame, is the JVM aborting. A section rebuild can arrive first, because the client
+/// caches block states on the title screen while a quickplay launch is already loading chunks.
+static BLOCKS_CACHED: AtomicBool = AtomicBool::new(false);
 pub static SETTINGS: RwLock<Option<Settings>> = RwLock::new(None);
 
 pub static CLASSLOADER: OnceCell<WeakRef> = OnceCell::new();
@@ -155,10 +176,14 @@ pub fn call_static_from_class_loader<'env>(
     };
 
     let arg = env.new_string(class)?;
+    // `loadClass`, not `findClass`. `findClass` is the loader's *define* hook: it skips the cache and
+    // asks the loader to produce the class again, which for a class that is already loaded ends in
+    // "attempted duplicate class definition" - a LinkageError, on a thread whose every later JNI call
+    // then fails as well. `loadClass` is the public lookup: parent first, cache included.
     let class_obj: JClass = env
         .call_method(
             class_loader,
-            "findClass",
+            "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[JValue::Object(&arg)],
         )?
@@ -188,87 +213,6 @@ pub fn setClassLoader(mut env: JNIEnv, _class: JClass, class_loader: JObject) {
     }
 }
 
-#[derive(Debug)]
-pub struct SectionHolder {
-    pub block_data: Option<(JavaPalette, PackedIntegerArray)>,
-    pub light_data: Option<DeserializedLightData>,
-}
-
-#[derive(Debug)]
-pub struct MinecraftBlockstateProvider {
-    pub sections: [Option<SectionHolder>; 27],
-    pub air: BlockstateKey,
-}
-impl BlockStateProvider for MinecraftBlockstateProvider {
-    fn get_state(&self, pos: IVec3) -> ChunkBlockState {
-        let section_pos: IVec3 = (pos >> 4) + 1;
-        let section_option =
-            &self.sections[(section_pos.x + section_pos.y * 3 + section_pos.z * 9) as usize];
-
-        let section = match section_option {
-            None => return ChunkBlockState::Air,
-            Some(chunk) => chunk,
-        };
-
-        let (palette, storage) = match &section.block_data {
-            Some(section) => section,
-            None => return ChunkBlockState::Air,
-        };
-
-        let palette_key = storage.get(pos.x & 15, pos.y & 15, pos.z & 15);
-        let block = palette.get(palette_key as usize).unwrap();
-
-        if *block == self.air {
-            ChunkBlockState::Air
-        } else {
-            ChunkBlockState::State(*block)
-        }
-    }
-
-    fn get_light_level(&self, pos: IVec3) -> LightLevel {
-        let section_pos: IVec3 = (pos >> 4) + 1;
-        let chunk_option =
-            &self.sections[(section_pos.x + section_pos.y * 3 + section_pos.z * 9) as usize];
-
-        let chunk = match chunk_option {
-            None => return LightLevel::from_sky_and_block(0, 0),
-            Some(chunk) => chunk,
-        };
-
-        let light_data = match &chunk.light_data {
-            None => return LightLevel::from_sky_and_block(0, 0),
-            Some(light_data) => light_data,
-        };
-
-        let local_x = pos.x & 0b1111;
-        let local_y = pos.y & 0b1111;
-        let local_z = pos.z & 0b1111;
-
-        let packed_coords = ((local_y << 8) | (local_z << 4) | (local_x)) as usize;
-
-        let shift = (packed_coords & 1) << 2;
-
-        let array_index = packed_coords >> 1;
-
-        let sky_light = (light_data.sky_light[array_index] >> shift) & 0b1111;
-        let block_light = (light_data.block_light[array_index] >> shift) & 0b1111;
-
-        LightLevel::from_sky_and_block(sky_light, block_light)
-    }
-
-    fn is_section_empty(&self, rel_pos: IVec3) -> bool {
-        if rel_pos.abs().cmpgt(ivec3(1, 1, 1)).any() {
-            return true;
-        }
-
-        self.sections[(rel_pos + 1).dot(ivec3(1, 3, 9)) as usize].is_none()
-    }
-
-    fn get_block_color(&self, _pos: IVec3, _tint_index: i32) -> u32 {
-        0xffffffff
-    }
-}
-
 struct MinecraftResourceManagerAdapter {
     jvm: JavaVM,
 }
@@ -292,6 +236,11 @@ impl ResourceProvider for MinecraftResourceManagerAdapter {
         let path = match env.new_string(&id.0) {
             Ok(path) => path,
             Err(err) => {
+                // A failure here almost always means an *earlier* call on this thread left an
+                // exception pending: every JNI call after that fails too, which is how one bad
+                // resource read turns into "nothing can be read". Describing and clearing it is what
+                // puts the original Java stack in the log and lets the next read succeed.
+                describe_and_clear(&mut env, &id.0);
                 log::error!("wgpu-mc: could not pass {} to the JVM: {err}", id.0);
                 return None;
             }
@@ -308,6 +257,10 @@ impl ResourceProvider for MinecraftResourceManagerAdapter {
         {
             Ok(bytes) => bytes.into(),
             Err(err) => {
+                // The Java stack of whatever `getResource` threw, printed before the exception is
+                // cleared: a pending exception makes every later JNI call on this thread fail, so
+                // the original failure would otherwise be reported as a second, unrelated one.
+                describe_and_clear(&mut env, &id.0);
                 log::error!("wgpu-mc: {} could not be read: {err}", id.0);
                 return None;
             }
@@ -336,6 +289,26 @@ impl ResourceProvider for MinecraftResourceManagerAdapter {
             slice::from_raw_parts(elements.as_ptr() as *const u8, size)
         }))
     }
+}
+
+/// Says what a pending Java exception is, and clears it.
+///
+/// A pending exception makes *every* later JNI call on the same thread fail, so leaving one behind
+/// turns "this one resource could not be read" into "nothing on this thread can be read". Printing
+/// it first is what keeps the original Java stack in the log, and clearing it is what lets the next
+/// call have a chance.
+fn describe_and_clear(env: &mut JNIEnv, what: &str) {
+    if !env.exception_check().unwrap_or(false) {
+        return;
+    }
+
+    log::error!("wgpu-mc: {what}: the JVM threw while reading this resource");
+
+    if let Err(err) = env.exception_describe() {
+        log::error!("wgpu-mc: {what}: and the exception could not be described: {err}");
+    }
+
+    let _ = env.exception_clear();
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
@@ -465,8 +438,9 @@ pub fn registerBlockState(
         .push((block_name, state_key, global_ref));
 }
 
+
 struct MinecraftBlockStateProviderWrapper<'a> {
-    internal: MinecraftBlockstateProvider,
+    internal: CachedBlockstateProvider,
     env: RefCell<JNIEnv<'a>>,
 }
 
@@ -483,113 +457,306 @@ impl<'a> BlockStateProvider for MinecraftBlockStateProviderWrapper<'a> {
         self.internal.is_section_empty(rel_pos)
     }
 
+    /// The biome tint for one tinted face, asked of the game itself: the tint is a property of the
+    /// world at that position, and this side only has the section data.
+    ///
+    /// This runs on a bake thread, which is a plain native thread attached to the JVM, so the class
+    /// has to be looked up through the game's own loader - `FindClass` on such a thread resolves
+    /// against the system loader, which cannot see NeoForge's transformed classes, and the
+    /// `.unwrap()` that used to be here took the pool thread (and, through the second panic, the
+    /// process) down the moment a tinted face was baked. White is what a face with no tint gets, so
+    /// that is the answer when the call cannot be made, once per failure mode with a log line.
     fn get_block_color(&self, pos: IVec3, tint_index: i32) -> u32 {
-        self.env
-            .borrow_mut()
-            .call_static_method(
-                "dev/birb/wgpu/render/Wgpu",
-                "helperGetBlockColor",
-                "(IIII)I",
-                &[
-                    JValue::Int(pos.x),
-                    JValue::Int(pos.y),
-                    JValue::Int(pos.z),
-                    JValue::Int(tint_index),
-                ],
-            )
-            .unwrap()
-            .i()
-            .unwrap() as u32
+        let mut env = self.env.borrow_mut();
+
+        let result = call_static_from_class_loader(
+            &mut env,
+            "dev.birb.wgpu.render.Wgpu",
+            "helperGetBlockColor",
+            "(IIII)I",
+            &[
+                JValue::Int(pos.x),
+                JValue::Int(pos.y),
+                JValue::Int(pos.z),
+                JValue::Int(tint_index),
+            ],
+        )
+        .and_then(|value| value.i());
+
+        match result {
+            Ok(color) => color as u32,
+            Err(err) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    // The Java side of the call is the interesting part: a `JavaException` here can
+                    // be the game's own, and it stays pending on this thread until it is described
+                    // and cleared - which would make every later call on the thread fail too.
+                    describe_and_clear(&mut env, "helperGetBlockColor");
+                    log::warn!(
+                        "wgpu-mc: could not ask the game for a biome tint ({err}); tinted faces are \
+                         left untinted"
+                    );
+                }
+
+                0xffff_ffff
+            }
+        }
     }
 }
 
+/// One section rebuild, in one call.
+///
+/// The payload is written by `RustChunkBake` into a buffer it owns and reuses, and `address`/`length`
+/// describe it: a structure of records followed by their blobs - Minecraft's own storage longs, the
+/// palette translation table, and the light layers that changed. One call rather than four arrays and
+/// a handle per section, because the old shape was ~57 JNI calls and 60 arrays per rebuild, all of it
+/// for data the JVM already had in exactly this form.
+///
+/// Returns whether the caller has to send the whole neighbourhood again: this side keeps the light of
+/// each section and drops the ones far from the player, so a section the JVM counts as already sent
+/// can be gone here. `true` means that happened, no bake was queued, and the caller should clear its
+/// own bookkeeping and call once more with everything it has.
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
-pub fn bakeSection(
-    mut env: JNIEnv,
+pub fn bakeSections(
+    _env: JNIEnv,
     _class: JClass,
     x: jint,
     y: jint,
     z: jint,
-    paletteIndices: JLongArray,
-    storageIndices: JLongArray,
-    blockBytes: JObjectArray,
-    skyBytes: JObjectArray,
-) {
-    let palette_elements =
-        unsafe { env.get_array_elements(&paletteIndices, ReleaseMode::NoCopyBack) }.unwrap();
-    let palettes =
-        unsafe { slice::from_raw_parts(palette_elements.as_ptr(), palette_elements.len()) };
-    let storage_elements =
-        unsafe { env.get_array_elements(&storageIndices, ReleaseMode::NoCopyBack) }.unwrap();
-    let storages =
-        unsafe { slice::from_raw_parts(storage_elements.as_ptr(), storage_elements.len()) };
-    const NONE: Option<SectionHolder> = None;
-    let mut bsp = MinecraftBlockstateProvider {
-        sections: [NONE; 27],
-        air: *AIR,
+    address: jlong,
+    length: jint,
+) -> jboolean {
+    // A rebuild can arrive before the client has cached block states, and the cache itself cannot
+    // build anything while no block atlas is registered. `AIR` is the registry's, so without it
+    // there is no way to tell a hole from a block: say so once and let the caller try again later.
+    let Some(air) = *AIR else {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: a section was offered for baking while the block registry was empty; \
+                 skipping until it is built"
+            );
+        }
+        return false as jboolean;
     };
 
-    for i in 0..27 {
-        let mut palette_storage = PALETTE_STORAGE.write();
-        let mut pia_storage = PIA_STORAGE.write();
-
-        let block_data = if palette_storage.contains(palettes[i] as usize)
-            && pia_storage.contains(storages[i] as usize)
-        {
-            Some((
-                palette_storage.remove(palettes[i] as usize),
-                pia_storage.remove(storages[i] as usize),
-            ))
-        } else {
-            None
-        };
-        let sky_array = unsafe {
-            JPrimitiveArray::from_raw(
-                env.get_object_array_element(&skyBytes, i as jsize)
-                    .unwrap()
-                    .into_raw(),
-            )
-        };
-        let sky_bytes =
-            unsafe { env.get_array_elements(&sky_array, ReleaseMode::NoCopyBack) }.unwrap();
-        let block_array = unsafe {
-            JPrimitiveArray::from_raw(
-                env.get_object_array_element(&blockBytes, i as jsize)
-                    .unwrap()
-                    .into_raw(),
-            )
-        };
-        let block_bytes =
-            unsafe { env.get_array_elements(&block_array, ReleaseMode::NoCopyBack) }.unwrap();
-
-        bsp.sections[i] = Some(SectionHolder {
-            block_data,
-            light_data: Some(DeserializedLightData {
-                sky_light: Box::new(
-                    unsafe { slice::from_raw_parts(sky_bytes.as_ptr(), sky_bytes.len()) }
-                        .try_into()
-                        .unwrap(),
-                ),
-                block_light: Box::new(
-                    unsafe { slice::from_raw_parts(block_bytes.as_ptr(), block_bytes.len()) }
-                        .try_into()
-                        .unwrap(),
-                ),
-            }),
-        });
+    if length <= 0 || address == 0 {
+        log::error!("wgpu-mc: a section bake arrived with no payload; dropping it");
+        return false as jboolean;
     }
 
-    // THREAD_POOL.get().unwrap().spawn(move || {
-    let wm = RENDERER.get().unwrap();
-    // let env = jvm.attach_current_thread_as_daemon().unwrap();
+    // The caller's buffer, read and left alone: everything kept is copied out below, before this
+    // returns and the JVM writes the next payload over it.
+    let bytes = unsafe { slice::from_raw_parts(address as *const u8, length as usize) };
 
-    let wrapper = MinecraftBlockStateProviderWrapper {
-        internal: bsp,
-        env: RefCell::new(env),
+    // A payload this side cannot read is one it did not receive. Saying so - rather than answering
+    // "all good" - is what makes the JVM forget what it thought had been sent and hand the whole
+    // neighbourhood over again, which is the only way back to a cache the two sides agree on.
+    let Some(mut payload) = Payload::parse(bytes) else {
+        return true as jboolean;
     };
 
-    bake_section(ivec3(x, y, z), wm, &wrapper);
-    // })
+    let target = ivec3(x, y, z);
+
+    let mut world = WORLD.write();
+
+    // Apply the payload first, so a bake queued below never sees a half-applied neighbourhood: the
+    // sections the caller sent replace what was held for them, and the ones it says to forget are
+    // dropped - those are the sections that became air or were unloaded.
+    for (index, slot) in payload.blocks.iter_mut().enumerate() {
+        let pos = target + neighbour_offset(index);
+
+        if payload.absent & (1 << index) != 0 {
+            world.remove_blocks(pos);
+        } else if let Some(blocks) = slot.take() {
+            world.set_blocks(pos, Arc::new(blocks));
+        }
+    }
+
+    for (index, light) in &payload.light {
+        world.set_light(target + neighbour_offset(*index), light.clone());
+    }
+
+    for index in 0..SECTIONS {
+        if payload.light_absent & (1 << index) != 0 {
+            world.remove_light(target + neighbour_offset(index));
+        }
+    }
+
+    // A section the JVM marked as "already yours" but that this side does not have - a cache that was
+    // trimmed, a new world, a section that became empty under us - means a bake against holes. The
+    // caller sends everything again instead, and this call queues nothing.
+    let known_blocks = payload.known_blocks & !payload.present;
+    let known_light = payload.known_light & !payload.light.iter().fold(0u32, |mask, (index, _)| {
+        mask | (1 << index)
+    });
+
+    let (missing_blocks, missing_light) = world.missing(target, known_blocks, known_light);
+
+    if missing_blocks != 0 || missing_light != 0 {
+        static RESYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let resyncs = RESYNCS.fetch_add(1, Ordering::Relaxed);
+        if resyncs < 8 || resyncs.is_multiple_of(256) {
+            log::info!(
+                "wgpu-mc: around {target:?} the JVM counts {missing_blocks:#b} (blocks) and \
+                 {missing_light:#b} (light) as already sent, and this side does not have them; asking \
+                 for the neighbourhood again ({resyncs} resync(s) so far)"
+            );
+        }
+
+        // What did arrive stays: it is the newest version of those sections either way.
+        return true as jboolean;
+    }
+
+    let mut blocks: [Option<Arc<SectionBlocks>>; SECTIONS] = Default::default();
+    let mut light: [Option<Arc<SectionLight>>; SECTIONS] = Default::default();
+
+    // Every slot is resolved from the cache, not just the ones this payload carried: a section the
+    // caller did not send is one it believes is already here, and a slot that is still empty is a
+    // section that is not loaded - which is air, as it is for Minecraft's own mesher.
+    for index in 0..SECTIONS {
+        let pos = target + neighbour_offset(index);
+        blocks[index] = world.blocks(pos);
+        light[index] = world.light(pos);
+    }
+
+    let provider = CachedBlockstateProvider {
+        blocks,
+        light,
+        air,
+    };
+
+    world.trim(target);
+    drop(world);
+
+    let jvm = match _env.get_java_vm() {
+        Ok(jvm) => jvm,
+        Err(err) => {
+            log::error!("wgpu-mc: could not get the JVM handle for a bake: {err}");
+            return false as jboolean;
+        }
+    };
+
+    // The Java thread is done with this section: everything the bake needs is owned by now, so it
+    // goes to the pool and the caller returns to Minecraft's chunk build. See [BakeTask] for what
+    // crosses the thread boundary and what deliberately does not.
+    if let Some(task) = BakeTask::new(target, provider, jvm) {
+        THREAD_POOL.spawn(move || task.run());
+    }
+
+    false as jboolean
+}
+/// The pool the section bakes run on.
+///
+/// Baking is CPU work over data the Java side has already handed over, and it used to run on
+/// whichever chunk-build thread asked for it - a thread Minecraft wants back for the next section,
+/// held while palettes were turned into vertices. Rayon's own default sizing is used (one thread per
+/// core): these tasks are independent, they take only read locks, and the results funnel back
+/// through the chunk update queue that was already the hand-off to the render thread.
+static THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
+    ThreadPoolBuilder::new()
+        .thread_name(|index| format!("wgpu-mc bake {index}"))
+        .build()
+        .expect("wgpu-mc: could not start the section bake pool")
+});
+
+/// How many bakes may be waiting before further sections are dropped on the floor.
+///
+/// A section rebuild is offered every time Minecraft decides one is out of date, so a dropped offer
+/// is not lost work - it comes back. What it buys is a bound on the memory waiting in this queue:
+/// each queued bake owns 27 sections' worth of palettes, storages and light layers, which is a few
+/// hundred kilobytes, and a player moving quickly can offer thousands of sections in a second.
+const MAX_QUEUED_BAKES: usize = 256;
+
+/// How many bakes are queued or running, against [MAX_QUEUED_BAKES].
+static QUEUED_BAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Takes a slot in the bake queue, or answers false when it is full.
+fn reserve_bake_slot() -> bool {
+    let queued = QUEUED_BAKES.fetch_add(1, Ordering::Relaxed);
+
+    if queued >= MAX_QUEUED_BAKES {
+        QUEUED_BAKES.fetch_sub(1, Ordering::Relaxed);
+
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {MAX_QUEUED_BAKES} section bakes are already waiting; dropping this one, \
+                 which Minecraft will offer again"
+            );
+        }
+
+        return false;
+    }
+
+    true
+}
+
+/// Gives a slot back. Called however a bake ends, including when it never started.
+fn release_bake_slot() {
+    QUEUED_BAKES.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// One section bake, on its way to the pool.
+///
+/// Everything it needs is owned: the JNI arrays it was built from are only valid on the thread that
+/// received them, so the palettes, the storages and the two light layers are moved out before the
+/// task is spawned. The `JNIEnv` is deliberately *not* carried across - a pool thread attaches
+/// itself in [`BakeTask::run`], which is also where the callback into Java for biome tints gets a
+/// usable environment from.
+struct BakeTask {
+    pos: IVec3,
+    provider: CachedBlockstateProvider,
+    jvm: JavaVM,
+}
+
+impl BakeTask {
+    /// Queues a bake, or drops it if the queue is full. `None` when it was dropped.
+    fn new(pos: IVec3, provider: CachedBlockstateProvider, jvm: JavaVM) -> Option<Self> {
+        if !reserve_bake_slot() {
+            return None;
+        }
+
+        Some(Self { pos, provider, jvm })
+    }
+
+    fn run(self) {
+        // Counts down however this returns, including the early returns below.
+        struct Queued;
+        impl Drop for Queued {
+            fn drop(&mut self) {
+                release_bake_slot();
+            }
+        }
+        let _queued = Queued;
+
+        let Some(wm) = RENDERER.get() else {
+            return;
+        };
+
+        // The bake asks Java for a biome tint per tinted face (`Wgpu.helperGetBlockColor`), so this
+        // thread needs its own attachment to the JVM. A daemon attachment is the right one: it does
+        // not hold the JVM open once the game is done, and it is what a worker pool thread wants.
+        let env = match self.jvm.attach_current_thread_as_daemon() {
+            Ok(env) => env,
+            Err(error) => {
+                log::warn!("wgpu-mc: could not attach a bake thread to the JVM: {error}");
+                return;
+            }
+        };
+
+        let wrapper = MinecraftBlockStateProviderWrapper {
+            internal: self.provider,
+            env: RefCell::new(env),
+        };
+
+        bake_section(self.pos, wm, &wrapper);
+    }
+}
+
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn blocksCached(_env: JNIEnv, _class: JClass) -> jboolean {
+    BLOCKS_CACHED.load(Ordering::Acquire) as jboolean
 }
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
@@ -628,14 +795,51 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
     let mut states = BLOCK_STATES.lock();
 
     let block_manager = wm.mc.block_manager.write();
+
+    // Nothing was baked, so there is nothing to map and `AIR` would not be in the registry either.
+    // Leave `BLOCKS_CACHED` false: the section baker checks it, and a bake against an empty registry
+    // would have to invent what "air" is.
+    if block_manager.blocks.is_empty() {
+        log::error!(
+            "wgpu-mc: no block states were registered, so the native block registry is empty and the \
+             terrain baker cannot run ({} state(s) were offered)",
+            states.len()
+        );
+        return;
+    }
     let mut mappings = Vec::new();
 
     let mut stdout = stdout().lock();
 
+    // Every state whose block has no model is drawn as bedrock, which is what the game itself falls
+    // back to. Bedrock missing too - a pack whose bedrock blockstate fails to bake, which
+    // `bake_blocks` skips with a warning - leaves the first block that did bake standing in; the
+    // registry is known to be non-empty here, because an empty one returned above.
+    let fallback_id = block_manager
+        .blocks
+        .get_index_of("minecraft:bedrock")
+        .unwrap_or(0);
+
+    // How many states had to take the fallback, so the log says it once rather than once per state.
+    let mut unmodelled = 0usize;
+
     states
         .iter()
         .for_each(|(block_name, state_key, global_ref)| {
-            let (id_key, _, wm_block) = block_manager.blocks.get_full(block_name).unwrap();
+            // A block whose blockstate file is missing or malformed is not in the registry at all,
+            // and `get_full(..).unwrap()` here used to take the block cache thread down with it -
+            // meaning nothing downstream, including the Rust terrain baker, ever saw a registry.
+            let Some(id_key) = block_manager.blocks.get_index_of(block_name.as_str()) else {
+                unmodelled += 1;
+                mappings.push((
+                    BlockstateKey {
+                        block: fallback_id as u16,
+                        augment: 0,
+                    },
+                    global_ref,
+                ));
+                return;
+            };
 
             let key_iter = if !state_key.is_empty() {
                 state_key
@@ -661,6 +865,7 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
             };
             let atlases = wm.mc.texture_manager.atlases.write();
             let atlas = &atlases[BLOCK_ATLAS];
+            let wm_block = &block_manager.blocks[id_key];
             let model = wm_block.get_model_by_key(
                 key_iter
                     .iter()
@@ -670,25 +875,31 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
                 atlas,
                 0,
             );
-            let fallback_key = block_manager.blocks.get_full("minecraft:bedrock").unwrap();
 
             let key = match model {
                 Some((_, augment)) => BlockstateKey {
                     block: id_key as u16,
                     augment,
                 },
-                None => BlockstateKey {
-                    block: fallback_key.0 as u16,
-                    augment: 0,
-                },
+                None => {
+                    unmodelled += 1;
+                    BlockstateKey {
+                        block: fallback_id as u16,
+                        augment: 0,
+                    }
+                }
             };
-
-            if key.block == fallback_key.0 as u16 {
-                writeln!(&mut stdout, "{} {}", block_name, state_key).unwrap();
-            }
 
             mappings.push((key, global_ref));
         });
+
+    if unmodelled != 0 {
+        writeln!(
+            &mut stdout,
+            "wgpu-mc: {unmodelled} block state(s) have no model and are drawn as bedrock"
+        )
+        .unwrap();
+    }
 
     drop(stdout);
 
@@ -710,6 +921,10 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
     let state_count = states.len();
 
     states.clear();
+
+    // Everything that bakes geometry reads the registry this just built, so it is only from here on
+    // that a bake is allowed to run - see `BLOCKS_CACHED`.
+    BLOCKS_CACHED.store(true, Ordering::Release);
 
     let debug_message = format!(
         "Released {} global refs to BlockState objects in {}ms",
@@ -761,19 +976,39 @@ pub fn setPanicHook(env: JNIEnv, _class: JClass) {
             }
         }
 
-        let jvm = unsafe { JavaVM::from_raw(jvm_ptr as _).unwrap() };
-        let mut env = jvm.attach_current_thread_permanently().unwrap();
+        // Nothing below may panic. A panic while a panic is being handled aborts the process -
+        // "thread panicked while processing panic" - and that abort replaces the report this hook
+        // exists to write, which is exactly what happened when a bake thread panicked with a Java
+        // exception pending: every JNI call from the hook failed, and the first `unwrap` in it turned
+        // a reported panic into a silent abort.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(jvm) = (unsafe { JavaVM::from_raw(jvm_ptr as _) }) else {
+                return;
+            };
 
-        let message = format!("wgpu-mc has panicked. Minecraft will now exit.\n{panic_info}");
-        let jstring = env.new_string(message).unwrap();
+            let Ok(mut env) = jvm.attach_current_thread_permanently() else {
+                return;
+            };
 
-        //Does not return
-        env.call_static_method(
-            "dev/birb/wgpu/render/Wgpu",
-            "rustPanic",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&JObject::from(jstring))],
-        );
+            // A pending exception would make the calls below fail one after another, and the one
+            // that describes it is also the one that clears it. This is the last chance to say what
+            // Java threw.
+            describe_and_clear(&mut env, "the panic hook");
+
+            let Ok(jstring) =
+                env.new_string(format!("wgpu-mc has panicked. Minecraft will now exit.\n{panic_info}"))
+            else {
+                return;
+            };
+
+            //Does not return
+            let _ = env.call_static_method(
+                "dev/birb/wgpu/render/Wgpu",
+                "rustPanic",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&JObject::from(jstring))],
+            );
+        }));
     }))
 }
 
@@ -784,3 +1019,34 @@ pub fn setWorldRenderState(_env: JNIEnv, _class: JClass, boolean: jboolean) {
     }));
 }
 
+
+#[cfg(test)]
+mod bake_queue_tests {
+    use super::*;
+
+    /// The cap is what keeps a fast-moving player from queueing a world's worth of sections, and it
+    /// has to give the slots back - a leak here would stop baking for the rest of the run, quietly.
+    #[test]
+    fn the_bake_queue_refuses_past_its_cap_and_gives_the_slots_back() {
+        // The counter is global, so this test owns it for its duration.
+        while QUEUED_BAKES.load(Ordering::Relaxed) > 0 {
+            release_bake_slot();
+        }
+
+        for taken in 0..MAX_QUEUED_BAKES {
+            assert!(reserve_bake_slot(), "slot {taken} of {MAX_QUEUED_BAKES} was refused");
+        }
+
+        assert!(!reserve_bake_slot(), "the queue took more than its cap");
+        assert_eq!(QUEUED_BAKES.load(Ordering::Relaxed), MAX_QUEUED_BAKES);
+
+        release_bake_slot();
+        assert!(reserve_bake_slot(), "a released slot was not reusable");
+        assert_eq!(QUEUED_BAKES.load(Ordering::Relaxed), MAX_QUEUED_BAKES);
+
+        for _ in 0..MAX_QUEUED_BAKES {
+            release_bake_slot();
+        }
+        assert_eq!(QUEUED_BAKES.load(Ordering::Relaxed), 0);
+    }
+}

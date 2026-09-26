@@ -1,0 +1,709 @@
+package dev.birb.wgpu.chunk
+
+import dev.birb.wgpu.WgpuMcMod
+import dev.birb.wgpu.backend.Diagnostics
+import dev.birb.wgpu.mixin.chunk.RenderSectionRegionAccessor
+import dev.birb.wgpu.mixin.world.PackedIntegerArrayMixin
+import dev.birb.wgpu.mixin.chunk.SectionCopyAccessor
+import dev.birb.wgpu.palette.RustBlockStateAccessor
+import dev.birb.wgpu.rust.WgpuNative
+import net.minecraft.client.Minecraft
+import net.minecraft.client.renderer.chunk.RenderSectionRegion
+import net.minecraft.core.SectionPos
+import net.minecraft.util.SimpleBitStorage
+import net.minecraft.world.level.LightLayer
+import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.chunk.PalettedContainer
+import java.lang.foreign.Arena
+import java.lang.foreign.MemorySegment
+import java.lang.foreign.ValueLayout
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.min
+
+/**
+ * Hands a section rebuild to the Rust terrain baker.
+ *
+ * The Rust side owns the meshing (`wgpu_mc::mc::chunk::bake_layers`) and the arena the result lands
+ * in (`SectionStorage`); this side owns the world. What crosses the boundary is Minecraft's own data,
+ * not a copy shaped for Rust:
+ *
+ *  - **The block storage goes over as it is.** A `PalettedContainer` is a palette plus a bit-packed
+ *    storage, and the storage's geometry - `valuesPerLong`, `mask`, `divideMul`, `divideAdd`,
+ *    `divideShift` and the raw longs - is read straight out of Minecraft's `SimpleBitStorage`. What
+ *    Rust gets beside it is a **palette translation table**: `table[minecraft index]` is the block key
+ *    Rust knows that state by. Two entries may name the same key - a waterlogged variant, say - which
+ *    is exactly why the table exists: the indices stay Minecraft's, so nothing has to be renumbered
+ *    and no storage has to be re-packed. (An earlier revision rebuilt a palette and packed a fresh
+ *    `SimpleBitStorage` here, per section, per rebuild: 4096 `getAll` calls and a new bit-packing
+ *    every time, for data the game was already holding.)
+ *  - **Only what changed is sent.** Rust keeps a section until it is far from the player, and this side
+ *    keeps what it has told Rust, so a section whose storage and light hash the same as last time goes
+ *    over as one bit in a mask instead of a few kilobytes. Light especially: a rebuild of one section
+ *    needs the light of 27, and re-sending all of them was 108 KB of copying, 54 array allocations and
+ *    54 JNI calls each time, for data that changes when a torch is placed rather than when a chunk is
+ *    re-meshed.
+ *  - **Everything goes in one call.** The payload is written into one reusable off-heap buffer and
+ *    handed over as an address; the old shape was ~57 JNI calls and 60 arrays per rebuild, and it
+ *    allocated all of them per rebuild as well.
+ *
+ * Three things about the shape of the data are worth naming, because each is easy to get wrong:
+ *
+ *  - **The 27 entries are ordered x fastest, then y, then z.** That is the order the Rust provider
+ *    indexes (`sx + sy * 3 + sz * 9`) and the order `RenderSectionRegion` keeps its own copies in.
+ *  - **Light is a nibble array**, 2048 bytes for a 16x16x16 section, packed as
+ *    `(y << 8) | (z << 4) | x` with the low nibble first - `DataLayer#getData` is exactly that.
+ *  - **The sections come from the rebuild's own snapshot.** A `SectionCopy` holds a private copy of
+ *    the section's `PalettedContainer`, so reading it is both consistent with the mesh Minecraft is
+ *    building in the same task and safe off-thread (the live chunk is guarded by a threading
+ *    detector). A position the snapshot does not cover is "not loaded", which is air to both sides.
+ *
+ * Nothing here runs unless the path is switched on - see [MARKER] - because until the render graph
+ * draws these sections, a baked section is work nobody reads.
+ */
+object RustChunkBake {
+	/**
+	 * The switch: a file named this in the run directory, or `-Dwgpu_mc.geo_terrain=true`.
+	 *
+	 * A marker rather than a setting on purpose, for now: the Rust baker is the first half of the
+	 * `@geo_terrain` path, and turning it on currently buys nothing but CPU - the terrain is still
+	 * drawn from Minecraft's own meshes. It becomes a real setting when the graph pass that draws
+	 * these sections exists, because that is when anyone would want it on.
+	 */
+	const val MARKER = "wgpu-geo-terrain"
+
+	private const val PROPERTY = "wgpu_mc.geo_terrain"
+	private const val SECTIONS = 27
+	private const val AXIS = 3
+	private const val LIGHT_BYTES = 2048
+	private const val REPORT_EVERY = 64L
+
+	/**
+	 * How many sections the "what have I already sent" table may hold before it is dropped.
+	 *
+	 * Losing it costs payloads with data in them that Rust already has - the masks stop claiming
+	 * anything - so the cap only has to keep the table from growing with the world.
+	 */
+	private const val SENT_LIMIT = 32768
+
+	/** The header, the 27 block records and the 27 light records; the blobs follow. */
+	private const val HEADER_BYTES = 32L
+	private const val BLOCK_RECORD_BYTES = 64L
+	private const val LIGHT_RECORD_BYTES = 16L
+	private const val BLOBS_AT = HEADER_BYTES + SECTIONS * BLOCK_RECORD_BYTES + SECTIONS * LIGHT_RECORD_BYTES
+
+	/** Must match `PAYLOAD_MAGIC` in `rust/wgpu-mc-jni/src/section.rs`. */
+	private const val MAGIC = 0x574D5331
+
+	/**
+	 * One buffer per build thread, big enough for the worst case: 27 sections of a 32-bit-per-entry
+	 * storage is 16 KB each, plus their palettes, plus 27 sections of light. It is allocated once and
+	 * never grows, so a rebuild allocates nothing at all.
+	 */
+	private const val PAYLOAD_BYTES = 1024L * 1024L
+
+	private val EMPTY_LIGHT = ByteArray(LIGHT_BYTES)
+
+	@Volatile
+	private var switchedOn: Boolean? = null
+
+	private var bakes = 0L
+	private var reported = 0L
+	private var resyncs = 0L
+
+	/** The offer count the timing report was last written at, so it is sampled like the offer line. */
+	private var reportedTiming = 0L
+
+	/** What the last payload measured, for the sampled report below. */
+	@Volatile
+	private var lastPayloadBytes = 0
+
+	/** What Rust has been told about each section, so the next rebuild can send only what changed. */
+	private val sent = ConcurrentHashMap<Long, Sent>()
+
+	/** Whether the Rust terrain baker runs at all. Resolved once, because this is read per rebuild. */
+	@JvmStatic
+	fun isOn(): Boolean {
+		switchedOn?.let { return it }
+
+		val property = System.getProperty(PROPERTY)?.toBoolean() ?: false
+		val marker = Files.exists(Path.of(MARKER))
+		val on = property || marker
+
+		switchedOn = on
+		if (on) {
+			WgpuMcMod.LOGGER.info(
+				"wgpu: the Rust terrain baker is on ({}); terrain is still drawn from Minecraft's own meshes",
+				if (marker) MARKER else "-D$PROPERTY=true",
+			)
+		}
+		return on
+	}
+
+	/**
+	 * Offers the middle section of [region] to the Rust baker. Called from the head of the compile
+	 * task, on the chunk-build worker thread.
+	 *
+	 * What is handed over is the data and only the data: Rust copies what it keeps out of the payload
+	 * before the call returns, and the meshing itself runs on Rust's own thread pool. The counters
+	 * below therefore count *offers*, while the `wgpu-mc: baked ...` lines in the log are the bakes
+	 * themselves.
+	 *
+	 * A failure is logged and swallowed: until the Rust side draws these sections, the game still has
+	 * Minecraft's mesh, and taking the world down over an optimisation that is not drawing anything
+	 * yet would be the wrong trade.
+	 */
+	@JvmStatic
+	fun bake(region: RenderSectionRegion) {
+		if (!isOn()) return
+
+		// A rebuild can arrive before the native side has cached block states - the cache is built on
+		// the title screen, and a quickplay launch is loading chunks well before that finishes. A bake
+		// then would find no registry and no "air", and the whole copy would be wasted.
+		if (!WgpuNative.blocksCached()) return
+
+		try {
+			bakeNow(region)
+		} catch (throwable: Throwable) {
+			WgpuMcMod.LOGGER.error("wgpu: the Rust terrain bake failed", throwable)
+		}
+	}
+
+	/**
+	 * The block states of one of the 27 sections, from the rebuild's own snapshot.
+	 *
+	 * The snapshot is what Minecraft is meshing the same section from, so the two meshes agree, and a
+	 * `SectionCopy` holds a *copy* of the container - reading it off-thread is safe, where a live
+	 * `LevelChunkSection` is guarded by a threading detector.
+	 *
+	 * When the snapshot cannot be reached at all (`ContainerData` says so once, with the reason), the
+	 * live chunk is read instead: same sections, keyed the same way, a moment newer than the mesh
+	 * beside it. Reading the world is the fallback rather than the plan because it is the one thing
+	 * here that is not the data the game itself is baking from.
+	 */
+	private fun statesOf(
+		region: RenderSectionRegion,
+		copies: Array<Any?>?,
+		index: Int,
+		x: Int,
+		y: Int,
+		z: Int,
+	): PalettedContainer<BlockState>? {
+		if (copies != null) {
+			val copy = copies.getOrNull(index) ?: return null
+			return (copy as? SectionCopyAccessor)?.`wgpu_mc$states`()
+		}
+
+		val level = Minecraft.getInstance().level ?: return null
+		val chunk = level.chunkSource.getChunkNow(x, z) ?: return null
+		val sectionIndex = chunk.getSectionIndexFromSectionY(y)
+		if (sectionIndex < 0 || sectionIndex >= chunk.sectionsCount) return null
+
+		val section = chunk.getSection(sectionIndex)
+		return if (section.hasOnlyAir()) null else section.states
+	}
+
+	private fun bakeNow(region: RenderSectionRegion) {
+		val corner = region as RenderSectionRegionAccessor
+		val minX = corner.`wgpu_mc$minSectionX`()
+		val minY = corner.`wgpu_mc$minSectionY`()
+		val minZ = corner.`wgpu_mc$minSectionZ`()
+		val targetX = minX + 1
+		val targetY = minY + 1
+		val targetZ = minZ + 1
+
+		// Rust keeps the light of every section it has been told about and drops the ones far from the
+		// player, so a section this side counts as sent can be gone there. It says so instead of baking
+		// against holes, and the answer is to forget what was sent and hand the whole neighbourhood
+		// over again - once, because the second call carries everything the first one was missing.
+		if (send(region, minX, minY, minZ, targetX, targetY, targetZ, force = false)) {
+			resyncs++
+			sent.clear()
+			send(region, minX, minY, minZ, targetX, targetY, targetZ, force = true)
+		}
+
+		if (sent.size > SENT_LIMIT) {
+			// Rust keeps what it has; dropping this side's bookkeeping only means the next payloads
+			// carry more than they had to.
+			sent.clear()
+		}
+
+		bakes++
+		if (Diagnostics.loggingEnabled() || bakes - reported >= REPORT_EVERY) {
+			reported = bakes
+			WgpuMcMod.LOGGER.info(
+				"wgpu: offered section ({}, {}, {}) to the Rust baker with {} B of payload ({} offer(s), {} resync(s) so far)",
+				targetX,
+				targetY,
+				targetZ,
+				lastPayloadBytes,
+				bakes,
+				resyncs,
+			)
+		}
+
+		// The same numbers the F3 line shows, in the log: the switch is about one run's cost, and a
+		// run whose F3 screen nobody is looking at should still be able to answer it.
+		if (Diagnostics.sectionTimingEnabled()) {
+			val offers = WgpuMcMod.SECTION_OFFERS.sum()
+			if (offers > 0 && bakes - reportedTiming >= REPORT_EVERY) {
+				reportedTiming = bakes
+				WgpuMcMod.LOGGER.info(
+					"wgpu: section feed per offer over {} offer(s): light {} ns, blocks {} ns, call {} ns, {} B of payload",
+					offers,
+					WgpuMcMod.TIME_SPENT_SECTION_LIGHT.sum() / offers,
+					WgpuMcMod.TIME_SPENT_SECTION_BLOCKS.sum() / offers,
+					WgpuMcMod.TIME_SPENT_SECTION_CALL.sum() / offers,
+					WgpuMcMod.SECTION_PAYLOAD_BYTES.sum() / offers,
+				)
+			}
+		}
+	}
+
+	/**
+	 * Builds the payload for one section rebuild and hands it over.
+	 *
+	 * Returns Rust's answer: `true` when it is missing part of the neighbourhood this call described,
+	 * which is the caller's cue to send everything again. `force` writes every one of the 27 sections
+	 * regardless of what this side believes Rust already has.
+	 *
+	 * The bookkeeping is committed only once the call has returned. That is not bookkeeping for its own
+	 * sake: chunk builds run on several threads at once, so a section this thread has just written into
+	 * its payload is a section a *second* thread may already be describing as "you have this one" -
+	 * and until the call lands, it is not true. Committing late is what keeps a mask from claiming a
+	 * section Rust has never seen, which is a resync, which is the whole neighbourhood sent twice.
+	 */
+	private fun send(
+		region: RenderSectionRegion,
+		minX: Int,
+		minY: Int,
+		minZ: Int,
+		targetX: Int,
+		targetY: Int,
+		targetZ: Int,
+		force: Boolean,
+	): Boolean {
+		val lightEngine = region.lightEngine
+		val blockLayers = lightEngine.getLayerListener(LightLayer.BLOCK)
+		val skyLayers = lightEngine.getLayerListener(LightLayer.SKY)
+		val copies = ContainerData.sectionCopies(region)
+
+		var knownBlocks = 0
+		var knownLight = 0
+		var present = 0
+
+		// The clock is read only while the switch is on, and each phase is timed around the work it
+		// names: the light of the 27 sections, the block data out of the container (palette, storage
+		// and the hash that decides whether it has to be sent), and the call itself. The payload
+		// writes belong to the phase whose data they carry, so the three add up to the loop plus the
+		// call rather than to a fourth "marshalling" phase nobody can act on.
+		val timing = Diagnostics.sectionTimingEnabled()
+
+		var lightNanos = 0L
+		var blockNanos = 0L
+
+		// The sections this call changes, applied to [sent] after it returns. A null value is a
+		// section to forget.
+		val updates = ArrayList<Pair<Long, Sent?>>(SECTIONS)
+
+		val payload = Payload.ofThread()
+		payload.begin()
+
+		for (index in 0 until SECTIONS) {
+			// x fastest, then y, then z - the order the Rust provider indexes, and the order the region
+			// keeps its own section copies in.
+			val x = minX + index % AXIS
+			val y = minY + (index / AXIS) % AXIS
+			val z = minZ + index / (AXIS * AXIS)
+			val key = SectionPos.asLong(x, y, z)
+
+			val lightStarted = if (timing) System.nanoTime() else 0L
+			val light = lightOf(blockLayers, skyLayers, x, y, z)
+			if (timing) lightNanos += System.nanoTime() - lightStarted
+
+			val blocksStarted = if (timing) System.nanoTime() else 0L
+			val states = statesOf(region, copies, index, x, y, z)
+			val blocks = if (states == null) null else describe(states)
+			val entry = sent[key]
+
+			if (blocks != null) {
+				present++
+			}
+
+			val blocksChanged = force || blocks != entry?.blocks
+			val lightChanged = force || light != entry?.light
+
+			if (blocksChanged) {
+				if (blocks == null) {
+					payload.writeAbsentBlock(index)
+				} else {
+					payload.writeBlock(index, blocks)
+				}
+			} else if (blocks != null) {
+				// Rust has this section and this call does not carry it.
+				knownBlocks = knownBlocks or (1 shl index)
+			}
+
+			if (timing) blockNanos += System.nanoTime() - blocksStarted
+
+			if (lightChanged) {
+				if (light == null) {
+					payload.writeAbsentLight(index)
+				} else {
+					payload.writeLight(index, light)
+				}
+			} else if (light != null) {
+				knownLight = knownLight or (1 shl index)
+			}
+
+			when {
+				blocks == null && light == null -> updates.add(key to null)
+				blocksChanged || lightChanged -> updates.add(key to Sent(blocks, light))
+			}
+		}
+
+		payload.finish(knownBlocks, knownLight)
+
+		lastPayloadBytes = payload.length
+
+		if (Diagnostics.loggingEnabled()) {
+			WgpuMcMod.LOGGER.info(
+				"wgpu: sent section ({}, {}, {}): {} B of payload, {} of {} sections present, {} block and {} light record(s)",
+				targetX,
+				targetY,
+				targetZ,
+				payload.length,
+				present,
+				SECTIONS,
+				payload.blocks,
+				payload.lights,
+			)
+		}
+
+		val callStarted = if (timing) System.nanoTime() else 0L
+		val resync = WgpuNative.bakeSections(targetX, targetY, targetZ, payload.address, payload.length)
+		val callNanos = if (timing) System.nanoTime() - callStarted else 0L
+
+		if (timing) {
+			WgpuMcMod.TIME_SPENT_SECTION_LIGHT.add(lightNanos)
+			WgpuMcMod.TIME_SPENT_SECTION_BLOCKS.add(blockNanos)
+			WgpuMcMod.TIME_SPENT_SECTION_CALL.add(callNanos)
+			WgpuMcMod.SECTION_PAYLOAD_BYTES.add(payload.length.toLong())
+			// One offer per call: a resync sends twice, and the second send is part of the same
+			// rebuild's cost rather than a rebuild of its own.
+			if (!force) {
+				WgpuMcMod.SECTION_OFFERS.increment()
+			}
+		}
+
+		if (!resync) {
+			for ((key, entry) in updates) {
+				if (entry == null) {
+					sent.remove(key)
+				} else {
+					sent[key] = entry
+				}
+			}
+		}
+
+		return resync
+	}
+
+	/** The two light layers of a section, or `null` when neither is loaded. */
+	private fun lightOf(
+		blockLayers: net.minecraft.world.level.lighting.LayerLightEventListener,
+		skyLayers: net.minecraft.world.level.lighting.LayerLightEventListener,
+		x: Int,
+		y: Int,
+		z: Int,
+	): Light? {
+		val pos = SectionPos.of(x, y, z)
+		val block = blockLayers.getDataLayerData(pos)?.data
+		val sky = skyLayers.getDataLayerData(pos)?.data
+
+		if (block == null && sky == null) {
+			return null
+		}
+
+		return Light(block ?: EMPTY_LIGHT, sky ?: EMPTY_LIGHT)
+	}
+
+	/**
+	 * Reads one snapshot section into the shape the cache compares and the payload writes.
+	 *
+	 * The palette and the storage come out of the container through [ContainerData] rather than the
+	 * public API: `pack` would hand them over but re-encodes the section first, and `getAll` is a
+	 * lambda per position - both are the per-rebuild cost this path exists to remove. `null` means
+	 * this build cannot reach them at all, which leaves the section out rather than guessing.
+	 */
+	private fun describe(states: PalettedContainer<BlockState>): Blocks? {
+		val storage = ContainerData.storage(states)
+		val palette = ContainerData.palette(states)
+
+		if (palette == null || storage == null) {
+			return null
+		}
+
+		val table = IntArray(palette.size) { index ->
+			(palette.valueFor(index) as? RustBlockStateAccessor)?.`wgpu_mc$getRustBlockStateIndex`() ?: 0
+		}
+
+		// A section of one state has no storage of its own (`ZeroBitStorage`): every position is index
+		// 0, which is the single entry the palette holds. One zero long and a zero mask is what makes
+		// the Rust decode agree with that.
+		if (storage !is SimpleBitStorage) {
+			return Blocks(Table(table), 0, longArrayOf(0L), 0, 0L, 0, 0, 0, 4096)
+		}
+
+		val geometry = storage as PackedIntegerArrayMixin
+
+		return Blocks(
+			Table(table),
+			storage.bits,
+			storage.raw,
+			geometry.`wgpu_mc$valuesPerLong`(),
+			geometry.`wgpu_mc$mask`(),
+			geometry.`wgpu_mc$divideMul`(),
+			geometry.`wgpu_mc$divideAdd`(),
+			geometry.`wgpu_mc$divideShift`(),
+			storage.size,
+		)
+	}
+
+	/**
+	 * The palette translation table: `keys[minecraft index]` is the Rust block key.
+	 *
+	 * Compared by content and hashed, so a section whose palette did not change costs one integer
+	 * comparison.
+	 */
+	private class Table(val keys: IntArray) {
+		private val hash = hashInts(keys)
+
+		override fun equals(other: Any?): Boolean =
+			other is Table && hash == other.hash && keys.contentEquals(other.keys)
+
+		override fun hashCode(): Int = hash
+
+		override fun toString(): String = "Table(${keys.size})"
+	}
+
+	/** One section's block storage, exactly as Minecraft holds it. */
+	private class Blocks(
+		val palette: Table,
+		val bits: Int,
+		val longs: LongArray,
+		val valuesPerLong: Int,
+		val mask: Long,
+		val divideMul: Int,
+		val divideAdd: Int,
+		val divideShift: Int,
+		val size: Int,
+	) {
+		private val hash = hashLongs(longs)
+
+		override fun equals(other: Any?): Boolean =
+			other is Blocks &&
+				hash == other.hash &&
+				bits == other.bits &&
+				palette == other.palette &&
+				longs.contentEquals(other.longs)
+
+		override fun hashCode(): Int = hash
+	}
+
+	/** One section's two light layers. */
+	private class Light(val block: ByteArray, val sky: ByteArray) {
+		private val blockHash = hashBytes(block)
+		private val skyHash = hashBytes(sky)
+
+		override fun equals(other: Any?): Boolean =
+			other is Light &&
+				blockHash == other.blockHash &&
+				skyHash == other.skyHash &&
+				block.contentEquals(other.block) &&
+				sky.contentEquals(other.sky)
+
+		override fun hashCode(): Int = blockHash * 31 + skyHash
+	}
+
+	/** What this side last told Rust about one section. `null` means "it is not there". */
+	private class Sent(val blocks: Blocks?, val light: Light?)
+
+	/**
+	 * Hashes rather than the identities of the objects the data came from.
+	 *
+	 * Minecraft mutates a `PalettedContainer`'s storage in place - `SimpleBitStorage#set` writes into
+	 * the same longs, `createOrReuseData` reuses the same `Data` while the palette still fits, and the
+	 * light engines write into the same `DataLayer` byte arrays - so "the same object" does not mean
+	 * "the same contents", and a rebuild happens *because* something changed. Comparing the bytes is
+	 * exact, and it is a scan of a few kilobytes against the 4096 palette lookups, the bit-packing and
+	 * the 54 array allocations this replaced.
+	 */
+	private fun hashLongs(values: LongArray): Int {
+		var hash = -0x7ee3623b
+		for (value in values) {
+			hash = (hash xor value.toInt()) * 0x01000193
+			hash = (hash xor (value ushr 32).toInt()) * 0x01000193
+		}
+		return hash
+	}
+
+	private fun hashInts(values: IntArray): Int {
+		var hash = -0x7ee3623b
+		for (value in values) {
+			hash = (hash xor value) * 0x01000193
+		}
+		return hash
+	}
+
+	private fun hashBytes(values: ByteArray): Int {
+		var hash = -0x7ee3623b
+		for (value in values) {
+			hash = (hash xor value.toInt()) * 0x01000193
+		}
+		return hash
+	}
+
+	/**
+	 * The payload buffer, one per build thread.
+	 *
+	 * Per thread because the chunk build runs on several at once; reused because a payload is written
+	 * for every rebuild of every section, and allocating a few hundred kilobytes each time is the kind
+	 * of cost this path exists to remove.
+	 */
+	private class Payload private constructor() {
+		private val arena = Arena.ofShared()
+		private val segment: MemorySegment = arena.allocate(PAYLOAD_BYTES)
+		private var cursor = BLOBS_AT
+
+		var blocks = 0
+			private set
+		var lights = 0
+			private set
+		var length = 0
+			private set
+
+		val address: Long get() = segment.address()
+
+		fun begin() {
+			cursor = BLOBS_AT
+			blocks = 0
+			lights = 0
+			length = 0
+		}
+
+		/** A section Rust should keep, or replace what it had. */
+		fun writeBlock(index: Int, section: Blocks) {
+			val at = blocksAt(blocks)
+
+			val paletteOffset = cursor
+			put(paletteOffset, section.palette.keys)
+			cursor += section.palette.keys.size * 4L
+
+			// The longs are read as 64-bit values on the other side, so they start on an 8-byte
+			// boundary: not because anything requires it, but because a misaligned read is the kind of
+			// thing that is fast on one machine and slow on the next.
+			cursor = (cursor + 7L) / 8L * 8L
+			val longsOffset = cursor
+			put(longsOffset, section.longs)
+			cursor += section.longs.size * 8L
+
+			word(at, index)
+			word(at + 4, 1)
+			word(at + 8, section.bits)
+			word(at + 12, section.size)
+			word(at + 16, section.valuesPerLong)
+			word(at + 20, section.mask.toInt())
+			word(at + 24, (section.mask ushr 32).toInt())
+			word(at + 28, section.divideMul)
+			word(at + 32, section.divideAdd)
+			word(at + 36, section.divideShift)
+			word(at + 40, section.palette.keys.size)
+			word(at + 44, paletteOffset.toInt())
+			word(at + 48, section.longs.size)
+			word(at + 52, longsOffset.toInt())
+
+			blocks++
+		}
+
+		/** A section Rust should forget: it is air, or it is not loaded any more. */
+		fun writeAbsentBlock(index: Int) {
+			val at = blocksAt(blocks)
+			word(at, index)
+			word(at + 4, 0)
+			blocks++
+		}
+
+		fun writeLight(index: Int, light: Light) {
+			val at = lightAt(lights)
+
+			val blockOffset = cursor
+			put(blockOffset, light.block)
+			cursor += LIGHT_BYTES
+
+			val skyOffset = cursor
+			put(skyOffset, light.sky)
+			cursor += LIGHT_BYTES
+
+			word(at, index)
+			word(at + 4, blockOffset.toInt())
+			word(at + 8, skyOffset.toInt())
+
+			lights++
+		}
+
+		/**
+		 * A section Rust should forget the light of - one that is not loaded at all, and whose light
+		 * is therefore nothing rather than dark. Both blob offsets are zero, which no written record
+		 * can be: the blobs start after the records.
+		 */
+		fun writeAbsentLight(index: Int) {
+			val at = lightAt(lights)
+			word(at, index)
+			word(at + 4, 0)
+			word(at + 8, 0)
+			lights++
+		}
+
+		fun finish(knownBlocks: Int, knownLight: Int) {
+			word(0, MAGIC)
+			word(4, 0)
+			word(8, blocks)
+			word(12, lights)
+			word(16, knownBlocks)
+			word(20, knownLight)
+			length = cursor.toInt()
+		}
+
+		private fun blocksAt(count: Int) = HEADER_BYTES + min(count, SECTIONS) * BLOCK_RECORD_BYTES
+
+		private fun lightAt(count: Int) =
+			HEADER_BYTES + SECTIONS * BLOCK_RECORD_BYTES + min(count, SECTIONS) * LIGHT_RECORD_BYTES
+
+		private fun word(at: Long, value: Int) {
+			segment.set(ValueLayout.JAVA_INT, at, value)
+		}
+
+		private fun put(at: Long, values: IntArray) {
+			if (values.isEmpty()) return
+			segment.asSlice(at, values.size * 4L).copyFrom(MemorySegment.ofArray(values))
+		}
+
+		private fun put(at: Long, values: LongArray) {
+			if (values.isEmpty()) return
+			segment.asSlice(at, values.size * 8L).copyFrom(MemorySegment.ofArray(values))
+		}
+
+		private fun put(at: Long, values: ByteArray) {
+			if (values.isEmpty()) return
+			segment.asSlice(at, values.size.toLong()).copyFrom(MemorySegment.ofArray(values))
+		}
+
+		companion object {
+			private val perThread = ThreadLocal.withInitial { Payload() }
+
+			fun ofThread(): Payload = perThread.get()
+		}
+	}
+}

@@ -143,11 +143,30 @@ impl Atlas {
         image_bytes: &[u8],
         resource_provider: &dyn ResourceProvider,
     ) {
-        let image = image::load_from_memory(image_bytes).unwrap();
+        // A texture the `image` crate cannot decode - a pack with a mislabelled or truncated file -
+        // is skipped rather than unwrapped, and the faces that name it come out untextured, which is
+        // what `get_atlas_uv` already does for a texture that is not in the map.
+        let Ok(image) = image::load_from_memory(image_bytes) else {
+            log::warn!("wgpu-mc: {path} could not be decoded as an image; skipping it");
+            return;
+        };
 
-        let allocation = allocator
+        // The atlas does not resize (`Atlas::new` ignores its `resizes` flag), so a pack with more
+        // or larger textures than 2048x2048 holds has nowhere to put the ones that do not fit.
+        // Skipping them is the same trade as above: a texture that is not in the map is a face that
+        // is not drawn, rather than a panic on the block cache thread.
+        let Some(allocation) = allocator
             .allocate(Size2D::new(image.width() as i32, image.height() as i32))
-            .unwrap();
+        else {
+            log::warn!(
+                "wgpu-mc: {}x{} {path} does not fit in the {}x{} atlas; skipping it",
+                image.width(),
+                image.height(),
+                ATLAS_DIMENSIONS,
+                ATLAS_DIMENSIONS
+            );
+            return;
+        };
 
         overlay(
             image_buffer,
@@ -197,8 +216,13 @@ impl Atlas {
             self.image.read().as_raw(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(self.size as _),
-                rows_per_image: Some(self.size as _),
+                // `size` is in pixels and the atlas is RGBA8, so a row is four bytes a pixel: 8192
+                // for the 2048-wide atlas, not 2048. Handing wgpu the pixel count is a validation
+                // error - "Number of bytes per row is less than the number of bytes in a complete
+                // row" - and a validation error inside a `#[jni_fn]` frame ends the game, which is
+                // how it behaved the first time this upload was reached at all.
+                bytes_per_row: Some(self.size * 4),
+                rows_per_image: Some(self.size),
             },
             Extent3d {
                 width: self.size,

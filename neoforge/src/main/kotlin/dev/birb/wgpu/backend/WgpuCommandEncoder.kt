@@ -9,7 +9,10 @@ import com.mojang.blaze3d.systems.GpuQuery
 import com.mojang.blaze3d.systems.RenderPassBackend
 import com.mojang.blaze3d.textures.GpuTexture
 import com.mojang.blaze3d.textures.GpuTextureView
+import dev.birb.wgpu.rust.WgpuNative
 import dev.birb.wgpu.rust.WmNative
+import net.minecraft.client.Minecraft
+import net.minecraft.core.SectionPos
 import org.lwjgl.system.MemoryUtil
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
@@ -643,6 +646,23 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         const val MAX_VERIFY_BYTES = 1L shl 20
 
         /**
+         * What the renderer has already been told about the camera.
+         *
+         * Process-wide rather than per encoder, because an encoder is made per frame: state on the
+         * instance would mean the same two integers crossing the ABI sixty times a second, and the
+         * native side's "the camera moved" checks would never fire.
+         */
+        @Volatile
+        private var sentCameraSectionX = Int.MIN_VALUE
+
+        @Volatile
+        private var sentCameraSectionZ = Int.MIN_VALUE
+
+        /** The render distance last sent, in chunks. */
+        @Volatile
+        private var sentRenderDistance = -1
+
+        /**
          * The furthest cell a cloud face can name.
          *
          * `CloudRenderer` builds its mesh out to the cloud range, 1024 blocks or 86 cells by default,
@@ -907,7 +927,52 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         if (Diagnostics.loggingEnabled() && presented.add(described)) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.info("wgpu: presents a {} texture", described)
         }
+
+        // Where the camera is, in sections, sent once a frame and before the frame is presented:
+        // this is the point in the frame that is known to happen exactly once, which is also where
+        // the native side drains the arena and trims it. Sent before the blit so the position
+        // belongs to the frame it was read in.
+        sendCameraSection()
+
         device.surface.blitAndPresent(view, view.texture.getWidth(0), view.texture.getHeight(0))
+    }
+
+    /**
+     * Hands the camera's section position to the renderer.
+     *
+     * Read from the camera rather than from the player, because the two differ whenever the game
+     * renders from somewhere else - a spectator's free camera, a demo camera, the camera a mod moved -
+     * and it is the camera's position that decides which sections are worth keeping. The entity is
+     * not always there (the title screen has no camera), in which case the player's own position is
+     * the closest thing, and neither being there means the frame is not a world frame at all, so
+     * nothing is sent: the arena keeps the last position rather than being trimmed against a guess.
+     */
+    private fun sendCameraSection() {
+        val client = Minecraft.getInstance() ?: return
+        val level = client.level ?: return
+
+        // How far the arena reaches follows Minecraft's render distance, which is also what decides
+        // how far the game is drawing. Sent on change, so once at world join and whenever the slider
+        // moves; the native side keeps it and trims the arena against it.
+        val renderDistance = client.options.renderDistance().get()
+        if (renderDistance != sentRenderDistance) {
+            sentRenderDistance = renderDistance
+            WgpuNative.setRenderDistance(renderDistance)
+        }
+
+        val camera = client.gameRenderer.mainCamera
+        val position = camera?.position() ?: client.player?.position() ?: return
+
+        val sectionX = SectionPos.blockToSectionCoord(position.x)
+        val sectionZ = SectionPos.blockToSectionCoord(position.z)
+
+        if (sectionX == sentCameraSectionX && sectionZ == sentCameraSectionZ) {
+            return
+        }
+
+        sentCameraSectionX = sectionX
+        sentCameraSectionZ = sectionZ
+        WgpuNative.setCameraSection(sectionX, sectionZ)
     }
 
     override fun createFence(): GpuFence = ImmediateFence

@@ -312,22 +312,37 @@ object WgpuNative {
 	@JvmStatic
 	external fun registerBlock(name: String)
 
+	/**
+	 * Whether the native side has finished caching block states.
+	 *
+	 * Everything that bakes geometry needs the registry that cache builds - `AIR`, and the model
+	 * behind every block state - so a bake is only allowed once this answers true. It is false while
+	 * the client is still on the title screen, which is also when a quickplay launch is already
+	 * loading chunks.
+	 */
+	@JvmStatic
+	external fun blocksCached(): Boolean
+
 	@JvmStatic
 	external fun clearPalette(l: Long)
 
 	@JvmStatic
 	external fun cacheBlockStates()
 
+	/**
+	 * Offers one section rebuild, in one call.
+	 *
+	 * `address` is the base of a payload `RustChunkBake` wrote into reusable off-heap memory and
+	 * `length` is how much of it is in use: the 27 sections around `(x, y, z)` - Minecraft's own
+	 * storage longs and a palette translation table for the ones that changed, and the light layers
+	 * that changed - followed by masks saying which sections the native side is expected to have. The
+	 * layout is written down in `rust/wgpu-mc-jni/src/section.rs`.
+	 *
+	 * Answers whether the native side is missing part of that neighbourhood, in which case it queued
+	 * no bake and the caller should forget what it has sent and call once more with everything.
+	 */
 	@JvmStatic
-	external fun bakeSection(
-		x: Int,
-		y: Int,
-		z: Int,
-		paletteIndices: LongArray,
-		storageIndices: LongArray,
-		blockIndices: Array<ByteArray>,
-		skyIndices: Array<ByteArray>
-	)
+	external fun bakeSections(x: Int, y: Int, z: Int, address: Long, length: Int): Boolean
 
 	@JvmStatic
 	external fun setMatrix(type: Int, mat: FloatArray)
@@ -369,8 +384,35 @@ object WgpuNative {
 	 *
 	 * @param display the raw GLFW display handle, or 0 where the platform has none
 	 * @param window the raw GLFW window handle
+	 * @param width the window's framebuffer width in pixels, or 0 when it has no size yet
+	 * @param height the window's framebuffer height in pixels, or 0 when it has no size yet
 	 * @return the `WmRenderer` pointer, or 0 if no backend could be created
 	 */
 	@JvmStatic
-	external fun createWmRendererOnWindow(display: Long, window: Long): Long
+	external fun createWmRendererOnWindow(display: Long, window: Long, width: Int, height: Int): Long
+
+	/**
+	 * Says where the camera is, in sections.
+	 *
+	 * Sections are what the terrain path is keyed by - the baker's positions, the arena's vertex and
+	 * index ranges, the graph pass's grid - so this is the one coordinate the renderer needs from the
+	 * camera, and it is sent rather than derived: the renderer has no camera of its own, only the
+	 * matrices Minecraft hands it. The arena is trimmed against it once a frame, and the graph's
+	 * `@geo_terrain` pass will cull against it.
+	 *
+	 * The name is the signature the Fabric module's `setSectionPos` had, kept because it is the right
+	 * one: two integers, once a frame, and no state on this side that has to be kept in step.
+	 */
+	@JvmStatic
+	external fun setCameraSection(x: Int, z: Int)
+
+	/**
+	 * Says how far the section arena should reach, in chunks.
+	 *
+	 * Minecraft's own render distance, which is what the arena is trimmed to: it holds the sections
+	 * the game is drawing and frees the ones behind the player. Sent when the value changes rather
+	 * than once a frame - it moves when the slider does.
+	 */
+	@JvmStatic
+	external fun setRenderDistance(chunks: Int)
 }

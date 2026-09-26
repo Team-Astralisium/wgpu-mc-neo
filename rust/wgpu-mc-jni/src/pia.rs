@@ -25,6 +25,35 @@ pub struct PackedIntegerArray {
 }
 
 impl PackedIntegerArray {
+    /// One of these from Minecraft's own storage, part for part.
+    ///
+    /// The section feed copies `SimpleBitStorage`'s raw longs and the five numbers that find a value
+    /// in them straight out of the game's object, so the arithmetic below is the same arithmetic
+    /// Minecraft's own `get` does - which is what makes "hand the storage over as it is, plus a
+    /// palette translation table" possible instead of re-packing a storage of our own per rebuild.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        data: Box<[i64]>,
+        elements_per_long: i32,
+        element_bits: i32,
+        max_value: i64,
+        index_scale: i32,
+        index_offset: i32,
+        index_shift: i32,
+        size: i32,
+    ) -> Self {
+        Self {
+            data,
+            elements_per_long,
+            element_bits,
+            max_value,
+            index_scale,
+            index_offset,
+            index_shift,
+            size,
+        }
+    }
+
     pub fn get(&self, x: i32, y: i32, z: i32) -> i32 {
         let x = x & 0xf;
         let y = y & 0xf;

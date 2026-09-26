@@ -6,7 +6,6 @@ use crate::device::{
 };
 use log::info;
 use rustc_hash::FxHashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use parking_lot::Mutex;
@@ -144,6 +143,13 @@ pub const MAX_DRAW_BINDINGS: usize = 32;
 /// How many vertex buffer slots a draw may carry.
 pub const MAX_VERTEX_BUFFERS: usize = 8;
 
+/// How many bind group sets a plan may have, and so how many offset lists a pass keeps room for.
+///
+/// The pass used to hold a `Vec<Vec<DynamicOffset>>` it cleared and refilled per draw, which is two
+/// levels of allocation on a path that runs thousands of times a frame. A plan's sets are fixed when
+/// its pipeline is compiled, so the room is fixed here too and the draw fills it in place.
+pub const MAX_DRAW_SETS: usize = 8;
+
 /// What [`DrawCall::bindings`] holds in one slot.
 pub const DRAW_BINDING_NONE: u32 = 0;
 pub const DRAW_BINDING_BUFFER: u32 = 1;
@@ -206,6 +212,21 @@ pub struct DrawCall {
     pub index_buffer: *const u8,
     pub vertex_buffers: [DrawVertexBuffer; MAX_VERTEX_BUFFERS],
     pub bindings: [DrawBinding; MAX_DRAW_BINDINGS],
+    /// The JVM's number for "this set of bindings", or zero when it did not send one.
+    ///
+    /// A combination is everything a bind group is built from except the dynamic offsets: the plan
+    /// and, per slot, the resource and any offset that gets baked in. The JVM resolves it to a small
+    /// integer once and hands that over per draw, which is what turns the per-draw question from a
+    /// walk over every binding into an integer comparison. Zero means "work it out from the table
+    /// below", which is what a JVM that does not number combinations sends.
+    pub combo: u32,
+    /// Whether [`Self::bindings`] is the table this `combo` was built from.
+    ///
+    /// The pass may hold this combination already, or the cache may know it, without looking at the
+    /// table at all - that is the point of the id. When neither knows it and this is zero, the draw
+    /// is refused (`draw_call` returns false) rather than built from a table that describes whatever
+    /// the JVM drew last; the JVM then re-sends the bindings and draws again.
+    pub bindings_present: u32,
 }
 
 impl Default for DrawCall {
@@ -233,6 +254,8 @@ impl Default for DrawCall {
                 offset: 0,
                 length: 0,
             }; MAX_DRAW_BINDINGS],
+            combo: 0,
+            bindings_present: 0,
         }
     }
 }
@@ -279,8 +302,11 @@ pub struct BlazeRenderPass {
     /// The key [groups] was looked up under, so a run of draws with the same bindings does not even
     /// touch the cache.
     key: u64,
-    /// Refilled per draw from the call's offsets, and reused: a draw allocates nothing.
-    offsets_per_group: Vec<Vec<wgpu::DynamicOffset>>,
+    /// The dynamic offsets of each set, filled in place per draw from the call's bindings - the
+    /// offsets live in the `DrawBinding` the JVM wrote, so nothing has to be collected to hand them
+    /// to `set_bind_group`. Only the first `offsets_len[set]` entries are used.
+    offsets: [[wgpu::DynamicOffset; MAX_DRAW_BINDINGS]; MAX_DRAW_SETS],
+    offsets_len: [usize; MAX_DRAW_SETS],
     /// The pipeline the pass currently has bound, so a run of draws under one pipeline binds it
     /// once - and so the topology does not have to live in a global.
     pipeline: *const BlazePipeline,
@@ -296,7 +322,8 @@ impl BlazeRenderPass {
             pass,
             groups: None,
             key: 0,
-            offsets_per_group: Vec::new(),
+            offsets: [[0; MAX_DRAW_BINDINGS]; MAX_DRAW_SETS],
+            offsets_len: [0; MAX_DRAW_SETS],
             pipeline: std::ptr::null(),
             emitted: 0,
         }
@@ -525,6 +552,24 @@ pub struct BindGroupPlan {
     /// Whether this plan has any uniform bindings, which are the ones that can carry an offset
     /// dynamically; without one there is nothing for the offsets list to describe.
     pub has_uniforms: bool,
+    /// What this plan contributes to a draw's key, computed once when the plan is built.
+    ///
+    /// The key is a fold over the bindings rather than a hash of them, and the plan's own identity
+    /// has to be part of it - two pipelines with the same slots and the same resources still need
+    /// their own bind groups, because a bind group belongs to one layout. Folding the name in on
+    /// every draw would walk the string; folding it in here walks it once per compiled pipeline.
+    pub salt: u64,
+}
+
+/// Folds `value` into a running key.
+///
+/// The key used to be an `FxHasher` walk over every binding: a hash function with its rounds, run
+/// once per draw over a handful of small integers. All it has to do is tell two binding tables
+/// apart, and a rotate-and-multiply fold does that with a few instructions and no finalisation -
+/// which is what "the key is an integer comparison, not a hash" means in `draw_call`.
+#[inline]
+fn fold(key: u64, value: u64) -> u64 {
+    (key.rotate_left(5) ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 impl BindGroupPlan {
@@ -594,10 +639,20 @@ impl BindGroupPlan {
             .flatten()
             .any(|binding| matches!(binding.resource, PlannedResource::Uniform { .. }));
 
+        let name = descriptor.name.to_string();
+        let salt = {
+            let mut salt = fold(0, name.len() as u64);
+            for byte in name.as_bytes() {
+                salt = fold(salt, *byte as u64);
+            }
+            fold(salt, has_uniforms as u64)
+        };
+
         Self {
-            name: descriptor.name.to_string(),
+            name,
             sets,
             has_uniforms,
+            salt,
         }
     }
 
@@ -977,95 +1032,148 @@ fn call_sampler<'a>(
     (sampler, entry.resource as usize)
 }
 
-/// What a draw needs from the cache: the key its bindings hash to, and the groups themselves when
+/// The bit that tells a JVM-numbered combination apart from a folded key.
+///
+/// Both live in the pass's one identity field and in the cache's one map, so they have to be
+/// disjoint: a combination is a small integer the JVM assigned to a set of bindings, and a folded
+/// key is whatever the fold over the table produced.
+const COMBO_TAG: u64 = 1 << 63;
+
+/// What a draw needs from the cache: the key its bindings fold to, and the groups themselves when
 /// they had to be looked up or built.
 struct GroupsForCall {
     key: u64,
     /// `None` when the key is the one the pass already holds, which is the common case: the pass
     /// keeps its set and the draw only hands over new dynamic offsets.
     groups: Option<Arc<CachedBindGroups>>,
+    /// Set when nobody knows this combination and the table was not sent with it, so the draw has to
+    /// be refused rather than built from bindings that describe a different pipeline.
+    unknown: bool,
 }
 
-/// Works out what a draw's bindings hash to, refills `offsets_per_group`, and returns the groups.
+/// Works out what a draw's bindings fold to, fills the pass's offset lists, and returns the groups.
+///
+/// The fold replaces the `FxHasher` walk this used to be: same inputs, same meaning - a key that is
+/// equal exactly when two draws need the same bind groups - but no hash function, and the dynamic
+/// offsets are read straight out of the call's bindings instead of being collected into a vector
+/// per set first.
 fn bind_groups_for_call(
     wm: &WmRenderer,
     pipeline: &BlazePipeline,
     call: &DrawCall,
-    offsets_per_group: &mut Vec<Vec<wgpu::DynamicOffset>>,
+    offsets: &mut [[wgpu::DynamicOffset; MAX_DRAW_BINDINGS]; MAX_DRAW_SETS],
+    offsets_len: &mut [usize; MAX_DRAW_SETS],
     held_key: u64,
 ) -> GroupsForCall {
     let alignment = wm.gpu.device.limits().min_uniform_buffer_offset_alignment as u64;
     let plan = &pipeline.plan;
 
-    // FxHash rather than the default SipHash: this runs once per draw over a handful of small
-    // integers, where SipHash's rounds cost more than the lookup they feed.
-    let mut hasher = rustc_hash::FxHasher::default();
-    plan.name.as_str().hash(&mut hasher);
-    plan.has_uniforms.hash(&mut hasher);
+    // A draw that carries a combination does not have to be folded: the JVM already resolved what
+    // the bindings are, and this walk only has to produce the offsets `set_bind_group` needs. What
+    // it must not do is decide anything the JVM's numbering did not cover, which is why the fold and
+    // the buffer lookups behind it are skipped together.
+    let numbering = call.combo != 0;
 
+    let mut key = if numbering {
+        COMBO_TAG | call.combo as u64
+    } else {
+        plan.salt
+    };
     let mut slot = 0usize;
-    let mut binding_slot = 0usize;
 
-    for bindings_in_set in plan.sets.iter() {
-        if offsets_per_group.len() <= binding_slot {
-            offsets_per_group.push(Vec::with_capacity(bindings_in_set.len()));
-        }
-
-        let offsets = &mut offsets_per_group[binding_slot];
-        offsets.clear();
+    for (set, bindings_in_set) in plan.sets.iter().enumerate() {
+        let mut count = 0usize;
 
         for binding in bindings_in_set.iter() {
             let entry = call.bindings.get(slot).copied().unwrap_or(NO_BINDING);
 
-            // The slot and the binding number, not the binding's name: the plan name is already in
-            // the key and a slot means the same binding under the same plan, so a string hash here
-            // was per-draw work that could not tell apart two sets the rest of the key does not.
-            // These are the two numbers the JVM writes its bindings by, too.
-            (binding_slot, binding.binding).hash(&mut hasher);
+            // The slot and the binding number, not the binding's name: the plan is already in the
+            // key and a slot means the same binding under the same plan, so a string hash here was
+            // per-draw work that could not tell apart two sets the rest of the key does not.
+            if !numbering {
+                key = fold(key, ((set as u64) << 32) | binding.binding as u64);
+            }
             slot += 1;
 
             match &binding.resource {
                 PlannedResource::Uniform { min_size } => {
-                    let (buffer, address) = call_buffer(&plan.name, binding, &entry);
                     let range = entry.offset..entry.offset + entry.length;
+
+                    if numbering {
+                        // The JVM's number already covers the resource, the length and any offset
+                        // that is baked in, so the only question left is whether this slot's offset
+                        // travels with the draw. That needs the alignment, not the buffer.
+                        offsets[set][count] = if dynamic_offset(
+                            plan,
+                            binding,
+                            &range,
+                            alignment,
+                            min_size.is_some(),
+                        ) {
+                            range.start as wgpu::DynamicOffset
+                        } else {
+                            0
+                        };
+
+                        count += 1;
+                        continue;
+                    }
+
+                    let (buffer, address) = call_buffer(&plan.name, binding, &entry);
                     let size = binding_size(buffer, &range, *min_size);
 
-                    (address, size).hash(&mut hasher);
+                    key = fold(key, address as u64);
+                    key = fold(key, size as u64);
 
                     // A dynamic offset is deliberately *not* part of the key: it is the one thing
                     // that may differ between two draws sharing a set, and sharing that set is the
                     // whole point of the offset. A baked offset is, because it lives inside the bind
-                    // group.
+                    // group. Either way what `set_bind_group` is handed is the offset the draw
+                    // carries, so nothing has to be gathered for it.
                     if dynamic_offset(plan, binding, &range, alignment, min_size.is_some()) {
-                        offsets.push(range.start as wgpu::DynamicOffset);
+                        offsets[set][count] = range.start as wgpu::DynamicOffset;
                     } else {
-                        range.start.hash(&mut hasher);
-                        offsets.push(0);
+                        key = fold(key, range.start);
+                        offsets[set][count] = 0;
                     }
+
+                    count += 1;
                 }
                 PlannedResource::Storage => {
+                    if numbering {
+                        continue;
+                    }
+
                     let (buffer, address) = call_buffer(&plan.name, binding, &entry);
                     let range = entry.offset..entry.offset + entry.length;
 
-                    (address, binding_size(buffer, &range, None), range.start).hash(&mut hasher);
+                    key = fold(key, address as u64);
+                    key = fold(key, binding_size(buffer, &range, None) as u64);
+                    key = fold(key, range.start);
                 }
                 PlannedResource::Texture { .. } => {
+                    if numbering {
+                        continue;
+                    }
+
                     let (_, address) = call_texture(&plan.name, binding, &entry);
 
-                    address.hash(&mut hasher);
+                    key = fold(key, address as u64);
                 }
                 PlannedResource::Sampler => {
+                    if numbering {
+                        continue;
+                    }
+
                     let (_, address) = call_sampler(&plan.name, binding, &entry);
 
-                    address.hash(&mut hasher);
+                    key = fold(key, address as u64);
                 }
             }
         }
 
-        binding_slot += 1;
+        offsets_len[set] = count;
     }
-
-    let key = hasher.finish();
 
     if crate::debug::trace_dynamic_offsets() && trace_filter_matches(&plan.name) {
         trace_call(plan, call, alignment, key);
@@ -1074,7 +1182,11 @@ fn bind_groups_for_call(
     if key == held_key {
         // Nothing a bind group is built from has moved: the pass keeps the set it has, and only the
         // offsets it just filled in travel with this draw.
-        return GroupsForCall { key, groups: None };
+        return GroupsForCall {
+            key,
+            groups: None,
+            unknown: false,
+        };
     }
 
     // Diagnostics: the `bind group cache` setting builds a fresh set for every draw, which is how
@@ -1086,6 +1198,17 @@ fn bind_groups_for_call(
         return GroupsForCall {
             key,
             groups: Some(cached),
+            unknown: false,
+        };
+    }
+
+    // Numbered, and nobody knows this combination: the draw came without the bindings it was built
+    // from, so there is nothing to build it from now. The caller re-sends the table and draws again.
+    if numbering && call.bindings_present == 0 {
+        return GroupsForCall {
+            key,
+            groups: None,
+            unknown: true,
         };
     }
 
@@ -1194,6 +1317,7 @@ fn bind_groups_for_call(
     GroupsForCall {
         key,
         groups: Some(cached),
+        unknown: false,
     }
 }
 
@@ -1201,7 +1325,7 @@ fn bind_groups_for_call(
 ///
 /// This is the whole per-draw ABI: it used to be a pipeline bind, one bind per uniform, one per
 /// sampler, one per buffer and then the draw, each with its own name lookup on the native side.
-pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
+pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
     count_draw();
     trace_draw();
 
@@ -1224,6 +1348,18 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
     // compiled pipeline alive for as long as any pass can draw with it.
     let pipeline = unsafe { &*call.pipeline };
 
+    // The pass keeps one offset list per set, so a plan with more sets than that would index past
+    // them. Like the binding count above, this is the two sides disagreeing about the table rather
+    // than one wrong draw, and is not served quietly.
+    if pipeline.plan.sets.len() > MAX_DRAW_SETS {
+        panic!(
+            "wgpu-mc: {} has {} bind group sets, more than the {MAX_DRAW_SETS} a pass keeps offsets \
+             for",
+            pipeline.plan.name,
+            pipeline.plan.sets.len()
+        );
+    }
+
     // Diagnostics: one line per draw naming the texture every texture slot of this draw carries, in
     // draw order. The deduplicated "sampled X in slot Y" report says which textures a pipeline *has*
     // used; this says which one the draw that painted a given model used, which is the question a
@@ -1239,7 +1375,8 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
         pass: raw_pass,
         groups,
         key,
-        offsets_per_group,
+        offsets,
+        offsets_len,
         pipeline: bound_pipeline,
         ..
     } = pass;
@@ -1279,9 +1416,18 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
         wm,
         pipeline,
         call,
-        offsets_per_group,
+        offsets,
+        offsets_len,
         if groups.is_some() { *key } else { 0 },
     );
+
+    // Nobody knows this combination and the draw left the bindings behind: refuse it. Drawing would
+    // bind groups built for whatever the JVM drew last, which is a wrong picture rather than a
+    // missing one. The caller re-sends the bindings and draws again, and the pass is left as it was -
+    // the pipeline and the vertex buffers above are idempotent to set a second time.
+    if outcome.unknown {
+        return false;
+    }
 
     if let Some(built) = outcome.groups {
         *groups = Some(built);
@@ -1290,12 +1436,9 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
 
     if let Some(bound) = groups.as_ref() {
         for (index, group) in bound.groups.iter().enumerate() {
-            let offsets = offsets_per_group
-                .get(index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            let count = offsets_len[index].min(MAX_DRAW_BINDINGS);
 
-            raw_pass.set_bind_group(index as u32, group, offsets);
+            raw_pass.set_bind_group(index as u32, group, &offsets[index][..count]);
         }
     }
 
@@ -1318,6 +1461,8 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) {
     let instances = 0..call.instance_count.max(1);
 
     draw_geometry(wm, raw_pass, pipeline, call, instances);
+
+    true
 }
 
 /// Draws the geometry of a call, generating an index buffer for the topologies wgpu has no

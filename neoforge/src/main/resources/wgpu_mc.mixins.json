@@ -7,6 +7,9 @@
     "DebugEntrySystemSpecsMixin",
     "DebugHUDMixin",
     "TitleScreenMixin",
+    "chunk.RenderSectionRegionAccessor",
+    "chunk.SectionCopyAccessor",
+    "chunk.RustChunkBakeMixin",
     "core.EarlyWindowMixin",
     "core.MainTestRenderdocMixin",
     "core.MinecraftClientCoreMixin",
@@ -27,7 +30,8 @@
     "render.SkyRendererMixin",
     "render.WindowMixin",
     "render.WorldRendererMixin",
-    "world.BlockStateMixin"
+    "world.BlockStateMixin",
+    "world.PackedIntegerArrayMixin"
   ],
   "injectors": {
     "defaultRequire": 1

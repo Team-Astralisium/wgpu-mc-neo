@@ -142,6 +142,31 @@ object Diagnostics {
     fun bindingsEnabled(): Boolean = bindings || logging
 
     /**
+     * The marker file that turns the section-feed timing on, next to the run directory.
+     *
+     * A file as well as a setting because the question it answers is asked while looking at a run:
+     * "what does one section rebuild cost, and which part of it" is worth being able to ask of a run
+     * started without touching the config, and the answer is three averages on the F3 screen.
+     */
+    const val SECTION_TIMING_MARKER = "wgpu-section-timing"
+
+    /** The renderer setting behind the section-feed timing. */
+    const val SECTION_TIMING_SETTING = "section_timing"
+
+    /**
+     * Whether the section feed is timed, phase by phase. See [SECTION_TIMING_MARKER].
+     *
+     * Read once per section rebuild, so what it guards is a handful of clock reads; off means the
+     * feed does not read the clock at all.
+     */
+    @Volatile
+    private var sectionTiming: Boolean = resolveSectionTiming()
+
+    /** Whether the section feed's phases are being timed. */
+    @JvmStatic
+    fun sectionTimingEnabled(): Boolean = sectionTiming
+
+    /**
      * Re-resolves both switches, which the options screen calls when the switches are applied.
      *
      * The renderer resolves the same settings on its own side when it receives them, so the two
@@ -175,7 +200,20 @@ object Diagnostics {
                 if (bindingValue) "on" else "off",
             )
         }
+
+        val timingValue = resolveSectionTiming()
+        if (timingValue != sectionTiming) {
+            sectionTiming = timingValue
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: the section feed timing is now {}",
+                if (timingValue) "on" else "off",
+            )
+        }
     }
+
+    /** The section-timing switch: the renderer's setting, or its marker file. */
+    private fun resolveSectionTiming(): Boolean =
+        RendererSettings.bool(SECTION_TIMING_SETTING) == true || Files.exists(Path.of(SECTION_TIMING_MARKER))
 
     /** The binding-resolution switch: the renderer's setting, or its marker file. */
     private fun resolveBindings(): Boolean =

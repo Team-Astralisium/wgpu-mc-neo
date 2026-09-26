@@ -16,8 +16,54 @@ object Wgpu {
 	@JvmField
 	val keyStates: HashMap<Int, Int> = HashMap()
 
+	/**
+	 * Whether the game has reached the main screen, which is when a resource reload can rebuild
+	 * pipelines and entity models can be uploaded.
+	 *
+	 * Set by `TitleScreenMixin#init` - see there for why that is the right moment and why a render
+	 * hook would not be.
+	 */
 	@Volatile
 	private var initialized: Boolean = false
+
+	/**
+	 * Whether the native renderer has been created, which happens while the game's window is built.
+	 *
+	 * Kept apart from [isInitialized] on purpose: that one is about the *game* being ready, and this
+	 * one about the renderer existing, which is minutes earlier. The block cache needs the renderer
+	 * and a resource reload, but not the main screen - a `--quickPlaySingleplayer` launch is already
+	 * loading chunks by then.
+	 */
+	@Volatile
+	private var rendererLive: Boolean = false
+
+	@JvmStatic
+	fun isRendererLive(): Boolean {
+		return rendererLive
+	}
+
+	@JvmStatic
+	fun setRendererLive(live: Boolean) {
+		rendererLive = live
+	}
+
+	/**
+	 * The device the game is rendering with, for the work that happens outside a pass.
+	 *
+	 * The device is Minecraft's to create and is handed to every pass it opens, so nothing needed to
+	 * keep a reference to it before; the pipeline precompile does, because it runs on its own thread
+	 * while the game is still on the loading screen and has no pass to borrow one from.
+	 */
+	@Volatile
+	private var device: Any? = null
+
+	@JvmStatic
+	fun device(): dev.birb.wgpu.backend.WgpuDevice? = device as? dev.birb.wgpu.backend.WgpuDevice
+
+	@JvmStatic
+	fun setDevice(created: dev.birb.wgpu.backend.WgpuDevice) {
+		device = created
+	}
 
 	@Volatile
 	private var mayInitialize: Boolean = false

@@ -8,6 +8,7 @@ import com.mojang.blaze3d.systems.GpuBackend
 import com.mojang.blaze3d.systems.GpuDevice
 import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.gui.OptionPages
+import dev.birb.wgpu.render.Wgpu
 import dev.birb.wgpu.rust.WgpuNative
 import java.lang.foreign.MemorySegment
 import org.lwjgl.glfw.GLFW
@@ -53,8 +54,13 @@ class WgpuBackend : GpuBackend {
         }
 
         // The JNI entry point creates the renderer (instance, adapter, device, queue) and returns
-        // its pointer; everything else then goes through the C ABI using that pointer.
-        val renderer = WgpuNative.createWmRendererOnWindow(display, nativeWindow)
+        // its pointer; everything else then goes through the C ABI using that pointer. The window's
+        // framebuffer size goes with it, because the scene the renderer owns - the section arena, the
+        // buffer it lives in, the depth texture - is sized from the framebuffer, and this is the one
+        // moment where that size is known before anything is drawn. A window that has no size yet
+        // reports `0, 0`, and the renderer makes its scene on the first frame that presents instead.
+        val (framebufferWidth, framebufferHeight) = WgpuSurface.framebufferSize(window)
+        val renderer = WgpuNative.createWmRendererOnWindow(display, nativeWindow, framebufferWidth, framebufferHeight)
         if (renderer == 0L) {
             // Rust has already logged which backend it tried and why each one failed. Throwing
             // rather than letting Minecraft carry on with a null device turns this into the
@@ -81,6 +87,14 @@ class WgpuBackend : GpuBackend {
         // vanilla's question ("which API is this?"), while this line is the mod's own and should
         // name the wgpu build too.
         WgpuMcMod.LOGGER.info("wgpu-mc backend initialised through {}", WgpuNative.getBackendSafe())
+        // The native renderer exists from here on. The block cache waits for this before building
+        // the registry the Rust terrain baker reads; nothing else reads it, on purpose - see
+        // `Wgpu#isRendererLive`.
+        Wgpu.setRendererLive(true)
+        // The pipeline precompile runs off the render thread and needs a device to compile against;
+        // this is the only place one exists before the game has a pass open. See `PipelinePrecompiler`
+        // for why the work is worth doing there rather than at the first draw.
+        Wgpu.setDevice(device)
         return GpuDevice(device)
     }
 }

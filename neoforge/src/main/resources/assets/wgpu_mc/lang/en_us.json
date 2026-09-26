@@ -15,6 +15,8 @@
   "wgpu_mc.option.backend": "Graphics backend",
   "wgpu_mc.option.backend.vulkan": "Vulkan",
   "wgpu_mc.option.backend.directx12": "DirectX 12",
+  "wgpu_mc.option.frames_in_flight": "Frames in flight",
+  "wgpu_mc.option.frames_in_flight.tooltip": "How many frames the CPU may record ahead of the GPU. One is a full stall on every frame, two hides the recording behind the GPU, three adds a frame of latency for a little more slack.",
   "wgpu_mc.option.vsync": "V-sync",
   "wgpu_mc.option.gpu_based_validation": "GPU-based validation",
   "wgpu_mc.option.logging": "Logging",
@@ -28,5 +30,7 @@
   "wgpu_mc.option.binding_verbosity.tooltip": "Log how every binding name was resolved against a pipeline's binding plan, and what the plan was left holding: a name that only matched through the shader shim's _wm_texshim / _wm_sampler suffix, the names a plan can be bound under when one of them is not in it, and the slots a pipeline change left empty. This is the detailed version of the warning the renderer always prints when a binding is not in the plan at all, and it is the switch to turn on when a shader reads nothing and the question is which name it was looking for. This is the wgpu-binding-log marker as a switch.",
   "wgpu_mc.option.dump_shaders": "Dump shaders",
   "wgpu_mc.option.gpu_timestamps": "GPU timestamps",
-  "wgpu_mc.option.pix_capture": "PIX capture support"
+  "wgpu_mc.option.pix_capture": "PIX capture support",
+  "wgpu_mc.option.section_timing": "Section feed timing",
+  "wgpu_mc.option.section_timing.tooltip": "Time the section feed, phase by phase, and report the averages. What the feed does is what runs on Minecraft's chunk-build threads - looking up the light of the sections around a rebuild, reading the block data out of the container, and handing the lot to the native side in one call - so this is the switch that answers \"what does one section rebuild cost, and which part of it\" with three numbers instead of a guess. The averages appear on the F3 screen while it is on. Off by default: it is a clock read per phase per section, and closing it costs nothing at all. This is the wgpu-section-timing marker as a switch."
 }
