@@ -246,6 +246,10 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setName(Component.translatable("options.graphics.preset"))
             .setOption(options.graphicsPreset())
             .setFormatter { graphicsPreset -> Component.translatable(graphicsPreset.getKey()) }
+            // Fabulous is missing on purpose: it is the preset that turns on improved transparency,
+            // whose post chain this backend cannot bind yet - see GraphicsPresets, which also clamps a
+            // settings file that still names it.
+            .setValues(GraphicsPresets.offered())
             .build())
 
         page.space()

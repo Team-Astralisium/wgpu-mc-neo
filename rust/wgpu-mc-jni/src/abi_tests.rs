@@ -17,8 +17,8 @@ use std::mem::{offset_of, size_of};
 
 use crate::blaze::{
     BindGroupEntryDescriptor, BlazeAttachmentDescriptor, BlazeBindGroupLayout, BlazeBlendState,
-    BlazeColorTargetState, BlazeDepthStencilState, BlazeRenderPassDescriptor, RawArray,
-    RenderPipeline, VertexFormat, VertexFormatElement,
+    BlazeColorTargetState, BlazeDepthStencilState, BlazeRenderPassDescriptor, DrawBinding, DrawCall,
+    PlanBinding, RawArray, RenderPipeline, VertexFormat, VertexFormatElement,
 };
 
 const WM_NATIVE_KT: &str =
@@ -612,6 +612,24 @@ fn every_struct_the_jvm_reads_by_offset_still_has_that_layout() {
     check_offset(&constants, "PIPELINE_FRAG_STATE", offset_of!(RenderPipeline, frag_state));
     check_offset(&constants, "PIPELINE_TOPOLOGY", offset_of!(RenderPipeline, primitive_topology));
     check_offset(&constants, "PIPELINE_CULL", offset_of!(RenderPipeline, cull));
+
+    // The draw call and the two tables inside it. The JVM writes a draw by these offsets, and the
+    // fields a draw is numbered by - the combination and whether the table came with it - are the
+    // last two, which is exactly the kind of thing a struct edit moves without saying so.
+    check_offset(&constants, "DRAW_CALL_VERTEX_BUFFERS", offset_of!(DrawCall, vertex_buffers));
+    check_offset(&constants, "DRAW_CALL_BINDINGS", offset_of!(DrawCall, bindings));
+    check_offset(&constants, "DRAW_CALL_COMBO", offset_of!(DrawCall, combo));
+    check_offset(&constants, "DRAW_CALL_BINDINGS_PRESENT", offset_of!(DrawCall, bindings_present));
+    check_offset(&constants, "DRAW_BINDING_KIND", offset_of!(DrawBinding, kind));
+    check_offset(&constants, "DRAW_BINDING_RESOURCE", offset_of!(DrawBinding, resource));
+    check_offset(&constants, "DRAW_BINDING_OFFSET", offset_of!(DrawBinding, offset));
+    check_offset(&constants, "DRAW_BINDING_LENGTH", offset_of!(DrawBinding, length));
+    check_offset(&constants, "PLAN_BINDING_NAME", offset_of!(PlanBinding, name));
+    check_offset(&constants, "PLAN_BINDING_DECLARED_NAME", offset_of!(PlanBinding, declared_name));
+    check_offset(&constants, "PLAN_BINDING_SET", offset_of!(PlanBinding, set));
+    check_offset(&constants, "PLAN_BINDING_BINDING", offset_of!(PlanBinding, binding));
+    check_offset(&constants, "PLAN_BINDING_KIND", offset_of!(PlanBinding, kind));
+    check_offset(&constants, "PLAN_BINDING_DYNAMIC", offset_of!(PlanBinding, dynamic));
 
     fn check_layout(layout: &str, rust_size: usize, fields: &[(&str, usize)]) {
         // Trailing padding is a layout entry without a field behind it, which is how the 24-byte

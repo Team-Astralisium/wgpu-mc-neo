@@ -314,8 +314,9 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
 
         // Diagnostics: a staging buffer that is allocated and never freed is native memory the
         // garbage collector cannot see, which is exactly the shape of "the game asks for memory and
-        // never gives it back". The totals say whether every allocation comes back.
-        if (Diagnostics.loggingEnabled()) {
+        // never gives it back". The totals say whether every allocation comes back, and they are
+        // counted only while the upload reports are on - the counters exist to be reported.
+        if (Diagnostics.uploadsEnabled()) {
             STAGING_ALLOCATED.addAndGet(upload)
             STAGING_OPEN.incrementAndGet()
             if (STAGING_OPEN.get() > STAGING_HIGH_WATER.get()) {
@@ -346,7 +347,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
             override fun close() {
                 try {
                     if (write) {
-                        if (Diagnostics.loggingEnabled()) {
+                        if (Diagnostics.uploadsEnabled()) {
                             reportMappedWrite(wgpuBuffer, staging, length)
                         }
                         WmNative.writeToBuffer.invokeExact(
@@ -364,13 +365,13 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
                         val written = staging.position().toLong()
                         wgpuBuffer.lastMappedWrite = written
 
-                        if (Diagnostics.loggingEnabled()) {
+                        if (Diagnostics.uploadsEnabled()) {
                             verifyMappedWrite(wgpuBuffer, buffer.offset(), staging, length, written)
                         }
                     }
                 } finally {
                     MemoryUtil.memAlignedFree(staging)
-                    if (Diagnostics.loggingEnabled()) {
+                    if (Diagnostics.uploadsEnabled()) {
                         STAGING_FREED.addAndGet(upload)
                         STAGING_OPEN.decrementAndGet()
                         reportStaging("free")
@@ -391,8 +392,9 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
      * own cell" is a question about these bytes.
      */
     private fun reportMappedWrite(buffer: WgpuBuffer, staging: ByteBuffer, length: Long) {
-        // The logging switch: these are the reports that verify an upload arrived and decode a face buffer, and they had none of their own.
-        if (!Diagnostics.loggingEnabled()) {
+        // The upload-report switch rather than the logging one: this is a line per upload, and it is
+        // the pair of this and `verifyMappedWrite` that answers whether an upload landed.
+        if (!Diagnostics.uploadsEnabled()) {
             return
         }
         if (!buffer.label.startsWith("Cloud")) {
@@ -442,8 +444,9 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         length: Long,
         written: Long,
     ) {
-        // The logging switch, as above: this is the verification half of a mapped write.
-        if (!Diagnostics.loggingEnabled()) {
+        // The upload-report switch, as above: this is the verification half of a mapped write, and it
+        // is the half that costs something - the bytes are read back from the GPU to be compared.
+        if (!Diagnostics.uploadsEnabled()) {
             return
         }
         if (!buffer.label.startsWith("Cloud") || !throttle("${buffer.label} (read back)")) {
@@ -711,12 +714,18 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
         private val STAGING_HIGH_WATER = java.util.concurrent.atomic.AtomicInteger()
         private var STAGING_REPORTED_AT = 0L
 
-        /** Reports the staging totals at most once a second, when they changed. */
+        /**
+         * Reports the staging totals at most once a second, when they changed.
+         *
+         * Gated on the upload reports rather than on the logging switch: this is a line a second for
+         * as long as uploads happen, and the number it prints is about the upload path rather than
+         * about the frame.
+         */
         fun reportStaging(what: String) {
-        // The logging switch: this is a counter report.
-        if (!Diagnostics.loggingEnabled()) {
-            return
-        }
+            if (!Diagnostics.uploadsEnabled()) {
+                return
+            }
+
             val now = System.nanoTime()
             if (now - STAGING_REPORTED_AT < 1_000_000_000L) {
                 return

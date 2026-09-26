@@ -8,6 +8,7 @@ import com.mojang.blaze3d.systems.RenderPassBackend;
 import com.mojang.blaze3d.textures.GpuSampler;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import dev.birb.wgpu.render.TerrainPass;
 import dev.birb.wgpu.rust.NativeNames;
 import dev.birb.wgpu.rust.WmNative;
 import net.minecraft.util.ARGB;
@@ -19,6 +20,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -51,9 +53,22 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     private final WgpuDevice device;
     private final WgpuCommandEncoder encoder;
-    private final MemorySegment nativePass;
+    private MemorySegment nativePass;
     private final boolean wantsDepth;
     private final AtomicBoolean closed = new AtomicBoolean();
+
+    /** The colour and depth views this pass was opened with, for the graph pass that may replace it. */
+    private final MemorySegment colorView;
+    private final MemorySegment depthView;
+
+    /**
+     * Set once the render graph has drawn this pass instead of Minecraft.
+     *
+     * <p>From then on this object is a pass whose native side is gone: the graph recorded its own, with
+     * the same attachments, and everything Minecraft goes on to record for this pass is dropped rather
+     * than drawn twice. See {@link #takeOverTerrainPass}.
+     */
+    private boolean graphTerrain;
 
     /**
      * The scratch buffer every draw of this pass is written into, taken from a per-thread pool.
@@ -112,7 +127,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * The bindings the pass has been given, by the name Minecraft binds them under.
-     *
+     * <p>
      * Sticky, the way OpenGL's state is: a draw reuses whatever was bound before it, and a pipeline
      * change re-emits all of it, because a slot means something different under a different plan.
      * Uniforms and texel buffers take one slot each; a combined sampler is a pair and lives in
@@ -144,6 +159,35 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /** The pipeline's binding slots, or null when it could not be resolved. */
     private PlanBindings bindings;
+
+    /**
+     * What the current binding table is made of, by slot, as the combination is built from it.
+     *
+     * <p>A draw hands the native side a *number* for its bindings rather than the bindings
+     * themselves: that number is the key its bind groups are cached under, and it turns the per-draw
+     * question from a walk over every slot into one integer comparison. One stamp per slot is what
+     * that number is minted from - the resource, the length and anything else a bind group is built
+     * from, but not the offset of a binding whose offset travels with the draw. Slot `i` is cleared
+     * to zero by {@link #clearBindings}, which is the same "nothing here" the draw call itself
+     * carries.
+     */
+    private final long[] slotStamps = new long[WmNative.MAX_DRAW_BINDINGS];
+
+    /** The slots [lastCombo] was minted from, so a run of draws sharing them skips the table. */
+    private final long[] lastStamps = new long[WmNative.MAX_DRAW_BINDINGS];
+
+    /** The number the last draw recorded, and how many slots went into it. */
+    private int lastCombo;
+    private int lastCount = -1;
+
+    /**
+     * Whether the pipeline bound now has any binding whose offset travels with the draw.
+     *
+     * <p>Those offsets are the one thing a combination leaves out, so a plan without one is
+     * described completely by its number: its draws leave the binding table behind. Read once per
+     * pipeline bind, because the answer is a property of the plan.
+     */
+    private boolean planHasDynamic;
 
     /** Kept for diagnostics: an `Animate ...` pass has its target dumped once it has been submitted. */
     private final String label;
@@ -184,6 +228,8 @@ public class WgpuRenderPass implements RenderPassBackend {
         this.targetWidth = colorTexture.getWidth(0);
         this.targetHeight = colorTexture.getHeight(0);
         this.wantsDepth = depthTexture != null;
+        this.colorView = nativeViewOf(colorTexture);
+        this.depthView = depthTexture == null ? MemorySegment.NULL : nativeViewOf(depthTexture);
         this.drawCallBuffer = DrawCallBuffer.acquire();
         this.drawCall = drawCallBuffer.segment();
         this.nativePass = buildDescriptor(this.label, colorTexture, clearColor, depthTexture, clearDepth);
@@ -297,7 +343,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     }
 
     @Override
-    public void pushDebugGroup(Supplier<String> label) {
+    public void pushDebugGroup(@NonNull Supplier<String> label) {
         openDebugGroups++;
     }
 
@@ -309,7 +355,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     }
 
     @Override
-    public void setPipeline(RenderPipeline pipeline) {
+    public void setPipeline(@NonNull RenderPipeline pipeline) {
         // The variant this pass needs, which the compiled pipeline writes on demand the first time:
         // a pass with a depth attachment and one without cannot share a `wgpu::RenderPipeline`.
         WgpuCompiledRenderPipeline compiled =
@@ -326,6 +372,7 @@ public class WgpuRenderPass implements RenderPassBackend {
                     + " has more bindings than the draw call can carry; see the log");
         }
         this.bindings = slots;
+        this.planHasDynamic = slots.dynamicSlotCount() > 0;
         clearBindings();
         for (Map.Entry<String, Bound> entry : boundBindings.entrySet()) {
             writeBinding(entry.getKey(), entry.getValue());
@@ -334,6 +381,44 @@ public class WgpuRenderPass implements RenderPassBackend {
             writeSampled(entry.getKey(), entry.getValue());
         }
         reportPlanOnce(slots);
+
+        // The Rust terrain path: the pass Minecraft has opened for the solid layer is the one the
+        // render graph draws, so this is where it is handed over - the pipeline is what says which pass
+        // this is, and it is bound before anything is drawn into it.
+        if (!graphTerrain
+                && TerrainPass.INSTANCE.isOn()
+                && TerrainPass.INSTANCE.replaces(activePipelineName)
+                && !depthView.equals(MemorySegment.NULL)
+                && TerrainPass.INSTANCE.ready(device.renderer())) {
+            takeOverTerrainPass();
+        }
+    }
+
+    /**
+     * Draws this pass with the render graph instead of with Minecraft's own meshes.
+     *
+     * <p>Minecraft's pass is finished first, because wgpu allows one pass to be recording at a time and
+     * the graph opens its own: nothing has been drawn into it - the pipeline that says "this is the
+     * solid layer" is the first thing such a pass is given - and a finished pass keeps whatever it
+     * recorded, so this is where the two meet rather than a reordering of the frame.
+     *
+     * <p>The colour and depth views are the ones this pass was opened with, which is what makes the
+     * graph's terrain the terrain of *this* frame: the cutout and translucent layers, the entities and
+     * everything else Minecraft draws afterwards test against the depth this pass fills.
+     */
+    private void takeOverTerrainPass() {
+        invoke(WmNative.dropRenderPass, nativePass);
+        nativePass = MemorySegment.NULL;
+        graphTerrain = true;
+
+        TerrainPass.INSTANCE.sendCameraMatrices();
+
+        boolean drawn = (boolean) invoke(WmNative.renderTerrainPass, device.renderer(), colorView, depthView);
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: {} is drawn by the render graph now{}",
+                label,
+                drawn ? "" : "; nothing was drawn, so this frame has no ground in it");
     }
 
     /** Plans already described by [reportPlanOnce]. */
@@ -341,7 +426,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Diagnostics: a pipeline's plan, slot by slot, once.
-     *
+     * <p>
      * The slot table is what turns a binding *name* into the number the shader's
      * `layout(binding = N)` was written with, and the two are built from the same plan - which is
      * exactly why they have to be checked together rather than trusted: a name that lands one slot
@@ -360,7 +445,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     /**
      * Diagnostics: the slots the plan declares that this draw leaves empty, named by the binding they
      * belong to.
-     *
+     * <p>
      * A pipeline change clears every slot and writes back what was bound so far, so a slot that is
      * still `DRAW_BINDING_NONE` when the draw is recorded is a binding this pipeline has and the pass
      * does not - the
@@ -368,7 +453,7 @@ public class WgpuRenderPass implements RenderPassBackend {
      * never bound at all. Which of those it is decides whether the draw that follows is fine, so
      * none of them is left unsaid: with the binding-resolution switch on, every empty slot is
      * reported with the pipeline it belongs to and the name that slot holds.
-     *
+     * <p>
      * Off by default because a pass binds *after* it sets its pipeline, so the slots of a pipeline
      * that has just been bound are normally empty at this point - the interesting ones are the slots
      * that are still empty by the time the pass draws, which is what the binding log is turned on to
@@ -409,7 +494,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     }
 
     @Override
-    public void bindTexture(String name, GpuTextureView textureView, GpuSampler sampler) {
+    public void bindTexture(@NonNull String name, GpuTextureView textureView, GpuSampler sampler) {
         if (textureView == null || sampler == null) {
             return;
         }
@@ -473,14 +558,14 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Diagnostics: what every texture slot of one draw carries, in slot order.
-     *
+     * <p>
      * The `pass X binds Sampler0 to Y` line is deduplicated, so it says which textures a pass has
      * *ever* bound - and "every mob wears some other mob's skin" is a question about one draw, not
      * about a pass. This reads the slots the draw call is about to be recorded with, which is the
      * same list the native side walks, in the same order: the native `trace &lt;pipeline&gt; slot '&lt;name&gt;'
      * -&gt; '&lt;label&gt;'` line for the same draw is what says which side mixed the textures up, and the two
      * only line up if both sides print every slot rather than the ones they happened to bind.
-     *
+     * <p>
      * The name comes from the plan and the label from the registry of views this side has handed
      * over, because the slot holds a pointer and nothing else. Restricted to the pipeline family
      * named by the `wgpu-trace-plan` file, because a line per draw per texture slot is a log that is
@@ -543,7 +628,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     }
 
     /** The index buffer of this draw, as `address`, for the trace. */
-    private String indexBufferDescription() {
+    private @NonNull String indexBufferDescription() {
         MemorySegment buffer = drawCall.get(WmNative.ADDRESS, WmNative.DRAW_CALL_INDEX_BUFFER);
         return String.format("0x%x", buffer.address());
     }
@@ -553,13 +638,13 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Diagnostics: a name that is not in the pipeline's plan, reported once per pipeline and name.
-     *
+     * <p>
      * This used to return in silence, and silence here is the worst possible answer: nothing is
      * written into any slot, so a shader that *does* read this binding reads whatever was there -
      * zeroes, most of the time - and the picture is wrong in a way that looks like a shader bug or a
      * resource bug. The cloud layer was one square above the player's head for exactly this reason,
      * and the log said nothing.
-     *
+     * <p>
      * A plan is built from what the pipeline's shader declares, so a name that is not in one is
      * usually a name this shader does not use - `RenderSystem#bindDefaultUniforms` binds `Globals`,
      * `Lighting` and `Fog` into every pass, including the ones whose pipeline declares none of them.
@@ -593,7 +678,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Diagnostics: a combined sampler whose name has only one slot in the plan.
-     *
+     * <p>
      * The shim splits a sampler into a texture and a sampler slot, and the plan is built from the
      * shader that resulted, so a name with one slot is a plan this side built from a shader that was
      * not shimmed - one half of the pair would be bound and the other left empty, which samples
@@ -621,12 +706,12 @@ public class WgpuRenderPass implements RenderPassBackend {
     }
 
     @Override
-    public void setUniform(String name, @NonNull GpuBuffer value) {
+    public void setUniform(@NonNull String name, @NonNull GpuBuffer value) {
         setUniform(name, value.slice());
     }
 
     @Override
-    public void setUniform(String name, GpuBufferSlice value) {
+    public void setUniform(@NonNull String name, @NonNull GpuBufferSlice value) {
         // Diagnostics: the offset Minecraft is binding this uniform at, which is the number the
         // dynamic-offset path has to carry through to `set_bind_group` unchanged.
         if (Diagnostics.loggingEnabled()) {
@@ -644,7 +729,7 @@ public class WgpuRenderPass implements RenderPassBackend {
         // clamp below used to turn back into an unaligned size - a 181,818 byte face buffer became a
         // 181,818 byte storage binding, and wgpu refused to build the cloud bind group at all
         // ("Effective buffer binding size 181818 for storage buffers is expected to align to 4").
-        long available = ((WgpuBuffer) value.buffer()).size() - value.offset();
+        long available = value.buffer().size() - value.offset();
         long wanted = Math.min(value.length(), available);
         long rounded = wanted - Math.floorMod(wanted, 4);
         if (rounded <= 0) {
@@ -654,7 +739,7 @@ public class WgpuRenderPass implements RenderPassBackend {
         Bound binding = Bound.buffer(
                 ((WgpuBuffer) value.buffer()).nativeBuffer(),
                 value.offset(),
-                Math.min(rounded, Math.max(available, 1)));
+                Math.clamp(available, 1, rounded));
 
         boundBindings.put(name, binding);
         writeBinding(name, binding);
@@ -674,14 +759,14 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Warns when a draw reads past what was uploaded into the buffer it reads from.
-     *
+     * <p>
      * A texel buffer is read by `gl_VertexIndex / 4` in the vertex shader, so a draw of `count`
      * indices reads `count / 6` faces of three bytes each - and if the mapped write behind the
      * buffer only reached part of that, the faces past the end are whatever the buffer already held.
      * The result is a cloud layer with faces from an older cell in it, or a layer of stale faces
      * that drift the wrong way, and nothing in the log says so: the upload succeeded, the draw has
      * the count it was given, and the buffer is bound to the right slot.
-     *
+     * <p>
      * Once a second at most, because this runs per draw.
      */
     private void checkTexelReadRange(int count, boolean indexed) {
@@ -724,7 +809,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Diagnostics: which buffer a cloud uniform went into, and into which slot.
-     *
+     * <p>
      * A binding whose name is not in the pipeline's plan is dropped in silence - `writeBinding`
      * returns without writing anything - so a shader that reads a face buffer nobody bound reads
      * zeroes, and every face of the cloud mesh decodes to cell (0, 0). That is one square of cloud
@@ -780,6 +865,8 @@ public class WgpuRenderPass implements RenderPassBackend {
         drawCall.set(WmNative.ADDRESS, base + WmNative.DRAW_BINDING_RESOURCE, binding.resource());
         drawCall.set(WmNative.LONG, base + WmNative.DRAW_BINDING_OFFSET, binding.offset());
         drawCall.set(WmNative.LONG, base + WmNative.DRAW_BINDING_LENGTH, binding.length());
+
+        slotStamps[slot] = stampOf(binding, bindings.dynamicSlots[slot]);
     }
 
     /** Marks every binding slot empty, which a pipeline change has to do before re-emitting. */
@@ -794,7 +881,35 @@ public class WgpuRenderPass implements RenderPassBackend {
             drawCall.set(WmNative.ADDRESS, base + WmNative.DRAW_BINDING_RESOURCE, MemorySegment.NULL);
             drawCall.set(WmNative.LONG, base + WmNative.DRAW_BINDING_OFFSET, 0L);
             drawCall.set(WmNative.LONG, base + WmNative.DRAW_BINDING_LENGTH, 0L);
+
+            slotStamps[slot] = 0L;
         }
+
+        // The slots are not the ones the last number was minted from any more, and the ones being
+        // written now belong to the plan that has just been bound.
+        lastCount = -1;
+    }
+
+    /** `0x9E3779B97F4A7C15`, the odd constant the native side's own fold multiplies by. */
+    private static final long STAMP_MIX = 0x9E3779B97F4A7C15L;
+
+    /**
+     * What one slot contributes to the combination, which is everything a bind group is built from.
+     *
+     * <p>The resource and the length are in it, and the offset too unless the binding is one whose
+     * offset travels with the draw - those are handed over per draw instead, and numbering them apart
+     * would give every draw of a run its own bind group. The kind is in it because the slots of one
+     * plan are not all the same thing: swapping a texture and a sampler between two slots is a
+     * different set of bindings even though the two addresses are the same two addresses.
+     *
+     * <p>This is a mix rather than a hash of the whole table: a stamp is compared, never trusted, so
+     * two that collide only cost the table having one entry too many.
+     */
+    private static long stampOf(Bound binding, boolean offsetTravels) {
+        long stamp = binding.kind();
+        stamp = (stamp ^ binding.resource().address()) * STAMP_MIX;
+        stamp = (stamp ^ (offsetTravels ? 0L : binding.offset())) * STAMP_MIX;
+        return (stamp ^ binding.length()) * STAMP_MIX;
     }
 
     /**
@@ -938,7 +1053,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * The last second the budget was reported for.
-     *
+     * <p>
      * A field rather than a set of seconds: the set grew by one entry per second for as long as the
      * game ran, which is a leak whose whole purpose was to log a warning.
      */
@@ -977,6 +1092,12 @@ public class WgpuRenderPass implements RenderPassBackend {
      */
     @Override
     public void enableScissor(int x, int y, int width, int height) {
+        if (graphTerrain) {
+            // The graph's pass has no scissor to set: the solid layer is drawn as one range of sections,
+            // and the pass Minecraft would have set this on is gone.
+            return;
+        }
+
         // OpenGL's scissor box is [x, x + width) x [y, y + height), and an empty box draws nothing;
         // wgpu accepts a zero-sized one, so an empty intersection needs no special case.
         int left = Math.max(0, x);
@@ -1003,13 +1124,17 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     @Override
     public void disableScissor() {
+        if (graphTerrain) {
+            return;
+        }
+
         // wgpu's scissor is per draw call and persists inside a pass, exactly like OpenGL's, so
         // turning it off has to put the whole target back rather than leave the last box in place.
         invoke(WmNative.setScissorRect, nativePass, 0, 0, targetWidth, targetHeight);
     }
 
     @Override
-    public void setVertexBuffer(int slot, GpuBuffer vertexBuffer) {
+    public void setVertexBuffer(int slot, @NonNull GpuBuffer vertexBuffer) {
         WgpuBuffer buffer = (WgpuBuffer) vertexBuffer;
         long base = WmNative.DRAW_CALL_VERTEX_BUFFERS + WmNative.elementOffset(WmNative.DRAW_VERTEX_BUFFER, slot);
 
@@ -1022,7 +1147,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     }
 
     @Override
-    public void setIndexBuffer(GpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
+    public void setIndexBuffer(@NonNull GpuBuffer indexBuffer, VertexFormat.@NonNull IndexType indexType) {
         drawCall.set(WmNative.ADDRESS, WmNative.DRAW_CALL_INDEX_BUFFER, ((WgpuBuffer) indexBuffer).nativeBuffer());
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INDEX_FORMAT,
                 indexType == VertexFormat.IndexType.INT
@@ -1034,7 +1159,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Diagnostics: the first indices of the buffer the clouds are drawn with, read back from the GPU.
-     *
+     * <p>
      * The cloud vertex shader has no vertex buffer at all: it derives the face it draws from
      * `gl_VertexIndex / 4`, which for an indexed draw is the value in the index buffer. An index
      * buffer full of zeroes therefore draws the *first* face ten thousand times - one square of
@@ -1093,13 +1218,20 @@ public class WgpuRenderPass implements RenderPassBackend {
 
     /**
      * Fills the draw call's parameters and records it, which is the whole per-draw ABI.
-     *
+     * <p>
      * The bindings are already in the buffer - they were written as they were bound - so a draw adds
      * the parameters and the count, and `draw_call` does the rest: the pipeline if it changed, the
      * vertex and index buffers, the bind groups (looked up or built once and then reused by the
      * pass) and finally the draw itself.
      */
     private void record(int first, int count, int baseVertex, int instanceCount, boolean indexed) {
+        if (graphTerrain) {
+            // The graph drew this pass's terrain, from the meshes the Rust baker built; Minecraft's own
+            // meshes for the same layer are what it replaced, so recording them would draw the world
+            // twice.
+            return;
+        }
+
         if (activePipeline.equals(MemorySegment.NULL) || bindings == null) {
             // Blaze3D never draws without a pipeline; if it ever does, the call would dereference a
             // null pipeline inside wgpu.
@@ -1115,12 +1247,20 @@ public class WgpuRenderPass implements RenderPassBackend {
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_INDEXED, indexed ? 1 : 0);
         drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_LEN, bindings.getCount());
 
-        // The combination this draw's bindings make up, and whether the table in the buffer is the
-        // one it was built from. Zero means "work the identity out from the table", which is what the
-        // native side did before combinations existed; numbering them is what turns that per-draw
-        // walk into one integer comparison, and it is done where the bindings are known - here.
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COMBO, 0);
-        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, 1);
+        // The combination this draw's bindings make up, and whether the table in the buffer carries
+        // what it left out. The number is the identity of the bind groups - it is what the native
+        // side keys them by - so it is minted from the slots as they are bound, and a draw whose
+        // slots are the ones the last draw of this pass had reuses its number without a lookup. Zero
+        // means "work the identity out from the table", which is what the native side did before
+        // combinations existed; numbering them is what turns that per-draw walk into one integer
+        // comparison, and it is done where the bindings are known - here.
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_COMBO, combination());
+
+        // The table is always the one the number was built from - the slots are written as they are
+        // bound - so what this really says is whether the number is the *whole* identity: a plan whose
+        // bindings all bake their offsets has none that travels with the draw, and its draws are then
+        // answered without the table being read at all.
+        drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, planHasDynamic ? 1 : 0);
 
         reportCloudDraw(first, count, baseVertex, indexed);
         checkTexelReadRange(count, indexed);
@@ -1136,23 +1276,74 @@ public class WgpuRenderPass implements RenderPassBackend {
         boolean recorded = (boolean) invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
 
         if (!recorded) {
-            // Unreachable while every draw carries its whole binding table: the native side only
-            // refuses a draw that names a combination it has never seen *and* leaves the bindings
-            // behind. If it ever happens, the picture is missing draws rather than wrong ones.
+            // The native side does not know this combination and was not given the bindings to build
+            // it from - which is a draw of a plan whose number was supposed to say everything, on the
+            // first draw to use that number, or one whose bind groups it has since dropped. It refuses
+            // rather than binding whatever it bound last, so the table goes with the draw this time
+            // and the same call is made again: the pipeline and the vertex buffers it recorded before
+            // it looked at the bindings are the same ones, so re-recording them changes nothing.
+            drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, 1);
+            recorded = (boolean) invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
+            reportRefusedDraw(recorded);
+        }
+
+        if (!recorded) {
+            // Unreachable while the native side only refuses a draw that left its bindings behind. If
+            // it ever happens, the picture is missing draws rather than wrong ones.
             dev.birb.wgpu.WgpuMcMod.LOGGER.error(
                     "wgpu: the native side refused a draw of {} that carried its bindings",
                     activePipelineName);
         }
     }
 
+    /** Refused draws already reported by [reportRefusedDraw], by pipeline. */
+    private static final java.util.Set<String> REFUSED_DRAWS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Diagnostics: a draw the native side asked to see the bindings of, once per pipeline.
+     *
+     * <p>Expected once per combination a plan of that kind is first drawn with, and again whenever
+     * the native side has dropped the bind groups it built - so a line per draw here would mean the
+     * numbers are changing per draw, which is the one way this can be slower than the walk it
+     * replaced rather than faster.
+     */
+    private void reportRefusedDraw(boolean recorded) {
+        if (!Diagnostics.loggingEnabled() || !REFUSED_DRAWS.add(activePipelineName)) {
+            return;
+        }
+
+        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: {} asked for the bindings of a draw the native side did not know ({} after "
+                        + "sending them); its bind groups are rebuilt once per combination",
+                activePipelineName,
+                recorded ? "recorded" : "still refused");
+    }
+
+    /** The number the current binding table is known by, minting one if it has changed. */
+    private int combination() {
+        int count = bindings.getCount();
+
+        if (count == lastCount && Arrays.equals(lastStamps, 0, count, slotStamps, 0, count)) {
+            return lastCombo;
+        }
+
+        int combo = bindings.combinationOf(slotStamps, count);
+        System.arraycopy(slotStamps, 0, lastStamps, 0, count);
+        lastCount = count;
+        lastCombo = combo;
+
+        return combo;
+    }
+
     /**
      * Diagnostics: what the clouds are drawn with, once a second.
-     *
+     * <p>
      * `CloudRenderer` turns its face buffer into `drawIndexed(0, 0, 6 * quadCount, 1)`, so the index
      * count says how many faces the mesh actually has - and the vertex shader derives the face it
      * reads from `gl_VertexIndex / 4`, which makes a wrong or empty index buffer look exactly like a
      * wrong face buffer: every quad reads the same face, and the sky has one square of cloud in it.
-     *
+     * <p>
      * Once a second and not once per pass: the pass is rebuilt every frame, so a field on it would
      * report every frame, which is a line a frame and a megabyte a minute of the same sentence.
      */
@@ -1195,8 +1386,8 @@ public class WgpuRenderPass implements RenderPassBackend {
             @NonNull Collection<RenderPass.Draw<T>> draws,
             GpuBuffer defaultIndexBuffer,
             VertexFormat.IndexType defaultIndexType,
-            Collection<String> dynamicUniforms,
-            T uniformArgument) {
+            @NonNull Collection<String> dynamicUniforms,
+            @NonNull T uniformArgument) {
         for (RenderPass.Draw<T> draw : draws) {
             GpuBuffer indexBuffer = draw.indexBuffer() != null ? draw.indexBuffer() : defaultIndexBuffer;
             if (indexBuffer == null) {
@@ -1210,7 +1401,7 @@ public class WgpuRenderPass implements RenderPassBackend {
 
             if (draw.uniformUploaderConsumer() != null) {
                 draw.uniformUploaderConsumer()
-                        .accept(uniformArgument, (name, buffer) -> setUniform(name, buffer));
+                        .accept(uniformArgument, this::setUniform);
             }
 
             setVertexBuffer(draw.slot(), draw.vertexBuffer());
@@ -1227,7 +1418,12 @@ public class WgpuRenderPass implements RenderPassBackend {
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
-            invoke(WmNative.dropRenderPass, nativePass);
+            // A pass the graph took over has no native side left to drop: it was finished when the
+            // takeover happened, because that is the only order wgpu allows.
+            if (!nativePass.equals(MemorySegment.NULL)) {
+                invoke(WmNative.dropRenderPass, nativePass);
+            }
+
             // The bind groups went with the pass itself and the draw call buffer goes back to the
             // pool for the next pass on this thread: nothing here frees anything per draw.
             drawCallBuffer.release();

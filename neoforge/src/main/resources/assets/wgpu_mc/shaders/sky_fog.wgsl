@@ -34,7 +34,7 @@ struct PushConstants {
     dimension_fog_color_a: f32,
 }
 
-var<push_constant> data: PushConstants;
+var<immediate> data: PushConstants;
 
 fn rotateX(degrees: f32) -> mat4x4<f32> {
     var theta = radians(degrees);

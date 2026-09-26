@@ -41,5 +41,7 @@
   "wgpu_mc.option.binding_verbosity": "绑定分析日志",
   "wgpu_mc.option.binding_verbosity.tooltip": "Log how every binding name was resolved against a pipeline's binding plan, and what the plan was left holding: a name that only matched through the shader shim's _wm_texshim / _wm_sampler suffix, the names a plan can be bound under when one of them is not in it, and the slots a pipeline change left empty. This is the detailed version of the warning the renderer always prints when a binding is not in the plan at all, and it is the switch to turn on when a shader reads nothing and the question is which name it was looking for. This is the wgpu-binding-log marker as a switch.",
   "wgpu_mc.option.section_timing": "区块喂送计时",
-  "wgpu_mc.option.section_timing.tooltip": "分相计时区块喂送路径并给出平均值。\n这条路径跑在 Minecraft 的区块构建线程上：查一次重建周围 27 节的光照、把方块数据从 PalettedContainer 里读出来、再把整份数据一次调用交给 Rust 侧。\n所以这个开关用三个数字回答\"一次区块重建要花多少、花在哪一段\"，而不是靠猜。\n开启期间平均值显示在 F3 界面上，计数按 offer 计，因此没活干的帧不会有数字。\n默认关闭：它是每节每相一次读时钟，关掉时完全没有开销。这是 wgpu-section-timing 标记文件的开关形式。"
+  "wgpu_mc.option.section_timing.tooltip": "分相计时区块喂送路径并给出平均值。\n这条路径跑在 Minecraft 的区块构建线程上：查一次重建周围 27 节的光照、把方块数据从 PalettedContainer 里读出来、再把整份数据一次调用交给 Rust 侧。\n所以这个开关用三个数字回答\"一次区块重建要花多少、花在哪一段\"，而不是靠猜。\n开启期间平均值显示在 F3 界面上，计数按 offer 计，因此没活干的帧不会有数字。\n默认关闭：它是每节每相一次读时钟，关掉时完全没有开销。这是 wgpu-section-timing 标记文件的开关形式。",
+  "wgpu_mc.option.upload_report": "上传上报",
+  "wgpu_mc.option.upload_report.tooltip": "报告渲染器缓冲上传做了什么：每次写入常量缓冲的映射写及其携带的头几个整数、这些字节是否真的到达了缓冲（做法是从 GPU 读回来比对，所以这条上报本身要花一次拷贝和一次映射），以及这类写每秒一次的暂存统计。\n怀疑某次上传没落地时开这个开关：\"mapped write to … first 12 ints\" 和 \"the bytes written to … did not arrive\" 这两行能把\"收到了错误的字节\"和\"一个字节都没收到\"区分开。\n默认关闭，并且与上面的\"日志\"开关相互独立，因为它是每次上传一行，而回读是每次上传一次拷贝。这是 wgpu-upload-report 标记文件的开关形式。"
 }

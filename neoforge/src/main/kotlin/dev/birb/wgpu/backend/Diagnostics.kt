@@ -167,6 +167,35 @@ object Diagnostics {
     fun sectionTimingEnabled(): Boolean = sectionTiming
 
     /**
+     * The marker file that turns the upload reports on, next to the run directory.
+     *
+     * The three reports it covers are the ones that answer "did this upload land": what a mapped
+     * write put in the buffer, whether those bytes are in the buffer afterwards, and how much staging
+     * those writes went through. A *file* as well as a setting, because the question is asked while
+     * looking at an upload that misbehaved, and the run that misbehaves is rarely one started from
+     * the options screen.
+     */
+    const val UPLOAD_MARKER = "wgpu-upload-report"
+
+    /** The renderer setting behind the upload reports. */
+    const val UPLOAD_SETTING = "upload_report"
+
+    /**
+     * Whether the renderer reports what its buffer uploads did.
+     *
+     * Deliberately *not* turned on by the logging switch: these are a line per upload - one per cloud
+     * layer per frame - and the verification half reads the buffer back from the GPU, which is a copy
+     * and a map per upload. A session that wants the renderer's log lines does not necessarily want
+     * either, which is why this is the one switch in this file that stands on its own.
+     */
+    @Volatile
+    private var uploads: Boolean = resolveUploads()
+
+    /** Whether the upload reports are on. */
+    @JvmStatic
+    fun uploadsEnabled(): Boolean = uploads
+
+    /**
      * Re-resolves both switches, which the options screen calls when the switches are applied.
      *
      * The renderer resolves the same settings on its own side when it receives them, so the two
@@ -201,6 +230,15 @@ object Diagnostics {
             )
         }
 
+        val uploadValue = resolveUploads()
+        if (uploadValue != uploads) {
+            uploads = uploadValue
+            dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                "wgpu: the upload reports are now {}",
+                if (uploadValue) "on" else "off",
+            )
+        }
+
         val timingValue = resolveSectionTiming()
         if (timingValue != sectionTiming) {
             sectionTiming = timingValue
@@ -210,6 +248,10 @@ object Diagnostics {
             )
         }
     }
+
+    /** The upload-report switch: the renderer's setting, or its marker file. */
+    private fun resolveUploads(): Boolean =
+        RendererSettings.bool(UPLOAD_SETTING) == true || Files.exists(Path.of(UPLOAD_MARKER))
 
     /** The section-timing switch: the renderer's setting, or its marker file. */
     private fun resolveSectionTiming(): Boolean =

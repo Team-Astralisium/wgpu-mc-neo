@@ -3,9 +3,9 @@ package dev.birb.wgpu.mixin;
 import dev.birb.wgpu.WgpuMcMod;
 import dev.birb.wgpu.backend.Diagnostics;
 import dev.birb.wgpu.render.Wgpu;
-import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.DebugScreenOverlay;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 
@@ -46,7 +46,7 @@ public class DebugHUDMixin {
             index = 1
     )
     private static List<String> wgpu_mc$reportRightColumn(List<String> lines) {
-        report("right", lines);
+        wgpu_mc$report("right", lines);
         return lines;
     }
 
@@ -62,7 +62,7 @@ public class DebugHUDMixin {
     private static List<String> wgpu_mc$addDiagnostics(List<String> lines) {
         if (WgpuMcMod.ENTRIES > 0) {
             lines.add("[Neolectrum] texSubImage2D call count: " + Wgpu.getTimesTexSubImageCalled());
-            lines.add("[Neolectrum] avg uploading entities: " + (WgpuMcMod.TIME_SPENT_ENTITIES / WgpuMcMod.ENTRIES) + "ns");
+            lines.add("[Neolectrum] avg uploading entities: " + (WgpuMcMod.TIME_SPENT_ENTITIES / WgpuMcMod.ENTRIES / 1E6) + "ms");
         }
 
         // The section feed, phase by phase, averaged over the rebuilds it has served: what Minecraft's
@@ -77,7 +77,7 @@ public class DebugHUDMixin {
                     + (WgpuMcMod.SECTION_PAYLOAD_BYTES.sum() / offers) + " B");
         }
 
-        report("left", lines);
+        wgpu_mc$report("left", lines);
         return lines;
     }
 
@@ -88,8 +88,9 @@ public class DebugHUDMixin {
      * version and the system block on one side, the biome and the player's position on the other -
      * and a screenshot only ever shows the top of the column that happens to be on screen.
      */
-    private static void report(String column, List<String> lines) {
-        if (!Diagnostics.loggingEnabled() || !REPORTED.add(column)) {
+    @Unique
+    private static void wgpu_mc$report(String column, List<String> lines) {
+        if (!Diagnostics.loggingEnabled() || !wgpu_mc$REPORTED.add(column)) {
             return;
         }
 
@@ -97,5 +98,6 @@ public class DebugHUDMixin {
     }
 
     /** Diagnostics are reported once per session and per column, not once per frame. */
-    private static final java.util.Set<String> REPORTED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    @Unique
+    private static final java.util.Set<String> wgpu_mc$REPORTED = java.util.concurrent.ConcurrentHashMap.newKeySet();
 }

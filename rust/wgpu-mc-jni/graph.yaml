@@ -1,10 +1,30 @@
 version: "0.0.1"
 support: wgsl
-resources:
-  texture_sky_sun:
-    type: texture_2d
-    src: "minecraft:textures/environment/sun.png"
-  texture_sky_moon:
-    type: texture_2d
-    src: "minecraft:textures/environment/moon_phases.png"
+resources: {}
 pipelines:
+  # The terrain pass: the chunk sections the Rust baker meshed, drawn from the arena the section feed
+  # fills (`scene.chunk_buffer`). The vertex data is read out of that storage buffer by the shader -
+  # `@geo_terrain` carries no vertex buffers at all - and the pass is drawn once per frame per section
+  # the camera can see. See `RenderGraph::render` and `Scene`.
+  #
+  # The block atlas and the sampler are registered by `RenderGraph::new` itself, and the three
+  # matrices are the buffers `application.rs` creates; `@texture_depth` is the scene's own depth
+  # texture and `@framebuffer_texture` is whatever the caller hands the pass as its target.
+  terrain:
+    geometry: "@geo_terrain"
+    depth: "@texture_depth"
+    output: [ "@framebuffer_texture" ]
+    # Minecraft's main target is an `Rgba8Unorm` texture of its own, not the surface: a pipeline built
+    # for the swapchain's `Bgra8Unorm` is refused by wgpu the moment it is set in a pass.
+    output_format: rgba8unorm
+    blending: replace
+    bind_groups:
+      0:
+        0: "@mat4_model"
+        1: "@mat4_view"
+        2: "@mat4_perspective"
+        3: "@texture_block_atlas"
+        4: "@sampler"
+      1: "@bg_ssbo_chunks"
+    immediates:
+      0: "@pc_section_position"

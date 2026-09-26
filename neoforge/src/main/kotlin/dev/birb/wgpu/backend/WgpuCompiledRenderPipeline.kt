@@ -629,12 +629,25 @@ private class VariantsReleaser(private val variants: Variants) : Runnable {
  * indexed by and what `draw_call` walks on the native side. This is the table that maps the
  * *names* Minecraft binds under onto those slots, once per compiled pipeline, instead of a
  * name lookup per binding per draw.
+ *
+ * It is also where the *combinations* of those slots are numbered, because a pipeline's slots are
+ * the only thing that decides what a combination of them means.
  */
 class PlanBindings internal constructor(
     /** The pipeline this plan belongs to, which every log line about this plan names. */
     @JvmField val label: String,
     /** Slot `i`: the `WmNative.DRAW_BINDING_*` kind the plan expects there. */
     @JvmField val kinds: IntArray,
+    /**
+     * Slot `i`: whether the binding there may carry its offset with the draw rather than have it
+     * baked into the bind group.
+     *
+     * Those are exactly the offsets a draw's combination leaves out, which is what makes a
+     * combination stable across the draws that share a bind group: two draws of the same sections
+     * with the same buffers differ in the offsets they ride at, and numbering them apart would put
+     * every one of them in a bind group of its own.
+     */
+    @JvmField val dynamicSlots: BooleanArray,
 ) {
     private val slots = HashMap<String, IntArray>()
 
@@ -643,6 +656,22 @@ class PlanBindings internal constructor(
 
     /** Requests that only resolved through [shimSuffixFallback] and were reported, by request name. */
     private val fallbacksReported = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * How many of this plan's slots may carry their offset with the draw.
+     *
+     * Called once per pass, when it binds the pipeline: no slot of the plan means no draw of it needs
+     * the binding table read at all, which is the difference between one native call per draw and one
+     * call per draw *plus* a walk over its slots.
+     */
+    fun dynamicSlotCount(): Int {
+        var count = 0
+        for (dynamic in dynamicSlots) {
+            if (dynamic) count++
+        }
+
+        return count
+    }
 
     internal fun put(name: String, slots: IntArray) {
         this.slots[name] = slots
@@ -765,12 +794,89 @@ class PlanBindings internal constructor(
     }
     val count: Int get() = kinds.size
 
+    /**
+     * The number this set of bindings is known by, minting one the first time it is seen.
+     *
+     * [stamps] holds one value per slot - see `WgpuRenderPass.combination` for what goes into one -
+     * and only the first [count] entries are read, because that is how many slots the plan has. The
+     * number is what the native side keys its bind groups by, so it has to mean one set of bindings
+     * and nothing else: two sets that stamp the same are one entry, and a set that stamps
+     * differently gets a number of its own. The numbers come from one counter for the whole process,
+     * so a number minted here can never mean something under another plan.
+     *
+     * The scan is exact rather than a hash comparison: a stamp is a mix of a resource's address and
+     * its slice, and two of them landing on the same `Long` would be two draws sharing a bind group
+     * they should not. A hash is only used to pick the bucket to scan.
+     *
+     * Called on the render thread, from the pass that has just changed its bindings: a draw whose
+     * bindings are the ones the last draw of that pass had does not come here at all.
+     */
+    fun combinationOf(stamps: LongArray, count: Int): Int {
+        val key = combinationKey(stamps, count)
+
+        combinations[key]?.let { bucket ->
+            for (known in bucket) {
+                if (java.util.Arrays.equals(known.stamps, 0, count, stamps, 0, count)) {
+                    return known.id
+                }
+            }
+        }
+
+        val id = NEXT_COMBINATION.getAndIncrement()
+        val bucket = combinations.getOrPut(key) { ArrayList(2) }
+        bucket.add(Combination(id, stamps.copyOf(count)))
+        combinationCount++
+
+        // A plan binds a bounded set of things, so a table that keeps growing is one that is being
+        // fed addresses it will never see again - a buffer per frame, say. Dropping it costs a
+        // number per combination the next time each is drawn, and nothing else: the numbers already
+        // handed out keep meaning what they meant, and the native side keeps the groups it built.
+        if (combinationCount > MAX_COMBINATIONS) {
+            combinations.clear()
+            combinationCount = 0
+        }
+
+        return id
+    }
+
+    /** A hash of [stamps] to bucket the scan by; it never decides whether two stamps are equal. */
+    private fun combinationKey(stamps: LongArray, count: Int): Long {
+        var key = COMBINATION_MIX * (count + 1)
+        for (slot in 0 until count) {
+            key = (key xor stamps[slot]) * COMBINATION_MIX
+        }
+
+        return key
+    }
+
+    /** One numbered set of bindings: the number, and the stamps it was minted for. */
+    private class Combination(@JvmField val id: Int, @JvmField val stamps: LongArray)
+
+    /** The combinations seen so far, by [combinationKey]. */
+    private val combinations = HashMap<Long, ArrayList<Combination>>()
+
+    private var combinationCount = 0
+
     private companion object {
         /** The suffixes `preprocessing.rs` puts on the two halves of a combined sampler. */
         const val TEXSHIM_SUFFIX = "_wm_texshim"
         const val SAMPLER_SUFFIX = "_wm_sampler"
+
+        /** `0x9E3779B97F4A7C15`, the odd constant the native side's fold multiplies by. */
+        const val COMBINATION_MIX = -7046029254386353131L
+
+        /** How many combinations one plan numbers before its table is dropped and started over. */
+        const val MAX_COMBINATIONS = 4096
     }
 }
+
+/**
+ * The next combination number, for the whole process.
+ *
+ * Numbers are never reused, which is what lets the native side treat one as the identity of a bind
+ * group without knowing which plan minted it.
+ */
+private val NEXT_COMBINATION = java.util.concurrent.atomic.AtomicInteger(1)
 
 /**
  * Reads the plan's binding table out of the native pipeline.
@@ -799,7 +905,8 @@ internal fun readPlanBindings(pipeline: MemorySegment, label: String): PlanBindi
         }
 
         val kinds = IntArray(count)
-        val table = PlanBindings(label, kinds)
+        val dynamicSlots = BooleanArray(count)
+        val table = PlanBindings(label, kinds, dynamicSlots)
         val textures = HashMap<String, Int>()
         val samplers = HashMap<String, Int>()
 
@@ -808,8 +915,10 @@ internal fun readPlanBindings(pipeline: MemorySegment, label: String): PlanBindi
             val name = arena.readString(entries, base + WmNative.PLAN_BINDING_NAME)
             val declared = arena.readString(entries, base + WmNative.PLAN_BINDING_DECLARED_NAME)
             val kind = entries.get(WmNative.INT, base + WmNative.PLAN_BINDING_KIND)
+            val dynamic = entries.get(WmNative.INT, base + WmNative.PLAN_BINDING_DYNAMIC)
 
             kinds[slot] = kind
+            dynamicSlots[slot] = dynamic != 0
 
             when (kind) {
                 WmNative.DRAW_BINDING_TEXTURE -> textures[declared] = slot

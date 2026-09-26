@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use crate::device::{
     BlazePipeline, LIVE_BIND_GROUP_COUNT, count_bind_groups, count_cache_hit, count_cache_miss,
-    count_draw, count_pipeline_bind, count_vertices, fan_indices, log_pipeline_once, quad_indices,
-    trace_draw, trace_pipeline,
+    count_draw, count_numbered, count_pipeline_bind, count_tableless, count_vertices, fan_indices,
+    log_pipeline_once, quad_indices, trace_draw, trace_pipeline,
 };
 use log::info;
 use rustc_hash::FxHashMap;
@@ -214,18 +214,20 @@ pub struct DrawCall {
     pub bindings: [DrawBinding; MAX_DRAW_BINDINGS],
     /// The JVM's number for "this set of bindings", or zero when it did not send one.
     ///
-    /// A combination is everything a bind group is built from except the dynamic offsets: the plan
-    /// and, per slot, the resource and any offset that gets baked in. The JVM resolves it to a small
-    /// integer once and hands that over per draw, which is what turns the per-draw question from a
-    /// walk over every binding into an integer comparison. Zero means "work it out from the table
-    /// below", which is what a JVM that does not number combinations sends.
+    /// A combination is everything a bind group is built from except the offsets that travel with the
+    /// draw: the plan and, per slot, the resource, the length and any offset that gets baked in. The
+    /// JVM resolves it to a small integer once and hands that over per draw, which is what turns the
+    /// per-draw question from a walk over every binding into an integer comparison. Zero means "work
+    /// it out from the table below", which is what a JVM that does not number combinations sends.
     pub combo: u32,
-    /// Whether [`Self::bindings`] is the table this `combo` was built from.
+    /// Whether [`Self::bindings`] carries what [`Self::combo`] left out.
     ///
-    /// The pass may hold this combination already, or the cache may know it, without looking at the
-    /// table at all - that is the point of the id. When neither knows it and this is zero, the draw
-    /// is refused (`draw_call` returns false) rather than built from a table that describes whatever
-    /// the JVM drew last; the JVM then re-sends the bindings and draws again.
+    /// The number is the identity of the bind groups, so the table is only ever read for the offsets
+    /// of the bindings whose offsets travel with the draw - and a plan whose bindings all bake theirs
+    /// (no [`PlanBinding::dynamic`] slot anywhere) sends zero here, which is a draw this side answers
+    /// without touching the table at all. When the number is new *and* this is zero, the draw is
+    /// refused (`draw_call` returns false) rather than bound from a table that describes whatever the
+    /// JVM drew last; the JVM then sends the bindings with it and draws again.
     pub bindings_present: u32,
 }
 
@@ -276,7 +278,15 @@ pub struct PlanBinding {
     pub binding: u32,
     /// One of the `DRAW_BINDING_*` constants: what has to be bound here.
     pub kind: u32,
-    pub _pad: u32,
+    /// Whether this binding's offset may travel with the draw instead of being baked into the bind
+    /// group, which is a uniform binding of a plan that has one.
+    ///
+    /// A slot marked here is the one thing the JVM leaves out of the combination it numbers a draw
+    /// under ([`DrawCall::combo`]): the number is then the identity of the *bind groups*, and the
+    /// offsets of the slots this side still has to bake are folded back into the key instead. The
+    /// flag is deliberately generous - it says "may", not "will" - because a slot that turns out to
+    /// be baked is covered by that fold.
+    pub dynamic: u32,
 }
 
 impl PlanBinding {
@@ -287,6 +297,20 @@ impl PlanBinding {
             PlannedResource::Sampler => DRAW_BINDING_SAMPLER,
         }
     }
+}
+
+/// Whether a binding's offset may travel with the draw rather than be baked into the bind group.
+///
+/// A uniform binding of a plan that has any: it is the only binding whose offset `set_bind_group`
+/// can be handed per draw (see [`dynamic_offset`]), and so the only one whose offset a combination
+/// may leave out. This is what [`PlanBinding::dynamic`] reports, and the two sides read it as one
+/// rule - a draw that arrives without its binding table is one whose plan has no such slot, which is
+/// also why the offsets all being zero is not an assumption but the same statement.
+///
+/// The flag is about what *can* travel, not what does: whether a given offset is aligned enough to
+/// travel is decided per draw, and the ones that turn out to be baked are folded into the key.
+fn may_travel(has_uniforms: bool, resource: &PlannedResource) -> bool {
+    has_uniforms && matches!(resource, PlannedResource::Uniform { .. })
 }
 
 /// A render pass, and the bind groups it has built.
@@ -835,7 +859,7 @@ pub extern "C" fn pipeline_bindings(
                 set: set as u32,
                 binding: binding.binding,
                 kind: PlanBinding::kind_of(&binding.resource),
-                _pad: 0,
+                dynamic: u32::from(may_travel(pipeline.plan.has_uniforms, &binding.resource)),
             };
 
             // Safety: `slot < capacity`, and the caller guarantees `capacity` writable entries.
@@ -1081,7 +1105,40 @@ fn bind_groups_for_call(
     };
     let mut slot = 0usize;
 
-    for (set, bindings_in_set) in plan.sets.iter().enumerate() {
+    // Numbered, and the table left behind: the number covers every binding and the offsets are all
+    // zero. That holds exactly when the plan has no uniform binding, a uniform being the only
+    // binding whose offset can travel with the draw - and it is the same condition the JVM numbers
+    // such a draw under, so the two sides agreeing is what this reads. If they ever disagree the
+    // draw is refused rather than bound with whatever offsets the last draw left in the pass.
+    let table_needed = numbering && call.bindings_present == 0;
+
+    if table_needed {
+        if plan.has_uniforms {
+            return GroupsForCall {
+                key,
+                groups: None,
+                unknown: true,
+            };
+        }
+
+        offsets_len.fill(0);
+    }
+
+    // Diagnostics: a draw that came numbered, and one whose number was the whole table. They say
+    // whether the JVM is numbering combinations at all and how often the table was skipped - and
+    // they are counted here rather than on the way in, because a draw refused below is one the JVM
+    // sends again with the bindings and it would be counted twice.
+    count_numbered();
+
+    if table_needed {
+        count_tableless();
+    }
+
+    // Nothing to walk when the number is the whole table: the loop below reads the call's bindings,
+    // and those are the one thing a table-less draw does not carry.
+    let sets = if table_needed { &[][..] } else { &plan.sets[..] };
+
+    for (set, bindings_in_set) in sets.iter().enumerate() {
         let mut count = 0usize;
 
         for binding in bindings_in_set.iter() {
@@ -1100,20 +1157,18 @@ fn bind_groups_for_call(
                     let range = entry.offset..entry.offset + entry.length;
 
                     if numbering {
-                        // The JVM's number already covers the resource, the length and any offset
-                        // that is baked in, so the only question left is whether this slot's offset
-                        // travels with the draw. That needs the alignment, not the buffer.
-                        offsets[set][count] = if dynamic_offset(
-                            plan,
-                            binding,
-                            &range,
-                            alignment,
-                            min_size.is_some(),
-                        ) {
-                            range.start as wgpu::DynamicOffset
+                        // The JVM's number already covers the resource and the length, and the offset
+                        // too unless it travels with the draw - so the only question left here is
+                        // whether this slot's offset travels, which needs the alignment, not the
+                        // buffer. One that does not travel is baked into the bind group, and the
+                        // number had to leave it out: it goes into the key here, which is what keeps
+                        // two draws whose baked offsets differ from sharing one group.
+                        if dynamic_offset(plan, binding, &range, alignment, min_size.is_some()) {
+                            offsets[set][count] = range.start as wgpu::DynamicOffset;
                         } else {
-                            0
-                        };
+                            key = fold(key, range.start);
+                            offsets[set][count] = 0;
+                        }
 
                         count += 1;
                         continue;
@@ -1175,7 +1230,9 @@ fn bind_groups_for_call(
         offsets_len[set] = count;
     }
 
-    if crate::debug::trace_dynamic_offsets() && trace_filter_matches(&plan.name) {
+    // The trace reads the call's bindings, so a table-less draw has nothing to trace: what it would
+    // print is the table the JVM drew something else with.
+    if !table_needed && crate::debug::trace_dynamic_offsets() && trace_filter_matches(&plan.name) {
         trace_call(plan, call, alignment, key);
     }
 
@@ -1326,9 +1383,6 @@ fn bind_groups_for_call(
 /// This is the whole per-draw ABI: it used to be a pipeline bind, one bind per uniform, one per
 /// sampler, one per buffer and then the draw, each with its own name lookup on the native side.
 pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
-    count_draw();
-    trace_draw();
-
     if call.pipeline.is_null() {
         panic!("wgpu-mc: a draw arrived with no pipeline bound");
     }
@@ -1428,6 +1482,11 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
     if outcome.unknown {
         return false;
     }
+
+    // Counted here rather than on the way in, because a refused draw is not one: the JVM sends the
+    // bindings and calls again, and counting both would report twice the draws the frame made.
+    count_draw();
+    trace_draw();
 
     if let Some(built) = outcome.groups {
         *groups = Some(built);
@@ -2109,6 +2168,39 @@ impl GpuFormat {
             | GpuFormat::S8_UINT
             | GpuFormat::None => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slot that may travel is a uniform of a plan that has one, and nothing else.
+    ///
+    /// This is the rule the two sides of the combination ABI share: the JVM leaves such a slot's
+    /// offset out of the number it mints, and a draw that arrives without its binding table is one
+    /// whose plan marked no slot at all. If this ever answered yes for a storage buffer - whose
+    /// offset is baked into the group, because DX12 has no offset for a storage descriptor - a
+    /// table-less draw would bind whatever offset the last group was built with and nothing here
+    /// would fold it back into the key.
+    #[test]
+    fn only_a_uniform_of_a_plan_that_has_one_may_carry_its_offset() {
+        let uniform = PlannedResource::Uniform { min_size: Some(64) };
+        let storage = PlannedResource::Storage;
+        let texture = PlannedResource::Texture { cube: false };
+        let sampler = PlannedResource::Sampler;
+
+        assert!(may_travel(true, &uniform));
+        assert!(!may_travel(false, &uniform));
+        assert!(!may_travel(true, &storage));
+        assert!(!may_travel(true, &texture));
+        assert!(!may_travel(true, &sampler));
+
+        // The flag the JVM reads is the plan's, and the condition the table-less path checks is the
+        // same one: a plan that marks no slot is a plan with no uniform binding, so its offsets are
+        // all zero and its draws are answered without the table.
+        assert_eq!(PlanBinding::kind_of(&uniform), DRAW_BINDING_BUFFER);
+        assert_eq!(PlanBinding::kind_of(&storage), DRAW_BINDING_BUFFER);
     }
 }
 

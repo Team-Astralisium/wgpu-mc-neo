@@ -7,7 +7,7 @@ struct PushConstant {
     color: vec3<f32>
 }
 
-var<push_constant> pc: PushConstant;
+var<immediate> pc: PushConstant;
 
 const VERTS = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, 1.0),

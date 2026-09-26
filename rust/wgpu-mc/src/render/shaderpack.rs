@@ -143,6 +143,10 @@ fn blend_default() -> String {
     "alpha_blending".into()
 }
 
+fn output_format_default() -> String {
+    "bgra8unorm".into()
+}
+
 #[derive(Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BindGroupDef {
@@ -156,6 +160,15 @@ pub struct PipelineConfig {
 
     #[serde(default)]
     pub output: Vec<String>,
+
+    /// The format of the colour attachments this pipeline draws into.
+    ///
+    /// Part of the pipeline rather than of the pass, because wgpu builds the pipeline against it: a
+    /// pipeline built for `bgra8unorm` cannot be set in a pass whose target is `rgba8unorm`, and the
+    /// error is a validation error at the first draw rather than at the pass. A renderer that presents
+    /// to a swapchain is `bgra8unorm` there and `rgba8unorm` when it draws into a texture of its own.
+    #[serde(default = "output_format_default")]
+    pub output_format: String,
 
     pub depth: Option<String>,
 
@@ -191,37 +204,63 @@ mod tests {
 
     use serde::Deserialize;
 
-    use super::ShaderPackConfig;
+    use super::{
+        BindGroupDef, LonghandResourceConfig, Mat3ValueOrMult, Mat4ValueOrMult, ShaderPackConfig,
+        ShorthandResourceConfig, TypeResourceConfig,
+    };
 
-    fn deserialize_and_print_error<'a, T: Debug + Deserialize<'a>>(input: &'a str) {
+    fn deserialize_and_print_error<'a, T: Debug + Deserialize<'a>>(input: &'a str) -> T {
         let config: Result<T, _> = serde_norway::from_str(input);
-        println!("{config:?}");
-        if let Err(err) = config {
+        if let Err(err) = &config {
             if let Some(loc) = err.location() {
                 let lines: Vec<&str> = input.lines().collect();
-                let line = lines[loc.line()];
-                println!("{}:{}{:?}", loc.line(), loc.column(), line);
+                println!("{}:{} {:?}", loc.line(), loc.column(), lines[loc.line()]);
             }
-            panic!();
+            panic!("{err}");
         }
+
+        config.unwrap()
     }
 
+    /// Every field the schema has, in one file: one resource of each type, in both the shorthand and
+    /// the longhand spelling, and pipelines that use each field a pipeline has.
+    ///
+    /// This is what the schema is read against, and it is not only about the file parsing: a field
+    /// this file spells and `serde` no longer knows is dropped in *silence*. `uniforms:` was the name
+    /// of what is `bind_groups:` now, and a file written against the old spelling deserializes into a
+    /// pipeline with no bindings and no complaint - which is a pass that draws nothing, three layers
+    /// away from the line that would have said so. [`complete_file`] checks the values came out where
+    /// the schema says they go, so a rename lands here rather than in a screenshot.
     const FULL_YAML: &str = r#"
 version: "0.0.1"
 support: glsl # could also be wgsl
 resources:
+  # Shorthands: a bare number or matrix is a value.
+  shorthand_int: 2
+  shorthand_float: 0.5
+  shorthand_mat3:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  # Longhand, one per type the schema names.
+  blob_test:
+    type: blob
+    src: "minecraft:textures/effect/dither.png"
+    size: 256
   shadowmap_texture_depth:
     type: texture_depth
+    desc: The depth buffer the shadow pass writes
+    show: true
+  texture_3d_test:
+    type: texture_3d
+    src: "minecraft:textures/atlas/blocks.png"
     clear_after_frame: true
-  shadow_ortho_mat4:
-    type: mat4
-    value: # this is just an identity matrix, it would be something different in practice
-      - [1.0, 0.0, 0.0, 0.0]
-      - [0.0, 1.0, 0.0, 0.0]
-      - [0.0, 0.0, 1.0, 0.0]
-      - [0.0, 0.0, 0.0, 1.0]
+  texture_2d_test:
+    type: texture_2d
+    src: "minecraft:textures/environment/sun.png"
   i32_test:
     type: i32
+    range: [0, 100]
     value: 2
   int_test:
     type: i64
@@ -235,53 +274,173 @@ resources:
     type: f64
     range: [-1000.0, 1000.0]
     value: 0.0
-    desc: This is a floating-point variable with 64 bits length
+  shadow_ortho_mat4:
+    type: mat4
+    value: # this is just an identity matrix, it would be something different in practice
+      - [1.0, 0.0, 0.0, 0.0]
+      - [0.0, 1.0, 0.0, 0.0]
+      - [0.0, 0.0, 1.0, 0.0]
+      - [0.0, 0.0, 0.0, 1.0]
   model_view_mat4:
     type: mat4
     mult: [wm_model_mat4, wm_view_mat4]
-  mvp_mat4:
-    type: mat4
-    mult: [wm_model_mat4, wm_view_mat4, wm_projection_mat4]
+  ortho_mat3:
+    type: mat3
+    mult: [wm_model_mat3]
 pipelines:
   terrain_shadows:
-    geometry: wm_geo_terrain # one
+    geometry: "@geo_terrain" # one
     depth: shadowmap_texture_depth
-    uniforms:
-      0:
-        resource: model_view_mat4
-        visibility: [vert]
-      1:
-        resource: shadow_ortho_mat4
-        visibility: [vert]
-
-  entity_shadows:
-    geometry: wm_geo_entities
-    depth: shadowmap_texture_depth
-    uniforms:
-      0:
-        resource: model_view_mat4
-        visibility: [vert]
-      1:
-        resource: shadow_ortho_mat4
-        visibility: [vert]
-      2:
-        resource: wm_ssbo_entity_part_transforms
-        visibility: [vert]
-
-  terrain:
-    geometry: wm_geo_terrain
-    depth: wm_framebuffer_depth
     output: [wm_framebuffer_texture]
+    clear: true
+    blending: replace
+    bind_groups:
+      0:
+        0: shadow_ortho_mat4
+        1: model_view_mat4
+      1: "@bg_ssbo_chunks"
+    immediates:
+      0: "@pc_section_position"
   entities:
-    geometry: wm_geo_entities
+    geometry: "@geo_entities"
     depth: wm_framebuffer_depth
     output: [wm_framebuffer_texture]
     bind_groups:
-      
+      0: "@bg_entity"
 "#;
 
     #[test]
     fn complete_file() {
-        deserialize_and_print_error::<ShaderPackConfig>(FULL_YAML);
+        let config: ShaderPackConfig = deserialize_and_print_error(FULL_YAML);
+
+        assert_eq!(config.version, "0.0.1");
+        assert_eq!(config.support, "glsl");
+
+        let resources = &config.resources.resources;
+
+        // The shorthands, which are a value with no type written down.
+        assert!(matches!(
+            resources.get("shorthand_int"),
+            Some(ShorthandResourceConfig::Int(2))
+        ));
+        assert!(matches!(
+            resources.get("shorthand_float"),
+            Some(ShorthandResourceConfig::Float(value)) if *value == 0.5
+        ));
+        assert!(matches!(
+            resources.get("shorthand_mat3"),
+            Some(ShorthandResourceConfig::Mat3(_))
+        ));
+
+        // Longhand, by type.
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { common, typed })) =
+            resources.get("shadowmap_texture_depth")
+        else {
+            panic!("shadowmap_texture_depth is a longhand resource");
+        };
+        assert!(matches!(typed, TypeResourceConfig::TextureDepth));
+        assert!(common.show);
+        assert_eq!(common.desc, "The depth buffer the shadow pass writes");
+
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
+            resources.get("blob_test")
+        else {
+            panic!("blob_test is a longhand resource");
+        };
+        assert!(matches!(typed, TypeResourceConfig::Blob { size: 256, .. }));
+
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
+            resources.get("texture_3d_test")
+        else {
+            panic!("texture_3d_test is a longhand resource");
+        };
+        assert!(matches!(
+            typed,
+            TypeResourceConfig::Texture3d {
+                clear_after_frame: true,
+                ..
+            }
+        ));
+
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
+            resources.get("i32_test")
+        else {
+            panic!("i32_test is a longhand resource");
+        };
+        assert!(matches!(
+            typed,
+            TypeResourceConfig::I32 {
+                range: [0, 100],
+                value: 2
+            }
+        ));
+
+        // A matrix is either a value or a product of other resources, and the two are told apart by
+        // which key is there rather than by the type.
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
+            resources.get("shadow_ortho_mat4")
+        else {
+            panic!("shadow_ortho_mat4 is a longhand resource");
+        };
+        assert!(matches!(typed, TypeResourceConfig::Mat4(Mat4ValueOrMult::Value { .. })));
+
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
+            resources.get("model_view_mat4")
+        else {
+            panic!("model_view_mat4 is a longhand resource");
+        };
+        let TypeResourceConfig::Mat4(Mat4ValueOrMult::Mult { mult }) = typed else {
+            panic!("model_view_mat4 is a product, not a value");
+        };
+        assert_eq!(mult.join(","), "wm_model_mat4,wm_view_mat4");
+
+        let Some(ShorthandResourceConfig::Longhand(LonghandResourceConfig { typed, .. })) =
+            resources.get("ortho_mat3")
+        else {
+            panic!("ortho_mat3 is a longhand resource");
+        };
+        assert!(matches!(typed, TypeResourceConfig::Mat3(Mat3ValueOrMult::Mult { .. })));
+
+        // A pipeline, field by field, including the defaults of the ones it leaves out.
+        let terrain = config
+            .pipelines
+            .pipelines
+            .get("terrain_shadows")
+            .expect("the file has a terrain_shadows pipeline");
+
+        assert_eq!(terrain.geometry, "@geo_terrain");
+        assert_eq!(terrain.depth.as_deref(), Some("shadowmap_texture_depth"));
+        assert_eq!(terrain.output, ["wm_framebuffer_texture"]);
+        assert!(terrain.clear);
+        assert_eq!(terrain.blending, "replace");
+        assert_eq!(
+            terrain.immediates.get(&0).map(String::as_str),
+            Some("@pc_section_position")
+        );
+
+        let Some(BindGroupDef::Entries(entries)) = terrain.bind_groups.get(&0) else {
+            panic!("bind group 0 is written out entry by entry");
+        };
+        assert_eq!(entries.get(&0).map(String::as_str), Some("shadow_ortho_mat4"));
+        assert_eq!(entries.get(&1).map(String::as_str), Some("model_view_mat4"));
+
+        assert!(matches!(
+            terrain.bind_groups.get(&1),
+            Some(BindGroupDef::Resource(resource)) if resource == "@bg_ssbo_chunks"
+        ));
+
+        let entities = config
+            .pipelines
+            .pipelines
+            .get("entities")
+            .expect("the file has an entities pipeline");
+
+        assert!(!entities.clear, "clear is off unless it is asked for");
+        assert_eq!(
+            entities.blending, "alpha_blending",
+            "blending has a default, and a pipeline that leaves it out gets it"
+        );
+        assert!(entities.immediates.is_empty());
+        assert!(entities.depth.is_some());
     }
 }

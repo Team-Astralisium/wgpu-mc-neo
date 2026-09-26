@@ -2,6 +2,7 @@ use glam::ivec3;
 use linked_hash_map::LinkedHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use treeculler::{AABB, BVol, Frustum, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 
@@ -26,6 +27,45 @@ use crate::render::shaderpack::{
 use crate::render::sky::{SkyVertex, SunMoonVertex};
 use crate::texture::TextureAndView;
 use crate::util::WmArena;
+
+/// What the terrain pass has drawn since the last report, and when that was.
+///
+/// Diagnostics, and the numbers the terrain path is checked with: "the graph pass ran and drew the
+/// arena" is a count here rather than a screenshot, and a frustum built from a matrix convention the
+/// culler does not share shows up as everything culled rather than as missing terrain.
+static TERRAIN_DRAWN: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_CULLED: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_EMPTY: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// Reports what the terrain pass drew, once a second and only while the section diagnostics are on.
+///
+/// The counters are always kept - they are relaxed increments on the render thread, one per section -
+/// because the line they feed is the only place a run says whether the Rust terrain reached the
+/// screen at all.
+fn report_terrain_pass() {
+    let drawn = TERRAIN_DRAWN.swap(0, Ordering::Relaxed);
+    let culled = TERRAIN_CULLED.swap(0, Ordering::Relaxed);
+    let empty = TERRAIN_EMPTY.swap(0, Ordering::Relaxed);
+
+    if !crate::mc::chunk::DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if TERRAIN_REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    log::info!(
+        "wgpu-mc: terrain pass: {drawn} section(s) drawn, {culled} culled by the frustum, {empty} \
+         with no solid layer"
+    );
+}
 
 pub trait Geometry: Send + Sync {
     fn render<'graph: 'pass + 'arena, 'pass, 'arena: 'pass>(
@@ -74,7 +114,10 @@ impl ResourceBacking {
                 binding,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    // Filterable, because the shaders this graph builds sample with `textureSample`
+                    // and the atlas is `Rgba8Unorm`: a layout that says otherwise is not a pipeline
+                    // that draws differently, it is one wgpu refuses to create at all.
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -83,7 +126,10 @@ impl ResourceBacking {
             ResourceBacking::Sampler(_) => wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(SamplerBindingType::NonFiltering),
+                // Filtering for the same reason: `textureSample` needs one, and the default sampler
+                // this graph binds is a filtering sampler with nearest filtering - non-filtering is
+                // a different binding type, not a different filter mode.
+                ty: wgpu::BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
         }
@@ -146,6 +192,31 @@ impl RenderGraph {
         let arena = WmArena::new(1024);
 
         for (pipeline_name, pipeline_config) in &self.config.pipelines.pipelines {
+            // A pipeline whose resources are not all registered is skipped rather than unwrapped: this
+            // runs inside a `#[jni_fn]` frame, where a panic aborts the JVM, and the resources a
+            // pipeline names can legitimately be missing - the block atlas is registered by a resource
+            // reload, and a reload that has not reached it yet leaves the terrain shader with nothing
+            // to sample. The rest of the graph is unaffected, and a later reload builds it.
+            let mut missing: Option<&String> = None;
+            'resources: for def in pipeline_config.bind_groups.values() {
+                if let BindGroupDef::Entries(entries) = def {
+                    for resource_id in entries.values() {
+                        if !self.resources.contains_key(resource_id) {
+                            missing = Some(resource_id);
+                            break 'resources;
+                        }
+                    }
+                }
+            }
+
+            if let Some(missing) = missing {
+                log::warn!(
+                    "wgpu-mc: the '{pipeline_name}' pipeline of the render graph names {missing}, \
+                     which is not registered; skipping it"
+                );
+                continue;
+            }
+
             let bind_group_layouts = pipeline_config
                 .bind_groups
                 .iter()
@@ -227,6 +298,19 @@ impl RenderGraph {
                 })
                 .sum();
 
+            // A pipeline that passes immediates needs the device feature for them, and wgpu answers a
+            // layout without it with a validation error rather than a `None` - which, on this path, is
+            // the process ending. There is no way to draw such a pipeline differently, so it is
+            // skipped with the reason.
+            if immediate_size > 0 && !wm.gpu.device.features().contains(wgpu::Features::IMMEDIATES) {
+                log::error!(
+                    "wgpu-mc: the render graph's '{pipeline_name}' pipeline passes {immediate_size} \
+                     byte(s) of immediates per draw, and this device was created without the \
+                     `immediates` feature; skipping it"
+                );
+                continue;
+            }
+
             let layout = wm
                 .gpu
                 .device
@@ -236,14 +320,26 @@ impl RenderGraph {
                     immediate_size,
                 });
 
-            let shader = WgslShader::init(
-                &ResourcePath(format!("wgpu_mc:shaders/{}.wgsl", pipeline_name)),
+            // A pipeline whose shader cannot be read is skipped, for the same reason the resources above
+            // are: the alternative is `unwrap` on a `None` inside a `#[jni_fn]` frame, which aborts the
+            // JVM - and a graph missing one pipeline still draws the rest of the frame. `init` has no
+            // error to report (it is a `None` for "no such resource" and for "not UTF-8"), so the line
+            // names the resource it wanted, which is what the reader needs either way.
+            let shader_resource = ResourcePath(format!("wgpu_mc:shaders/{}.wgsl", pipeline_name));
+            let Some(shader) = WgslShader::init(
+                &shader_resource,
                 &*wm.mc.resource_provider,
                 &wm.gpu.device,
                 "frag".into(),
                 "vert".into(),
-            )
-            .unwrap();
+            ) else {
+                log::error!(
+                    "wgpu-mc: the render graph's '{pipeline_name}' pipeline could not be built: {} is \
+                     missing, or is not a readable WGSL source; skipping it",
+                    shader_resource.0
+                );
+                continue;
+            };
 
             let vertex_buffer = match &pipeline_config.geometry[..] {
                 "@geo_terrain" => vec![],
@@ -308,7 +404,20 @@ impl RenderGraph {
                                 .iter()
                                 .map(|_| {
                                     Some(wgpu::ColorTargetState {
-                                        format: wgpu::TextureFormat::Bgra8Unorm,
+                                        format: match &pipeline_config.output_format[..] {
+                                            "bgra8unorm" => wgpu::TextureFormat::Bgra8Unorm,
+                                            "bgra8unorm_srgb" => wgpu::TextureFormat::Bgra8UnormSrgb,
+                                            "rgba8unorm" => wgpu::TextureFormat::Rgba8Unorm,
+                                            "rgba8unorm_srgb" => wgpu::TextureFormat::Rgba8UnormSrgb,
+                                            "r16float" => wgpu::TextureFormat::R16Float,
+                                            "rgba16float" => wgpu::TextureFormat::Rgba16Float,
+                                            other => unimplemented!(
+                                                "Unknown output format {other}; the pass would have to \
+                                                 be built against the format of the texture it draws \
+                                                 into, and a mismatch is a validation error at the first \
+                                                 draw"
+                                            ),
+                                        },
                                         blend: Some(match &pipeline_config.blending[..] {
                                             "alpha_blending" => wgpu::BlendState::ALPHA_BLENDING,
                                             "premultiplied_alpha_blending" => {
@@ -367,15 +476,35 @@ impl RenderGraph {
                         TypeResourceConfig::Blob { .. } => {}
                         TypeResourceConfig::Texture3d { .. } => {}
                         TypeResourceConfig::Texture2d { src } => {
-                            let bytes = wm
-                                .mc
-                                .resource_provider
-                                .get_bytes(&ResourcePath::from(&src[..]))
-                                .unwrap();
+                            // A texture that cannot be read is left unregistered rather than
+                            // unwrapped: this runs inside a `#[jni_fn]` frame, where a panic aborts the
+                            // JVM, and a pipeline that names it is then skipped by `create_pipelines` -
+                            // which is one pipeline fewer and a line in the log, not a game that ends
+                            // the first time it draws a world.
+                            let Some(bytes) =
+                                wm.mc.resource_provider.get_bytes(&ResourcePath::from(&src[..]))
+                            else {
+                                log::warn!(
+                                    "wgpu-mc: the render graph's {resource_id} names {src}, which \
+                                     this build cannot read; skipping it"
+                                );
+                                continue;
+                            };
 
-                            let tav =
-                                TextureAndView::from_image_file_bytes(&wm.gpu, &bytes, resource_id)
-                                    .unwrap();
+                            let tav = match TextureAndView::from_image_file_bytes(
+                                &wm.gpu,
+                                &bytes,
+                                resource_id,
+                            ) {
+                                Ok(tav) => tav,
+                                Err(err) => {
+                                    log::warn!(
+                                        "wgpu-mc: the render graph's {resource_id} ({src}) could not \
+                                         be decoded: {err}; skipping it"
+                                    );
+                                    continue;
+                                }
+                            };
 
                             resources.insert(
                                 resource_id.clone(),
@@ -400,24 +529,71 @@ impl RenderGraph {
             resources,
         };
 
-        let atlases = wm.mc.texture_manager.atlases.read();
+        // The sampler is always available; the atlas only once a resource reload has baked one. The
+        // two travel together - a pipeline that samples the atlas without it is skipped by
+        // `create_pipelines`, which is a graph with one pipeline fewer rather than no renderer.
+        graph.resources.insert(
+            "@sampler".into(),
+            ResourceBacking::Sampler(wm.mc.texture_manager.default_sampler.clone()),
+        );
 
-        let block_atlas = atlases.get(BLOCK_ATLAS).unwrap();
-
-        graph.resources.extend([
-            (
-                "@texture_block_atlas".into(),
-                ResourceBacking::Texture2D(block_atlas.texture.clone()),
-            ),
-            (
-                "@sampler".into(),
-                ResourceBacking::Sampler(wm.mc.texture_manager.default_sampler.clone()),
-            ),
-        ]);
+        match wm.mc.texture_manager.atlases.read().get(BLOCK_ATLAS) {
+            Some(block_atlas) => {
+                graph.resources.insert(
+                    "@texture_block_atlas".into(),
+                    ResourceBacking::Texture2D(block_atlas.texture.clone()),
+                );
+            }
+            None => {
+                log::warn!(
+                    "wgpu-mc: no block atlas is registered yet, so the render graph's terrain \
+                     pipeline cannot be built; a resource reload that bakes the atlas rebuilds it"
+                );
+            }
+        }
 
         graph.create_pipelines(wm, custom_bind_groups, custom_geometry);
 
         graph
+    }
+
+    /// Records the graph's passes into `encoder`, one pass per pipeline, in the order the config lists
+    /// them.
+    ///
+    /// `depth_override` is the depth texture the passes that name `@texture_depth` attach instead of
+    /// the scene's own: the caller is the one that knows what the frame before and after this pass
+    /// wrote, and a terrain pass that does not share their depth buffer is geometry the rest of the
+    /// frame cannot occlude. `None` uses the scene's texture, which is the standalone case.
+    /// The same, with the culling frustum built from a view-projection matrix.
+    ///
+    /// A caller that has the camera's matrices and nothing else is the common case - the JNI side is
+    /// handed one from Minecraft's camera once a frame - and the frustum's planes are derived from
+    /// that same matrix, so building it here keeps the matrix convention in one place. The matrix is
+    /// column-major, which is the order `glam`, `joml` and the uniform buffer all agree on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_mvp(
+        &self,
+        wm: &WmRenderer,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        render_target: &wgpu::TextureView,
+        depth_override: Option<&wgpu::TextureView>,
+        clear_color: [f32; 3],
+        view_projection: [[f32; 4]; 4],
+    ) {
+        let frustum = Frustum::from_modelview_projection(view_projection);
+        let mut geometry = HashMap::new();
+
+        self.render(
+            wm,
+            encoder,
+            scene,
+            render_target,
+            depth_override,
+            clear_color,
+            &mut geometry,
+            &frustum,
+        );
     }
 
     pub fn render(
@@ -426,6 +602,7 @@ impl RenderGraph {
         encoder: &mut wgpu::CommandEncoder,
         scene: &Scene,
         render_target: &wgpu::TextureView,
+        depth_override: Option<&wgpu::TextureView>,
         clear_color: [f32; 3],
         geometry: &mut HashMap<String, Box<dyn Geometry>>,
         frustum: &Frustum<f32>,
@@ -469,28 +646,39 @@ impl RenderGraph {
                     })
                     .collect::<Vec<_>>(),
                 depth_stencil_attachment: pipeline_config.depth.as_ref().map(|depth_texture| {
-                    let will_clear_depth = should_clear_depth;
+                    // The caller's texture keeps its own contents: it is already the frame's depth
+                    // buffer, and clearing it here would erase whatever the passes before this one
+                    // wrote into it.
+                    let overridden = if depth_texture == "@texture_depth" {
+                        depth_override
+                    } else {
+                        None
+                    };
+
+                    let will_clear_depth = should_clear_depth && overridden.is_none();
                     should_clear_depth = false;
 
-                    let depth_view = if depth_texture == "@texture_depth" {
-                        arena.alloc(scene.depth_texture.read().create_view(
-                            &wgpu::TextureViewDescriptor {
-                                label: None,
-                                format: Some(wgpu::TextureFormat::Depth32Float),
-                                dimension: Some(wgpu::TextureViewDimension::D2),
-                                usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
-                                aspect: Default::default(),
-                                base_mip_level: 0,
-                                mip_level_count: None,
-                                base_array_layer: 0,
-                                array_layer_count: None,
-                            },
-                        ))
-                    } else {
-                        match self.resources.get(depth_texture) {
+                    let depth_view = match overridden {
+                        Some(view) => view,
+                        None if depth_texture == "@texture_depth" => {
+                            arena.alloc(scene.depth_texture.read().create_view(
+                                &wgpu::TextureViewDescriptor {
+                                    label: None,
+                                    format: Some(wgpu::TextureFormat::Depth32Float),
+                                    dimension: Some(wgpu::TextureViewDimension::D2),
+                                    usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+                                    aspect: Default::default(),
+                                    base_mip_level: 0,
+                                    mip_level_count: None,
+                                    base_array_layer: 0,
+                                    array_layer_count: None,
+                                },
+                            ))
+                        }
+                        None => match self.resources.get(depth_texture) {
                             Some(ResourceBacking::Texture2D(view)) => &view.view,
                             _ => unimplemented!("Unknown depth target {}", depth_texture),
-                        }
+                        },
                     };
 
                     RenderPassDepthStencilAttachment {
@@ -548,26 +736,34 @@ impl RenderGraph {
                             AABB::new((a * 16.0).into_array(), (b * 16.0).into_array());
 
                         if !bounds.coherent_test_against_frustum(frustum, 0).0 {
+                            TERRAIN_CULLED.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if let Some(layer) = &section.layers[RenderLayer::Solid as usize] {
-                            let mut pc: HashMap<String, (Vec<u8>, ShaderStages)> = HashMap::new();
-                            //println!("draw {pos}");
-                            pc.insert(
-                                "@pc_section_position".to_string(),
-                                (
-                                    bytemuck::cast_slice(&rel_pos.to_array()).to_vec(),
-                                    ShaderStages::VERTEX,
-                                ),
-                            );
-                            set_push_constants(pipeline_config, &mut render_pass, Some(pc));
-                            render_pass.draw_indexed(
-                                layer.index_range.clone(),
-                                0,
-                                layer.vertex_range.start..layer.vertex_range.start + 1,
-                            );
-                        }
+
+                        let Some(layer) = &section.layers[RenderLayer::Solid as usize] else {
+                            TERRAIN_EMPTY.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+
+                        let mut pc: HashMap<String, (Vec<u8>, ShaderStages)> = HashMap::new();
+                        pc.insert(
+                            "@pc_section_position".to_string(),
+                            (
+                                bytemuck::cast_slice(&rel_pos.to_array()).to_vec(),
+                                ShaderStages::VERTEX,
+                            ),
+                        );
+                        set_push_constants(pipeline_config, &mut render_pass, Some(pc));
+                        render_pass.draw_indexed(
+                            layer.index_range.clone(),
+                            0,
+                            layer.vertex_range.start..layer.vertex_range.start + 1,
+                        );
+
+                        TERRAIN_DRAWN.fetch_add(1, Ordering::Relaxed);
                     }
+
+                    report_terrain_pass();
                 }
                 "@geo_entities" => {
                     render_pass.set_pipeline(&bound_pipeline.pipeline);

@@ -32,7 +32,7 @@ struct PushConstants {
     dimension_fog_color_a: f32,
 }
 
-var<push_constant> data: PushConstants;
+var<immediate> data: PushConstants;
 
 @vertex
 fn vert(

@@ -87,6 +87,14 @@ pub struct Settings {
     /// not.
     #[serde(default = "off")]
     pub section_timing: BoolSetting,
+    /// Whether the renderer reports what its buffer uploads did - see [`SettingInfo::debug`].
+    ///
+    /// Its own switch rather than part of `logging`: these are per-upload lines, one of them reads
+    /// the buffer back from the GPU to check the bytes arrived, and a session that wants the
+    /// renderer's log lines does not necessarily want either. Off by default, and *not* turned on by
+    /// the logging switch, for the same reason.
+    #[serde(default = "off")]
+    pub upload_report: BoolSetting,
 }
 
 /// The default of a setting that is off unless a player asks for it.
@@ -125,6 +133,7 @@ pub struct SettingsInfo {
     gpu_timestamps: SettingInfo,
     pix_capture: SettingInfo,
     section_timing: SettingInfo,
+    upload_report: SettingInfo,
 }
 
 /// The section the options screen puts a setting under, when it is not one of the plain ones.
@@ -288,6 +297,18 @@ lazy_static! {
             missing.",
             true,
         ),
+        upload_report: SettingInfo::debug(
+            "Report what the renderer's buffer uploads did: every mapped write into a constant \
+            buffer, with the first integers it carried, whether the bytes actually arrived in the \
+            buffer - which is checked by reading them back from the GPU, so that report is a copy \
+            and a map of its own - and the staging totals for those writes once a second. It is the \
+            switch to turn on when an upload is suspected of not landing: `mapped write to Cloud UBO \
+            ... first 12 ints` and `the bytes written to ... did not arrive` are the two lines that \
+            tell a buffer that received the wrong bytes apart from one that received none. Off by \
+            default, and independent of the logging switch above, because it is a line per upload and \
+            the readback costs a copy per upload. This is the `wgpu-upload-report` marker as a switch.",
+            false,
+        ),
         section_timing: SettingInfo::debug(
             "Time the section feed, phase by phase, and report the averages. The feed is what runs \
             on Minecraft's chunk-build threads - the light lookup, the block data and the call into \
@@ -446,6 +467,7 @@ impl Default for Settings {
             gpu_timestamps: BoolSetting::of(false),
             pix_capture: BoolSetting::of(false),
             section_timing: BoolSetting::of(false),
+            upload_report: BoolSetting::of(false),
         }
     }
 }
@@ -777,6 +799,7 @@ mod tests {
             "gpu_timestamps",
             "pix_capture",
             "section_timing",
+            "upload_report",
         ] {
             assert_eq!(
                 info[name]["section"],
@@ -891,7 +914,7 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 14] = [
+    const NAME_LIST: [&str; 15] = [
         "backend",
         "vsync",
         "frames_in_flight",
@@ -906,6 +929,7 @@ mod tests {
         "gpu_timestamps",
         "pix_capture",
         "section_timing",
+        "upload_report",
     ];
 
     /// The options screen, pulled in for the one part of it that is a contract with this side: how

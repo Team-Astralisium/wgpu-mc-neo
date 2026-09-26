@@ -125,27 +125,59 @@ impl SectionStorage {
                 }
             }
         }
+        // A full arena is a state this has to survive rather than panic on: the ranges come out of one
+        // fixed pool, and a render distance whose sections do not fit in it is a *policy* problem -
+        // the pool is 25 million u32 slots, and a fully baked view at 16 chunks is several times that.
+        // Panicking here ended the game (the panic hook throws, and the JVM aborts on a panic through
+        // a native frame), which is not a trade a renderer gets to make: the section is left without
+        // geometry instead, and Minecraft offers it again the next time it is rebuilt.
+        let mut full = false;
+
         let section = Section {
             layers: baked_layers
                 .iter()
                 .map(|layer| {
-                    if !layer.indices.is_empty() {
-                        Some(SectionRanges {
-                            vertex_range: self
-                                .allocator
-                                .allocate_range(layer.vertices.len() as u32 / 4)
-                                .unwrap(),
-                            index_range: self
-                                .allocator
-                                .allocate_range(layer.indices.len() as u32 / 4)
-                                .unwrap(),
-                        })
-                    } else {
-                        None
+                    if layer.indices.is_empty() {
+                        return None;
                     }
+
+                    let vertices = match self
+                        .allocator
+                        .allocate_range(layer.vertices.len() as u32 / 4)
+                    {
+                        Ok(range) => range,
+                        Err(_) => {
+                            full = true;
+                            return None;
+                        }
+                    };
+
+                    let indices = match self
+                        .allocator
+                        .allocate_range(layer.indices.len() as u32 / 4)
+                    {
+                        Ok(range) => range,
+                        Err(_) => {
+                            // Give the vertices back: a layer with no indices draws nothing, and
+                            // holding them would leak the range for as long as the section is stored.
+                            self.allocator.free_range(vertices);
+                            full = true;
+                            return None;
+                        }
+                    };
+
+                    Some(SectionRanges {
+                        vertex_range: vertices,
+                        index_range: indices,
+                    })
                 })
                 .collect(),
         };
+
+        if full {
+            report_full_arena();
+        }
+
         self.storage.insert(pos, section.clone());
         section
     }
@@ -160,6 +192,26 @@ impl SectionStorage {
 
     pub fn is_empty(&self) -> bool {
         self.storage.is_empty()
+    }
+}
+
+/// Says the arena is full, once every so often rather than once per section.
+///
+/// The number that matters is how much of the view does not fit: a handful of sections is a world edge
+/// nobody notices, and thousands of them is a rendering-policy problem - the pool is fixed and the
+/// render distance is not.
+fn report_full_arena() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+
+    let refused = REFUSED.fetch_add(1, Ordering::Relaxed);
+    if refused < 4 || refused.is_multiple_of(512) {
+        log::warn!(
+            "wgpu-mc: the section arena is full, so this section was left without geometry \
+             ({refused} section(s) refused so far); the arena is a fixed pool and the render \
+             distance is not - see `SectionStorage::replace`"
+        );
     }
 }
 

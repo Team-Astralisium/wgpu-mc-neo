@@ -2,7 +2,7 @@ struct PushConstants {
     parts_per_entity: u32
 }
 
-var<push_constant> push_constants: PushConstants;
+var<immediate> push_constants: PushConstants;
 
 @group(0) @binding(0) var<uniform> view_proj: mat4x4<f32>;
 @group(0) @binding(1) var<uniform> persp_proj: mat4x4<f32>;

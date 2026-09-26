@@ -47,7 +47,16 @@ struct VertexResult {
     @location(18) color: vec4<f32>
 };
 
-var<push_constant> section_pos: vec3i;
+// The section this draw is for, as three integers rather than a vec3i: an immediate has to be a
+// struct for the HLSL backend (push-constant ... has non-struct type is what a bare vector gets),
+// and three i32 members are twelve bytes with no padding - which is the size the pass declares.
+struct SectionPosition {
+    x: i32,
+    y: i32,
+    z: i32,
+};
+
+var<immediate> section_pos: SectionPosition;
 
 @vertex
 fn vert(
@@ -133,7 +142,8 @@ fn vert(
     }
     var pos = vec3<f32>(x, y, z);
 
-    var world_pos = pos + vec3<f32>(f32(section_pos.x) * 16.0, f32(section_pos.y) * 16.0, f32(section_pos.z) * 16.0);
+    var section_origin = vec3<f32>(f32(section_pos.x), f32(section_pos.y), f32(section_pos.z)) * 16.0;
+    var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);
     vr.tex_coords = vec2<f32>(u, v);

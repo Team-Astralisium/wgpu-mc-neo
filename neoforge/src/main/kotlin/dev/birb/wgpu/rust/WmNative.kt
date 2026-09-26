@@ -164,7 +164,7 @@ object WmNative {
     // `bindings_len` entries are read, so a draw writes as many as it has bindings and no more.
     // ------------------------------------------------------------------
 
-    /** `struct PlanBinding { char *name; char *declared_name; uint32_t set; uint32_t binding; uint32_t kind; uint32_t _pad; }` */
+    /** `struct PlanBinding { char *name; char *declared_name; uint32_t set; uint32_t binding; uint32_t kind; uint32_t dynamic; }` */
     @JvmField val PLAN_BINDING: MemoryLayout = MemoryLayout.structLayout(PTR, PTR, INT, INT, INT, INT)
 
     /** `struct DrawBinding { uint32_t kind; uint32_t _pad; const uint8_t *resource; uint64_t offset; uint64_t length; }` */
@@ -207,7 +207,15 @@ object WmNative {
 
     /**
      * The two fields after the binding table: the JVM's number for this set of bindings, and whether
-     * the table next to it is the one that number was built from. See `DrawCall` in `blaze.rs`.
+     * the table next to it carries what that number left out. See `DrawCall` in `blaze.rs`.
+     *
+     * The number is the identity of the bind groups: a combination is the plan and, per slot, the
+     * resource, the length and any offset that is baked in - but *not* the offset of a slot the plan
+     * marks [PLAN_BINDING_DYNAMIC], which travels with the draw instead. So a plan with no such slot
+     * has a number that says everything, and a draw of one sends zero in [DRAW_CALL_BINDINGS_PRESENT]
+     * and is answered without the table being read at all. A number the native side has not seen and
+     * no table makes it refuse the draw rather than bind whatever it had last: `drawCall` answers
+     * false, and the draw is repeated with the table.
      */
     const val DRAW_CALL_COMBO = 1264L
     const val DRAW_CALL_BINDINGS_PRESENT = 1268L
@@ -218,6 +226,16 @@ object WmNative {
     const val PLAN_BINDING_SET = 16L
     const val PLAN_BINDING_BINDING = 20L
     const val PLAN_BINDING_KIND = 24L
+
+    /**
+     * Slot `i`: whether the binding there may carry its offset with the draw rather than have it
+     * baked into the bind group, which is a uniform of a plan that has one.
+     *
+     * This is the one thing a draw's combination leaves out - see [DRAW_CALL_COMBO] - so it is what
+     * decides both which slots contribute an offset to the combination and whether the table has to
+     * travel with the draw at all.
+     */
+    const val PLAN_BINDING_DYNAMIC = 28L
 
     const val DRAW_BINDING_KIND = 0L
     const val DRAW_BINDING_RESOURCE = 8L
@@ -445,6 +463,32 @@ object WmNative {
 
     @JvmField val dropRenderPass: MethodHandle =
         handle("drop_render_pass", FunctionDescriptor.ofVoid(PTR))
+
+    /**
+     * Records the render graph's terrain pass: the sections the Rust baker meshed, drawn from the
+     * arena the section feed fills, into the frame's own encoder.
+     *
+     * It has to be called *between* two of Minecraft's passes rather than inside one - the graph opens
+     * a pass of its own - and the colour and depth views are the ones the pass it stands in for would
+     * have used, because a terrain pass with a depth buffer of its own is terrain nothing else in the
+     * frame can occlude. Answers whether anything was drawn: false means no scene, no graph, or no
+     * terrain pipeline in it, and the caller is left with a world that has no ground in it.
+     */
+    @JvmField val renderTerrainPass: MethodHandle =
+        handle(
+            "render_terrain_pass",
+            FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR, PTR, PTR),
+        )
+
+    /**
+     * Whether the render graph can draw [renderTerrainPass] yet, building it if it cannot.
+     *
+     * Asked before a pass is taken away from Minecraft, because the graph's terrain pipeline is built
+     * from the block atlas and a takeover without it is a frame with no ground in it. The answer is
+     * kept on this side: a pipeline does not unbuild itself.
+     */
+    @JvmField val terrainPassReady: MethodHandle =
+        handle("terrain_pass_ready", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR))
 
     /**
      * Restricts drawing in [createRenderPass]'s pass to a rectangle of its colour target.

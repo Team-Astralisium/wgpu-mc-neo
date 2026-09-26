@@ -617,6 +617,16 @@ fn try_create_renderer(
         required_features |= wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     }
 
+    // Immediates - push constants, spelled the way WebGPU spells them: the render graph's terrain pass
+    // hands each section its position that way, and a pipeline layout that declares an immediate size
+    // is refused outright without the feature ("Features ... are required but not enabled on the
+    // device"). That refusal is a wgpu validation error, and a validation error on this path ends the
+    // process, so the feature is asked for whenever the adapter has it - and a graph whose device does
+    // not gets its immediate pipelines skipped rather than built (see `create_pipelines`).
+    if adapter.features().contains(wgpu::Features::IMMEDIATES) {
+        required_features |= wgpu::Features::IMMEDIATES;
+    }
+
     let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: None,
         required_features,
@@ -2628,6 +2638,10 @@ struct Counters {
     bind_groups_created: Cell<u64>,
     cache_hits: Cell<u64>,
     cache_misses: Cell<u64>,
+    /// Draws that arrived with the JVM's number for their bindings, and of those, the ones whose
+    /// number was the whole table and were therefore answered without reading it.
+    numbered: Cell<u64>,
+    tableless: Cell<u64>,
 }
 
 /// One interval's worth of [`Counters`], with the cells swapped out.
@@ -2641,6 +2655,8 @@ struct RenderStats {
     bind_groups_created: u64,
     cache_hits: u64,
     cache_misses: u64,
+    numbered: u64,
+    tableless: u64,
 }
 
 impl Counters {
@@ -2656,6 +2672,8 @@ impl Counters {
             bind_groups_created: Cell::new(0),
             cache_hits: Cell::new(0),
             cache_misses: Cell::new(0),
+            numbered: Cell::new(0),
+            tableless: Cell::new(0),
         }
     }
 
@@ -2683,6 +2701,8 @@ impl Counters {
             bind_groups_created: 0,
             cache_hits: 0,
             cache_misses: 0,
+            numbered: 0,
+            tableless: 0,
         };
 
         macro_rules! take {
@@ -2699,6 +2719,8 @@ impl Counters {
         take!(bind_groups_created);
         take!(cache_hits);
         take!(cache_misses);
+        take!(numbered);
+        take!(tableless);
 
         // The two that are not plain totals: the last pass's draws stay until the next pass closes,
         // and the current pass keeps counting.
@@ -2757,6 +2779,17 @@ pub(crate) fn count_cache_hit() {
 
 pub(crate) fn count_cache_miss() {
     with_counters(|c| c.cache_misses.set(c.cache_misses.get() + 1));
+}
+
+/// Counts a draw that came numbered: the JVM resolved its bindings to one integer.
+pub(crate) fn count_numbered() {
+    with_counters(|c| c.numbered.set(c.numbered.get() + 1));
+}
+
+/// Counts a numbered draw that needed no binding table at all, which is the number being the whole
+/// identity of its bind groups.
+pub(crate) fn count_tableless() {
+    with_counters(|c| c.tableless.set(c.tableless.get() + 1));
 }
 
 /// What one render pass was handed: how many draws, whether it cleared, whether it has a depth
@@ -2859,6 +2892,8 @@ pub extern "C" fn log_render_stats() {
         bind_groups_created: bind_groups,
         cache_hits: hits,
         cache_misses: misses,
+        numbered,
+        tableless,
     } = stats;
 
     if RECORDING_THREADS.load(Ordering::Relaxed) > 1 {
@@ -2880,7 +2915,8 @@ pub extern "C" fn log_render_stats() {
         "wgpu-mc: render stats: {passes} render passes ({empty} of them empty, last had {last} \
          draws), {pipelines} pipeline binds, {draws} draws ({bind_groups} bind groups built, \
          {hits} cache hits and {misses} misses), {vertices} vertices, {submissions} submissions for \
-         {presents} presented frame(s); uploads: {} staged ({} MB), {} fell back to queue writes",
+         {presents} presented frame(s); {numbered} of the draws came numbered ({tableless} of them \
+         without a binding table); uploads: {} staged ({} MB), {} fell back to queue writes",
         STAGED_UPLOADS.swap(0, Ordering::Relaxed),
         STAGED_BYTES.swap(0, Ordering::Relaxed) / (1024 * 1024),
         STAGING_FALLBACKS.swap(0, Ordering::Relaxed),
@@ -3208,6 +3244,33 @@ pub unsafe extern "C" fn compile_render_pipeline(
         // is one re-translation per pipeline when the player switches backend, which happens once.
         wm.gpu.adapter.get_info().backend.to_str(),
     ]);
+
+    // Which part of the key moved, when a pipeline that should have been cached is translated again.
+    // The parts are short enough to compare by eye across two runs, and this is the only way to tell
+    // "the cache is not working" apart from "this pipeline is new".
+    if crate::debug::logging() {
+        static REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 12 {
+            info!(
+                "wgpu-mc: {} key {cache_key}: v={:08x} f={:08x} d={:08x} l={:08x} i={:08x} b={:08x}",
+                render_pipeline_description.name,
+                crate::shader_cache::part(&render_pipeline_description.vertex_shader),
+                crate::shader_cache::part(&render_pipeline_description.fragment_shader),
+                crate::shader_cache::part(&directives),
+                crate::shader_cache::part(&crate::shader_cache::canonical(
+                    shader_locations
+                        .iter()
+                        .map(|(name, (set, binding))| (name.clone(), format!("{set}:{binding}"))),
+                )),
+                crate::shader_cache::part(&crate::shader_cache::canonical(
+                    vertex_stage_input_layout
+                        .iter()
+                        .map(|(name, location)| (name.clone(), *location)),
+                )),
+                crate::shader_cache::part(wm.gpu.adapter.get_info().backend.to_str()),
+            );
+        }
+    }
 
     let (vert_processed, frag_processed, sampler_types, implicit_uniforms, block_sizes) =
         match crate::shader_cache::load(&cache_key) {
@@ -4220,6 +4283,136 @@ pub extern "C" fn write_to_texture(
 #[unsafe(no_mangle)]
 pub extern "C" fn submit_command_encoder(wm: &WmRenderer, _encoder: Box<CommandEncoderHandle>) {
     flush_shared_encoder(wm);
+}
+
+/// Records the render graph's terrain pass: the sections the Rust baker meshed, drawn from the arena
+/// the section feed fills.
+///
+/// The pass is recorded into the frame's own encoder, between two of Minecraft's, so that what it
+/// draws lands in the same colour and depth attachments as the geometry around it - a terrain pass in
+/// a submission of its own would be terrain nothing else in the frame could occlude, or that occludes
+/// everything. `depth` is therefore the caller's depth texture rather than the scene's own: the JVM
+/// side hands over the view the pass it is standing in for would have used.
+///
+/// Answers whether anything was drawn, which is false when there is no scene yet, no graph, or no
+/// terrain pipeline in it - and a caller that ignores the answer draws a world with no ground in it
+/// and no line in the log to say why.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_terrain_pass(
+    wm: &WmRenderer,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+) -> bool {
+    // The graph opens a pass of its own, and wgpu allows one at a time: recording it inside one of
+    // Minecraft's would leave the frame's recording in a state neither side can describe.
+    let open = LIVE_PASS_COUNT.load(Ordering::Relaxed);
+    if open != 0 {
+        error!(
+            "wgpu-mc: the terrain pass was asked for while {open} render pass(es) are open; it has to \
+             be recorded between two of Minecraft's, not inside one"
+        );
+        return false;
+    }
+
+    let Some(scene) = wm.scene() else {
+        return false;
+    };
+
+    if !ensure_terrain_pipeline(wm) {
+        return false;
+    }
+
+    let graph = crate::RENDER_GRAPH.get().unwrap().lock();
+
+    // The matrices travel in buffers the pass binds, so they are uploaded for this frame before the
+    // pass reads them. The one the culler uses is the perspective times the view, which is what the
+    // shader multiplies a section by.
+    crate::application::upload_terrain_matrices(wm);
+
+    let view_projection = {
+        let matrices = crate::renderer::MATRICES.lock();
+        multiply(&matrices.projection, &matrices.view)
+    };
+
+    with_shared_encoder(|encoder| {
+        graph.render_with_mvp(
+            wm,
+            encoder,
+            scene,
+            color,
+            Some(depth),
+            [0.0, 0.0, 0.0],
+            view_projection,
+        );
+    });
+
+    true
+}
+
+/// `a * b` for two column-major 4x4 matrices, which is the order the shader multiplies in.
+fn multiply(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut out = [[0.0f32; 4]; 4];
+
+    for column in 0..4 {
+        for row in 0..4 {
+            out[column][row] = (0..4).map(|k| a[k][row] * b[column][k]).sum();
+        }
+    }
+
+    out
+}
+
+/// Whether the graph can draw the terrain pass yet, building it if it cannot.
+///
+/// The JVM side asks this before it takes a pass away from Minecraft. The graph's terrain pipeline is
+/// built from the block atlas, which a resource reload stitches on a background thread, so for the
+/// first seconds of a session there is nothing to draw with - and a pass taken away then is a frame
+/// with no ground in it rather than a frame drawn another way. See `ensure_terrain_pipeline`.
+#[unsafe(no_mangle)]
+pub extern "C" fn terrain_pass_ready(wm: &WmRenderer) -> bool {
+    wm.scene().is_some() && ensure_terrain_pipeline(wm)
+}
+
+/// Whether the graph has a terrain pipeline, building it if it does not.
+///
+/// The graph is built by a shader reload, and a shader reload is gated on the renderer being up *and*
+/// on a resource reload happening after that - a `--quickPlaySingleplayer` launch reaches its world
+/// without either, and its reload has already gone by. So the pass is what asks for the graph, once a
+/// second at most: the block atlas it samples is stitched on a background thread after a reload, and
+/// until it exists the graph comes up without the pipeline (see `create_pipelines`), which is exactly
+/// the case a later attempt fixes.
+fn ensure_terrain_pipeline(wm: &WmRenderer) -> bool {
+    let built = || {
+        crate::RENDER_GRAPH
+            .get()
+            .is_some_and(|graph| graph.lock().pipelines.contains_key("terrain"))
+    };
+
+    if built() {
+        return true;
+    }
+
+    static LAST_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if LAST_ATTEMPT.swap(now, Ordering::Relaxed) == now {
+        return false;
+    }
+
+    crate::application::load_shaders(wm);
+
+    if !built() {
+        warn!(
+            "wgpu-mc: the render graph has no terrain pipeline yet; is the block atlas registered? \
+             the pass will ask again next second"
+        );
+    }
+
+    built()
 }
 
 /// Blits the frame into the swapchain image, and submits it.
